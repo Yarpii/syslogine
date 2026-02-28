@@ -24,12 +24,25 @@ const sidebars: SidebarsConfig = {
       link: { type: 'doc', id: 'security/index' },
       items: [],
     },
-
     {
       type: 'category',
       label: 'Web Development',
       link: { type: 'doc', id: 'web-development/index' },
-      items: [],
+      items: [
+        {
+          type: 'category',
+          label: 'Backend',
+          items: [
+            {
+              type: 'category',
+              label: 'Magento 2',
+              items: [
+                'web-development/backend/magento/installation',
+              ],
+            },
+          ],
+        },
+      ],
     },
   ],
 
