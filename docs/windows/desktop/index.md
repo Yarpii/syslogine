@@ -61,6 +61,9 @@ Windows desktop editions provide powerful computing solutions for home users and
 
 ## Quick Access
 
+- **New here?** Start with [Desktop Getting Started](/docs/windows/desktop/getting-started).
+
+
 <div className="row">
   <div className="col col--4">
     <div className="card">
