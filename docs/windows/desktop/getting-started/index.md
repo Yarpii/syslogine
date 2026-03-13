@@ -55,6 +55,8 @@ If you need AD DS, DNS, DHCP, Hyper-V host planning, or server role management, 
 
 ## Next guides
 
+- [Desktop patching baseline](/docs/windows/desktop/getting-started/patching-baseline)
+- [Desktop security baseline](/docs/windows/desktop/getting-started/security-baseline)
 - [Windows 10 documentation](/docs/windows/desktop/windows-10)
 - [Windows 11 documentation](/docs/windows/desktop/windows-11)
 - [Enterprise desktop management](/docs/windows/desktop/enterprise)

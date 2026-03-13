@@ -48,6 +48,8 @@ If you are configuring user laptops and desktops, use the **Windows Desktop** tr
 
 ## Next guides
 
+- [Member server hardening](/docs/windows/server/getting-started/member-server-hardening)
+- [First domain controller checklist](/docs/windows/server/getting-started/first-domain-controller-checklist)
 - [Windows Server overview](/docs/windows/server)
 - [Windows Server 2019](/docs/windows/server/2019)
 - [Windows Server 2022](/docs/windows/server/2022)
