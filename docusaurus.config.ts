@@ -87,7 +87,8 @@ const config: Config = {
     navbar: {
       logo: {
         alt: 'Syslogine Logo',
-        src: 'img/logo.webp',
+        src: 'img/logo_dark.webp',
+        srcDark: 'img/logo.webp',
       },
       items: [
         { type: 'docSidebar',sidebarId: 'mainSidebar',position: 'left',label: 'Guides'},
