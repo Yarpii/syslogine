@@ -5,15 +5,14 @@
   "scripts": {
     "docusaurus": "docusaurus",
     "start": "docusaurus start",
-    "build": "BROWSERSLIST_IGNORE_OLD_DATA=1 docusaurus build",
+    "build": "docusaurus build",
     "swizzle": "docusaurus swizzle",
     "deploy": "docusaurus deploy",
     "clear": "docusaurus clear",
     "serve": "docusaurus serve",
     "write-translations": "docusaurus write-translations",
     "write-heading-ids": "docusaurus write-heading-ids",
-    "typecheck": "tsc",
-    "deps:refresh-browser-data": "npm i baseline-browser-mapping@latest -D && npx update-browserslist-db@latest"
+    "typecheck": "tsc"
   },
   "dependencies": {
     "@docusaurus/core": "^3.9.1",
