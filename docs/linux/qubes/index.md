@@ -12,7 +12,7 @@ keywords:
   - "dom0 administration"
   - "disposable vms"
   - "qubes firewall"
-slug: qubes-guide
+slug: /linux/qubes
 ---
 
 # Qubes OS Administration
