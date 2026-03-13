@@ -1,8 +1,8 @@
 {
-  "label": "Windows Server 2019",
-  "position": 8,
+  "label": "Troubleshooting",
+  "position": 5,
   "link": {
-    "type": "doc",
-    "id": "windows/server/2019/index"
+    "type": "generated-index",
+    "title": "Windows Server 2019 Troubleshooting"
   }
 }
