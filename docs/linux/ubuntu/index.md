@@ -130,7 +130,7 @@ Always use LTS (Long Term Support) versions for production servers. They receive
 
 ### Security & Monitoring
 - **[Security Hardening](/docs/linux/ubuntu/security)** - Essential security practices
-- **[Log Management](/docs/linux/ubuntu/logging)** - Rsyslog and log analysis
+- **[Log Management](/docs/linux/ubuntu/logging)** - Community-friendly rsyslog, journald, and rotation setup
 - **[Monitoring](/docs/linux/ubuntu/monitoring)** - System monitoring tools
 - **[Backup Solutions](/docs/linux/ubuntu/backup)** - Data protection strategies
 

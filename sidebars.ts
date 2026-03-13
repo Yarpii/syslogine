@@ -4075,7 +4075,9 @@ const sidebars: SidebarsConfig = {
       type: 'category',
       label: 'Qubes',
       link: { type: 'doc', id: 'linux/qubes/index' },
-      items: [],
+      items: [
+        'linux/qubes/qubes-guide',
+      ],
     },
     {
       type: 'category',
@@ -4455,14 +4457,39 @@ const sidebars: SidebarsConfig = {
       type: 'category',
       label: 'Windows Server',
       link: { type: 'doc', id: 'windows/server/index' },
-      items: [], // subitems later handmatig toevoegen
+      items: [
+        {
+          type: 'category',
+          label: 'Getting Started',
+          link: { type: 'doc', id: 'windows/server/getting-started/index' },
+          items: [
+            'windows/server/getting-started/member-server-hardening/index',
+            'windows/server/getting-started/first-domain-controller-checklist/index',
+          ],
+        },
+        'windows/server/2019/index',
+        'windows/server/2022/index',
+        'windows/server/2025/index',
+      ],
     },
 
     {
       type: 'category',
       label: 'Windows Desktop',
       link: { type: 'doc', id: 'windows/desktop/index' },
-      items: [],
+      items: [
+        {
+          type: 'category',
+          label: 'Getting Started',
+          link: { type: 'doc', id: 'windows/desktop/getting-started/index' },
+          items: [
+            'windows/desktop/getting-started/patching-baseline/index',
+            'windows/desktop/getting-started/security-baseline/index',
+          ],
+        },
+        'windows/desktop/windows-10/index',
+        'windows/desktop/windows-11/index',
+      ],
     },
 
     {

@@ -1,5 +1,4 @@
 ---
-id: web-development/backend/magento/installation
 title: Magento 2 Complete Installation Guide
 sidebar_label: Installation
 ---
