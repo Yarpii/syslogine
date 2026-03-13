@@ -18,12 +18,13 @@ const config: Config = {
   projectName: 'syslogine',
 
   onBrokenLinks: 'warn',
-  
-  markdown: {
+
+  markdown: ({
     hooks: {
       onBrokenMarkdownLinks: 'warn',
     },
-  },
+  } as any),
+
 
   i18n: {
     defaultLocale: 'en',
