@@ -1,0 +1,581 @@
+---
+title: "GDPR Implementation"
+sidebar_label: "GDPR"
+sidebar_position: 1
+description: "Implement practical GDPR-aligned security, privacy, and operational controls for websites, apps, and internal systems."
+keywords:
+  - gdpr
+  - data protection
+  - privacy
+  - compliance
+  - lawful basis
+  - dpia
+  - dpo
+tags:
+  - security
+  - compliance
+  - privacy
+slug: /security/compliance/gdpr
+---
+
+# GDPR Implementation
+
+The GDPR is not only a legal topic. It also affects how you design systems, collect data, secure services, choose vendors, respond to incidents, and explain processing to users.
+
+This guide focuses on **practical GDPR implementation** for technical teams, site owners, and operators.
+
+:::warning This guide is not legal advice
+This page is a practical implementation guide for technical and operational teams.
+
+If your organisation handles sensitive data, operates in multiple jurisdictions, or faces regulatory review, work with qualified legal counsel and, where required, your Data Protection Officer.
+:::
+
+## What this guide covers
+
+This page helps you translate GDPR into operational work across:
+
+- data collection
+- application design
+- access control
+- vendor management
+- logging and retention
+- incident response
+- documentation
+- user rights handling
+
+## Start with the right mindset
+
+A strong GDPR implementation is not about adding a cookie banner and hoping for the best.
+
+It is about answering these questions clearly:
+
+- What personal data do we collect?
+- Why do we collect it?
+- What legal basis do we rely on?
+- Who can access it?
+- Where is it stored?
+- How long do we keep it?
+- Which vendors process it for us?
+- Can we respond to requests from individuals?
+- Can we detect and handle a breach?
+
+If your team cannot answer those questions, start there.
+
+## Step 1: Map your personal data
+
+Before you can secure personal data, you need to know where it exists.
+
+Create a simple data inventory that includes:
+
+- systems and services
+- categories of personal data
+- who the data belongs to
+- purpose of processing
+- legal basis
+- recipients
+- retention period
+- storage location
+- processor or vendor involved
+- transfer outside the EU/EEA, if applicable
+
+### Example inventory fields
+
+A practical table can include:
+
+- system name
+- owner
+- data subjects
+- data categories
+- purpose
+- lawful basis
+- processor
+- retention
+- transfer outside EU/EEA
+- security measures
+
+:::tip Start small
+Do not wait for a perfect enterprise data map.
+
+Start with your highest-risk systems first:
+
+- authentication
+- CRM
+- analytics
+- billing
+- support platform
+- HR systems
+- backups
+:::
+
+## Step 2: Identify your lawful basis for each processing activity
+
+Do not treat “consent” as the default answer for everything.
+
+For each processing activity, document the legal basis you rely on.
+
+Common lawful bases include:
+
+- consent
+- contract
+- legal obligation
+- vital interests
+- public task
+- legitimate interests
+
+### Practical rule
+
+For every important processing activity, your team should be able to complete this sentence:
+
+> “We process this data for this purpose, on this lawful basis.”
+
+If you cannot say that clearly, the activity needs review.
+
+### Example
+
+- Account signup → **contract**
+- Invoice retention → **legal obligation**
+- Optional marketing emails → **consent**
+- Abuse prevention and some security logging → often **legitimate interests**, after proper assessment
+
+:::warning Consent is not a universal shortcut
+If you rely on consent, it must actually fit the use case and be managed properly. Do not use consent where another lawful basis is more appropriate.
+:::
+
+## Step 3: Apply the GDPR principles in system design
+
+The GDPR principles should affect how you build and operate systems.
+
+That usually means:
+
+- collect only the data you actually need
+- use it only for stated purposes
+- avoid keeping it longer than necessary
+- keep it accurate where relevant
+- secure it appropriately
+- be able to demonstrate what you are doing
+
+### Practical examples
+
+#### Better data minimisation
+
+Instead of collecting:
+
+- full date of birth
+- phone number
+- postal address
+- company name
+- job title
+
+ask whether your feature actually needs all of that.
+
+#### Better storage limitation
+
+Instead of keeping old exports, uploaded files, and support transcripts forever, define deletion windows and archive rules.
+
+#### Better access control
+
+Instead of letting all staff view customer profiles, restrict access by role and task.
+
+## Step 4: Build privacy by design and by default
+
+Privacy should not be bolted on after launch.
+
+When building or changing a product, include privacy questions early:
+
+- What data is necessary?
+- What is optional?
+- Are the defaults privacy-friendly?
+- Can users control visibility and sharing?
+- Are we exposing data in logs or analytics?
+- Can we pseudonymise or separate identifiers?
+
+### Practical implementation ideas
+
+- default profiles to private where reasonable
+- disable unnecessary tracking by default
+- minimize fields in forms
+- separate account identifiers from analytics identifiers
+- tokenize or pseudonymise high-risk data where possible
+- use role-based access controls
+- redact sensitive values from logs
+
+## Step 5: Know whether you are a controller or a processor
+
+This matters for contracts, responsibilities, and vendor management.
+
+### In simple terms
+
+- A **controller** decides why and how personal data is processed
+- A **processor** processes personal data on behalf of a controller
+
+In real environments, you may be:
+
+- a controller for your own customers and employees
+- a processor for a business client
+- a controller using multiple processors like cloud, support, and email vendors
+
+## Step 6: Put proper processor agreements in place
+
+If a third party processes personal data on your behalf, you need a proper contract or legal arrangement that covers that relationship.
+
+Examples include vendors for:
+
+- cloud hosting
+- support tools
+- email delivery
+- payroll
+- analytics
+- storage
+- identity services
+
+### What to verify operationally
+
+For each processor, verify:
+
+- what data they process
+- where they process it
+- what security measures they offer
+- whether subprocessors are used
+- what happens at contract termination
+- how deletion or return of data is handled
+- whether international transfers occur
+
+## Step 7: Document records of processing
+
+Do not keep GDPR knowledge only in people’s heads.
+
+Maintain written records of processing activities.
+
+Even smaller organisations should not assume records are irrelevant, especially if processing is not occasional, involves risk, or includes special-category data.
+
+### Your records should cover things like
+
+- controller or processor details
+- purposes
+- categories of data subjects
+- categories of personal data
+- recipients
+- international transfers
+- retention periods
+- general security measures
+
+A spreadsheet is enough to start, as long as it is maintained.
+
+## Step 8: Handle data-subject rights operationally
+
+You need a process, not just a policy page.
+
+Individuals may have rights including:
+
+- to be informed
+- access
+- rectification
+- erasure
+- restriction
+- portability
+- objection
+- review of certain automated decision-making
+
+### Build a simple request workflow
+
+Your process should define:
+
+- where requests arrive
+- who validates identity
+- who owns the case
+- which systems must be checked
+- what deadlines apply
+- how the response is documented
+
+### Practical checklist
+
+For access or deletion requests, your team should know how to check:
+
+- app database
+- support platform
+- marketing platform
+- billing system
+- logs
+- backups
+- file storage
+- third-party processors
+
+## Step 9: Decide when you need a DPIA
+
+Some processing activities require extra risk assessment.
+
+A Data Protection Impact Assessment is generally needed when processing is likely to result in a high risk to the rights and freedoms of individuals.
+
+This is especially important for things like:
+
+- large-scale sensitive data processing
+- large-scale monitoring
+- extensive profiling
+- high-risk new technologies
+
+### Practical trigger questions
+
+Do a DPIA review when you plan to:
+
+- launch facial recognition
+- profile users for consequential decisions
+- monitor public areas at scale
+- process health or biometric data at scale
+- combine large datasets in a way that increases risk
+
+## Step 10: Appoint a DPO when required
+
+Some organisations must appoint a Data Protection Officer.
+
+This is especially relevant where core activities involve:
+
+- public authority processing
+- large-scale sensitive data processing
+- large-scale regular and systematic monitoring of individuals
+
+Even when a DPO is not legally required, assigning clear privacy ownership is still a good practice.
+
+## Step 11: Secure personal data appropriately
+
+GDPR is not a substitute for security work. It requires it.
+
+Security measures should be appropriate to the risk.
+
+### Practical technical and organisational controls
+
+Use controls such as:
+
+- encryption where appropriate
+- pseudonymisation where useful
+- least-privilege access
+- MFA for admin systems
+- secure backups
+- logging and monitoring
+- patch management
+- vendor review
+- incident response procedures
+- regular testing of security controls
+
+### Good security questions
+
+Ask:
+
+- Is personal data encrypted in transit?
+- Is it encrypted at rest where appropriate?
+- Who has access?
+- Can access be audited?
+- Are admin actions logged?
+- Can we restore availability after an incident?
+- Are we testing our controls regularly?
+
+## Step 12: Set retention and deletion rules
+
+Do not keep personal data indefinitely just because storage is cheap.
+
+For each data category, define:
+
+- why it is kept
+- how long it is kept
+- when it is archived
+- when it is deleted
+- what legal or contractual obligations affect retention
+
+### Practical examples
+
+- marketing leads with no engagement → delete after a defined period
+- inactive trial accounts → purge after a defined period
+- support tickets → retain according to policy and legal need
+- invoices → retain according to legal and tax requirements
+- backups → rotate on a defined schedule
+
+## Step 13: Review analytics, tracking, and marketing tooling
+
+This is where many teams lose control of data flows.
+
+Review:
+
+- analytics tools
+- ad pixels
+- session replay tools
+- support widgets
+- A/B testing tools
+- embedded third-party scripts
+
+For each one, document:
+
+- what personal data is collected
+- who receives it
+- what lawful basis applies
+- whether transfers outside the EU/EEA occur
+- whether the tool is actually necessary
+
+## Step 14: Check international data transfers
+
+If personal data is transferred outside the EU/EEA, you need to know what transfer mechanism applies.
+
+Operationally, this means checking:
+
+- vendor hosting regions
+- support access locations
+- subprocessors
+- backup regions
+- content delivery and email providers
+
+Where relevant, use appropriate transfer safeguards and document them.
+
+## Step 15: Prepare for personal data breaches
+
+Your team should know what counts as a personal data breach and what happens next.
+
+A practical breach workflow should define:
+
+- how incidents are identified
+- who gets notified internally
+- how severity is assessed
+- what evidence is collected
+- whether supervisory authority notification is required
+- whether affected individuals must be informed
+- how the decision is documented
+
+### Minimum breach-response checklist
+
+- contain the issue
+- preserve evidence
+- identify affected data
+- identify affected individuals
+- assess likely impact
+- notify internal owners
+- document decisions
+- coordinate regulatory and user communications if needed
+- implement remediation
+- record lessons learned
+
+:::danger Do not improvise breach handling
+Breach decisions should be made using a documented process, not panic in a group chat.
+:::
+
+## Step 16: Align notices and internal reality
+
+Your privacy notice should match what your systems actually do.
+
+Review whether your notice accurately covers:
+
+- categories of data collected
+- purposes
+- lawful bases
+- retention
+- recipients
+- transfers
+- rights handling
+- contact points
+
+If your notice says one thing and your systems do another, fix the mismatch quickly.
+
+## Step 17: Train the people who touch personal data
+
+Compliance failures are often operational failures.
+
+Train the teams that handle:
+
+- support requests
+- HR data
+- finance data
+- admin tools
+- exports
+- access provisioning
+- incident response
+- vendor onboarding
+
+They do not need to become privacy lawyers, but they do need to know the rules that affect their work.
+
+## Practical GDPR implementation checklist
+
+Use this as a working baseline:
+
+- Inventory personal data and systems
+- Document lawful basis by processing activity
+- Minimize collection
+- Set privacy-friendly defaults
+- Document controller and processor roles
+- Put processor agreements in place
+- Maintain records of processing
+- Build a rights-request workflow
+- Review whether a DPIA is needed
+- Assign DPO or privacy ownership
+- Apply risk-appropriate security controls
+- Define retention and deletion schedules
+- Review analytics and tracking tools
+- Review international transfers
+- Create and test a breach-response workflow
+- Align notices, contracts, and actual system behavior
+- Train staff
+
+## Common mistakes
+
+### Treating GDPR as only a legal document problem
+
+Technical design, defaults, and data flow choices are part of GDPR implementation.
+
+### Collecting data “just in case”
+
+Unused personal data is liability.
+
+### Logging too much
+
+Logs often contain identifiers, tokens, IPs, and payloads. Review them carefully.
+
+### No ownership for rights requests
+
+If no one owns the workflow, requests get delayed or mishandled.
+
+### Unreviewed vendors
+
+Third-party tools can introduce hidden data sharing and transfers.
+
+### No deletion strategy
+
+If nothing is ever deleted, storage limitation is only theoretical.
+
+### No breach decision log
+
+Teams should document what happened, what risk was assessed, and why notification decisions were made.
+
+## Suggested rollout order
+
+If you want a realistic rollout path, do this:
+
+1. Map systems and personal data
+2. Identify lawful bases
+3. Review vendors and transfers
+4. Define retention
+5. Build rights-request handling
+6. Improve access control and logging
+7. Review high-risk processing for DPIA triggers
+8. Create a breach-response workflow
+9. Align privacy notices and contracts
+10. Train staff and review regularly
+
+## Summary
+
+A strong GDPR implementation is operational.
+
+It means your organisation can clearly explain:
+
+- what personal data it processes
+- why it processes it
+- on what basis
+- who can access it
+- how long it is kept
+- which vendors are involved
+- how individuals can exercise their rights
+- how incidents are handled
+
+If your team can answer those questions with evidence, you are moving in the right direction.
+
+:::tip Good next guides
+This page pairs especially well with:
+
+- [Audit Logging Setup](/docs/security/compliance/audit-logging)
+- [ELK Stack for Security Monitoring](/docs/security/monitoring/elk-stack)
+- [Incident Response Playbooks](/docs/security/incident-response/playbooks)
+:::

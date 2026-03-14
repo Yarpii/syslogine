@@ -1,0 +1,326 @@
+---
+title: "Rate Limiting in Nginx"
+sidebar_label: "Rate Limiting"
+sidebar_position: 2
+description: "Use Nginx rate limiting to slow abusive clients, protect login endpoints, and reduce brute-force noise without breaking legitimate traffic."
+keywords:
+  - nginx
+  - rate limiting
+  - limit_req
+  - brute force protection
+  - login protection
+tags:
+  - security
+  - nginx
+  - web-security
+slug: /security/web-security/nginx/rate-limiting
+---
+
+# Rate Limiting in Nginx
+
+Rate limiting is one of the most practical protections you can add to a public-facing Nginx server.
+
+It helps reduce:
+
+- brute-force login attempts
+- abusive API bursts
+- noisy scraping
+- accidental traffic spikes from misbehaving clients
+
+This guide focuses on **request-rate limiting with Nginx** using `limit_req`.
+
+## How Nginx rate limiting works
+
+Nginx rate limiting is based on the `ngx_http_limit_req_module`.
+
+At a high level, you:
+
+1. define a shared memory zone with `limit_req_zone`
+2. choose a key, usually the client IP
+3. apply limits to specific locations with `limit_req`
+
+A request stream can be:
+
+- allowed immediately
+- delayed to stay within the configured rate
+- rejected if it exceeds the configured burst
+
+:::tip Good starting mindset
+Do not rate-limit your entire site aggressively on day one.
+
+Start with the most sensitive endpoints first:
+
+- login pages
+- password reset endpoints
+- search endpoints
+- APIs
+- expensive dynamic routes
+:::
+
+## Before you start
+
+If Nginx sits **behind a trusted reverse proxy, load balancer, or CDN**, make sure Nginx sees the **real client IP**, otherwise your limits may apply to the proxy instead of the visitor.
+
+Example:
+
+```nginx
+# http context
+set_real_ip_from 10.0.0.0/8;
+set_real_ip_from 172.16.0.0/12;
+set_real_ip_from 192.168.0.0/16;
+
+real_ip_header X-Forwarded-For;
+real_ip_recursive on;
+````
+
+:::warning Trust only real upstreams
+Only use `set_real_ip_from` for addresses you actually control or explicitly trust.
+
+Never trust arbitrary internet clients to provide their own real IP headers.
+:::
+
+## Step 1: Define rate-limit zones
+
+Create a reusable snippet for your zones in the `http` context.
+
+Example file:
+
+```bash
+/etc/nginx/snippets/rate-limit-zones.conf
+```
+
+Add:
+
+```nginx
+# General per-IP limit for dynamic traffic
+limit_req_zone $binary_remote_addr zone=perip_general:10m rate=5r/s;
+
+# Stricter per-IP limit for login-style endpoints
+limit_req_zone $binary_remote_addr zone=perip_login:10m rate=30r/m;
+```
+
+### Why use `$binary_remote_addr`
+
+`$binary_remote_addr` is a very common and efficient key for per-IP limiting.
+
+It is a better default than `$remote_addr` for shared-memory tracking because it uses a fixed-size binary representation.
+
+## Step 2: Apply limits to sensitive routes
+
+Inside your `server` block:
+
+```nginx
+server {
+  listen 443 ssl http2;
+  server_name example.com www.example.com;
+
+  # Optional but recommended: return 429 instead of the module default 503
+  limit_req_status 429;
+  limit_req_log_level notice;
+
+  location = /login {
+    limit_req zone=perip_login burst=5 nodelay;
+    proxy_pass http://app_backend;
+  }
+
+  location = /forgot-password {
+    limit_req zone=perip_login burst=5 nodelay;
+    proxy_pass http://app_backend;
+  }
+
+  location /api/ {
+    limit_req zone=perip_general burst=20 nodelay;
+    proxy_pass http://app_backend;
+  }
+
+  location / {
+    proxy_pass http://app_backend;
+  }
+}
+```
+
+## Understanding `burst`, `nodelay`, and delays
+
+### `burst`
+
+`burst` allows short spikes above the average rate.
+
+Example:
+
+```nginx
+limit_req zone=perip_general burst=20;
+```
+
+This means a client can exceed the average rate briefly, up to the burst size.
+
+### `nodelay`
+
+With `nodelay`, requests inside the allowed burst are not intentionally delayed.
+
+Example:
+
+```nginx
+limit_req zone=perip_general burst=20 nodelay;
+```
+
+Use this when you want short bursts to pass quickly but still want abusive traffic rejected once the burst is exhausted.
+
+### default behavior without `nodelay`
+
+Without `nodelay`, excessive requests are delayed so they are processed at the configured average rate.
+
+That can be useful, but it may feel slow to legitimate users during bursts.
+
+## Safer rollout with dry run
+
+If you want to measure impact before enforcing the limit, enable dry-run mode first.
+
+```nginx
+server {
+  listen 443 ssl http2;
+  server_name example.com;
+
+  limit_req_dry_run on;
+  limit_req_status 429;
+  limit_req_log_level notice;
+
+  location = /login {
+    limit_req zone=perip_login burst=5 nodelay;
+    proxy_pass http://app_backend;
+  }
+}
+```
+
+With dry-run enabled, Nginx tracks excess traffic but does not actually reject requests.
+
+This is useful when you want to watch logs first and tune safely.
+
+## Recommended practical starting points
+
+These are sane starting examples, not universal truths.
+
+### Login endpoint
+
+```nginx
+location = /login {
+  limit_req zone=perip_login burst=5 nodelay;
+  proxy_pass http://app_backend;
+}
+```
+
+### Password reset
+
+```nginx
+location = /forgot-password {
+  limit_req zone=perip_login burst=3 nodelay;
+  proxy_pass http://app_backend;
+}
+```
+
+### API routes
+
+```nginx
+location /api/ {
+  limit_req zone=perip_general burst=20 nodelay;
+  proxy_pass http://app_backend;
+}
+```
+
+## What not to do
+
+### Do not rate-limit static files aggressively
+
+Avoid applying strict limits to:
+
+* images
+* CSS
+* JavaScript
+* fonts
+* public assets
+
+Browsers legitimately fetch many assets quickly.
+
+### Do not guess blindly
+
+Very strict values can break:
+
+* mobile clients behind NAT
+* office users behind one public IP
+* API consumers with valid concurrency
+* admin panels used by teams
+
+### Do not forget the real client IP problem
+
+If a load balancer or CDN sits in front of Nginx and you do not configure real client IP handling, all traffic may look like it comes from one address.
+
+## Testing
+
+Validate config:
+
+```bash
+sudo nginx -t
+```
+
+Reload:
+
+```bash
+sudo nginx -s reload
+```
+
+Basic test:
+
+```bash
+for i in $(seq 1 20); do
+  curl -s -o /dev/null -w "%{http_code}\n" https://example.com/login
+done
+```
+
+If the limit is enforced, some responses should eventually return:
+
+```text
+429
+```
+
+## Troubleshooting
+
+### I keep rate-limiting everyone at once
+
+You are probably limiting on the wrong source IP.
+
+Check whether you need real IP configuration for a proxy or CDN.
+
+### My users report random delays
+
+You may be using `burst` without `nodelay`, which means extra requests are queued and delayed.
+
+### I get 503 instead of 429
+
+That is Nginx’s default reject status for `limit_req`.
+
+Set this explicitly:
+
+```nginx
+limit_req_status 429;
+```
+
+## Summary
+
+Rate limiting is one of the easiest high-value protections you can deploy at the web layer.
+
+A good rollout pattern is:
+
+1. trust the correct client IP
+2. define zones in `http`
+3. protect only sensitive routes first
+4. start with dry run if needed
+5. tune based on logs and real traffic
+
+That gives you meaningful protection without turning normal traffic into collateral damage.
+
+:::tip Pair this with other guides
+Rate limiting works especially well alongside:
+
+* [Block Malicious Scanners](/docs/security/web-security/nginx/block-malicious-scanners)
+* [Bot Protection](/docs/security/web-security/nginx/bot-protection)
+* [Security Headers](/docs/security/web-security/nginx/security-headers)
+  :::

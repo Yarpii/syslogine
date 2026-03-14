@@ -1,0 +1,521 @@
+---
+title: "Audit Logging Setup"
+sidebar_label: "Audit Logging"
+sidebar_position: 3
+description: "Build practical audit logging that supports security investigations, accountability, and compliance without collecting unsafe or useless data."
+keywords:
+  - audit logging
+  - compliance logging
+  - security logging
+  - accountability
+  - log retention
+tags:
+  - security
+  - compliance
+  - logging
+slug: /security/compliance/audit-logging
+---
+
+# Audit Logging Setup
+
+Audit logs help answer one of the most important security questions:
+
+**who did what, when, where, and with what result?**
+
+A good audit logging strategy supports:
+
+- incident investigation
+- accountability
+- operational troubleshooting
+- compliance requirements
+- change tracking
+- alerting and monitoring
+
+This guide focuses on **practical audit logging**, not just theory.
+
+## What audit logging should achieve
+
+A useful audit log should help you:
+
+- reconstruct important actions
+- identify suspicious behavior
+- understand the sequence of events during an incident
+- show whether an action succeeded or failed
+- prove that sensitive changes were tracked
+- support monitoring and alerting
+
+Audit logging is not about logging everything forever.
+
+It is about logging the **right events**, with the **right fields**, in a **usable and protected format**.
+
+:::tip Think quality, not noise
+A small number of high-value, well-structured audit events is better than a huge pile of vague log lines nobody can search, trust, or review.
+:::
+
+## What should be logged
+
+At a minimum, audit logging should cover **security-relevant** and **business-relevant** actions.
+
+### Authentication events
+
+Log:
+
+- successful logins
+- failed logins
+- MFA success and failure
+- password reset requests
+- password changes
+- account lockouts
+- session creation and termination
+
+### Access control events
+
+Log:
+
+- authorization failures
+- permission changes
+- role changes
+- group membership changes
+- access granted to protected resources
+- denied access to sensitive routes or objects
+
+### Administrative activity
+
+Log:
+
+- user creation and deletion
+- privilege escalation
+- system configuration changes
+- API key creation or revocation
+- token revocation
+- security setting changes
+- logging configuration changes
+
+### Data and business events
+
+Log:
+
+- sensitive data exports
+- record creation, update, and deletion
+- billing-impacting actions
+- workflow approvals
+- high-value transactions
+- changes to customer or tenant settings
+
+### Application and system events
+
+Log:
+
+- application startup and shutdown
+- service failures
+- dependency failures
+- integrity check failures
+- suspicious input validation failures
+- security control failures
+
+## What each audit log entry should contain
+
+Every audit log event should be structured enough to answer basic investigation questions.
+
+A strong baseline field set is:
+
+- **timestamp**
+- **event name**
+- **event category**
+- **severity or importance**
+- **outcome** such as success or failure
+- **actor** such as user ID, service account, or system component
+- **target** such as object, account, or resource affected
+- **source** such as IP address, hostname, service, or node
+- **request or correlation ID**
+- **reason or context**
+- **tenant, environment, or application name** if relevant
+
+## Recommended event format
+
+Structured logs are much easier to search, filter, correlate, and alert on than free-form text.
+
+A JSON-style event is a strong default.
+
+Example:
+
+```json
+{
+  "timestamp": "2026-03-14T12:45:10Z",
+  "event_name": "user.role.updated",
+  "event_category": "authorization",
+  "severity": "medium",
+  "outcome": "success",
+  "actor": {
+    "type": "user",
+    "id": "admin_123"
+  },
+  "target": {
+    "type": "user",
+    "id": "user_456"
+  },
+  "source": {
+    "ip": "203.0.113.10",
+    "service": "admin-api"
+  },
+  "request_id": "req_01HRXYZABC123",
+  "environment": "production",
+  "message": "Admin updated user role from viewer to editor"
+}
+````
+
+## Recommended event naming style
+
+Use clear, consistent event names.
+
+Good examples:
+
+* `auth.login.success`
+* `auth.login.failure`
+* `auth.mfa.failure`
+* `user.created`
+* `user.deleted`
+* `user.role.updated`
+* `access.denied`
+* `config.updated`
+* `token.revoked`
+* `data.export.started`
+* `data.export.completed`
+
+Avoid vague names like:
+
+* `something_happened`
+* `update_done`
+* `admin_action`
+* `error_event`
+
+## What not to log
+
+Audit logs should never become a secret dump.
+
+Do **not** log raw secrets or sensitive credentials.
+
+That includes things like:
+
+* passwords
+* access tokens
+* session identifiers
+* encryption keys
+* database connection strings
+* payment card data
+* highly sensitive personal data unless there is a lawful and necessary reason
+
+If a field might be useful for correlation, prefer:
+
+* hashing
+* masking
+* truncation
+* tokenization
+* redaction
+
+:::danger Never log secrets directly
+If your logs contain credentials, tokens, or session values, the logging system itself becomes a high-value breach target.
+:::
+
+## Logging user context safely
+
+User context is important, but it should be collected deliberately.
+
+Safe examples:
+
+* internal user ID
+* account ID
+* tenant ID
+* role name
+* authentication method
+* source IP
+* user-agent when useful
+
+Use extra care with:
+
+* email addresses
+* phone numbers
+* legal names
+* internal network details
+* request bodies
+* uploaded content
+* free-form user input
+
+If you log request bodies, do it only for a narrowly defined purpose and with strong redaction controls.
+
+## Keep audit logs separate from debug logs
+
+This is one of the best design decisions you can make.
+
+### Audit logs
+
+Should be:
+
+* structured
+* stable
+* security-relevant
+* retained appropriately
+* protected from tampering
+* reviewed and monitored
+
+### Debug logs
+
+Are often:
+
+* verbose
+* temporary
+* developer-focused
+* noisy
+* full of implementation detail
+
+Mixing them together usually creates confusion and increases the chance of logging unsafe data.
+
+## Centralize your logs
+
+If logs only live on one machine, they are easier to lose, tamper with, or miss during an incident.
+
+A better design is:
+
+* generate logs locally
+* forward them securely
+* store them centrally
+* search and alert from one place
+
+This also helps with:
+
+* retention management
+* access control
+* investigations across multiple systems
+* dashboarding and alerting
+
+## Protect the logs themselves
+
+Logs are evidence.
+
+Treat them as security-sensitive data.
+
+### Protect confidentiality
+
+Restrict who can read logs.
+
+Not everyone who can operate a service should be able to browse every audit event.
+
+### Protect integrity
+
+Use controls that reduce tampering risk, such as:
+
+* append-only storage patterns
+* write-once or read-only copies
+* immutable storage where appropriate
+* strong access controls
+* logging all access to the logs themselves
+
+### Protect availability
+
+Logs are only useful if they are still there when you need them.
+
+Plan for:
+
+* central storage
+* backups
+* rotation
+* retention
+* capacity growth
+* failure handling
+
+## Add correlation IDs everywhere
+
+A single action can touch:
+
+* a web application
+* an API
+* a queue
+* a worker
+* a database
+* an identity provider
+
+Without correlation IDs, investigations become much harder.
+
+A request ID or trace ID should be carried through all relevant systems so related events can be linked together.
+
+## Standardize field names
+
+One service logging `user_id`, another logging `uid`, and a third logging `accountIdentifier` creates avoidable chaos.
+
+Choose a standard field model and stick to it across services.
+
+A simple shared schema helps with:
+
+* search
+* dashboards
+* alert rules
+* incident response
+* onboarding new contributors
+
+## Retention policy
+
+Retention should be deliberate, not accidental.
+
+Your retention period should be based on:
+
+* legal and regulatory requirements
+* operational needs
+* incident response timelines
+* storage cost
+* data sensitivity
+
+A practical policy usually defines:
+
+* how long logs stay hot and searchable
+* when they move to archive
+* when they are deleted
+* who approves retention exceptions
+
+:::warning Retention is context-specific
+There is no single correct retention period for every organization.
+
+Set retention with legal, compliance, security, and operations input.
+:::
+
+## Review and alerting
+
+Audit logs are not useful if nobody looks at them.
+
+At minimum, define:
+
+* what events should trigger alerts
+* who receives those alerts
+* what the escalation path is
+* how quickly alerts should be reviewed
+* which dashboards or saved searches support investigations
+
+High-value alert candidates often include:
+
+* repeated failed logins
+* admin role changes
+* sudden token creation or revocation spikes
+* disabled security controls
+* large data exports
+* access to sensitive records outside normal patterns
+* changes to logging settings
+
+## Log access to the logs
+
+A mature setup also tracks:
+
+* who viewed logs
+* who exported logs
+* who changed retention settings
+* who changed logging rules
+* who deleted or archived data
+
+This is especially important for compliance-heavy environments.
+
+## Example audit logging policy checklist
+
+Use this as a practical baseline:
+
+* Log authentication and authorization events
+* Log administrative actions
+* Log sensitive data access and export events
+* Use structured logs
+* Use consistent event names and field names
+* Include request or correlation IDs
+* Exclude secrets and raw sensitive identifiers
+* Centralize collection and search
+* Protect logs from tampering
+* Restrict log access
+* Define retention and disposal rules
+* Define alerting and review workflows
+* Test that logging still works after releases
+
+## Example: bad vs good audit log design
+
+### Weak example
+
+```text
+User changed something
+```
+
+This tells you almost nothing.
+
+### Better example
+
+```json
+{
+  "timestamp": "2026-03-14T12:45:10Z",
+  "event_name": "billing.plan.updated",
+  "event_category": "business",
+  "outcome": "success",
+  "actor_id": "user_123",
+  "target_id": "account_789",
+  "source_ip": "203.0.113.10",
+  "request_id": "req_abc123",
+  "message": "Plan changed from starter to pro"
+}
+```
+
+Now you can actually investigate the event later.
+
+## Common mistakes
+
+### Logging too little
+
+If you only log generic errors, you will struggle to investigate incidents.
+
+### Logging too much
+
+If every event is noisy, duplicated, or unstructured, your important events disappear into the background.
+
+### Logging secrets
+
+This creates a second major security problem inside your observability stack.
+
+### Storing logs only locally
+
+Local-only logs are fragile and easy to lose during compromise or failure.
+
+### No one owns review and alerting
+
+If alerts do not have an owner, they are just decorative.
+
+### Inconsistent field names
+
+This makes cross-service investigations far harder than they need to be.
+
+## Practical rollout plan
+
+A good rollout path for audit logging is:
+
+1. define the critical events you must capture
+2. define a shared event schema
+3. add request and correlation IDs
+4. redact or mask sensitive data
+5. centralize collection
+6. restrict access
+7. define retention
+8. create alerts for high-risk events
+9. review and improve after incidents
+
+## Summary
+
+Good audit logging is not about collecting everything.
+
+It is about collecting the **right evidence** in a way that is:
+
+* searchable
+* understandable
+* consistent
+* protected
+* reviewable
+* useful during real incidents
+
+If your team can answer **who did what, when, where, why, and with what result**, your audit logging is moving in the right direction.
+
+:::tip Good next guides
+This page pairs well with:
+
+* [ELK Stack for Security Monitoring](/docs/security/monitoring/elk-stack)
+* [Incident Response Playbooks](/docs/security/incident-response/playbooks)
+* [Multi-Factor Authentication](/docs/security/authentication/mfa)
+  :::

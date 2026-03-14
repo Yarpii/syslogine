@@ -1,0 +1,515 @@
+---
+title: "Firewall Basics"
+sidebar_label: "Firewall Basics"
+sidebar_position: 2
+description: "Set up a safe Linux host firewall with UFW using copy-paste commands, tests, troubleshooting, and rollback steps."
+keywords:
+  - linux firewall
+  - ufw
+  - ubuntu firewall
+  - host firewall
+  - ssh firewall
+tags:
+  - security
+  - linux
+  - firewall
+slug: /security/system-hardening/linux/firewall-basics
+---
+
+# Firewall Basics
+
+This guide shows you how to set up a **safe host firewall** on Linux using **UFW**.
+
+You will:
+
+- install or verify UFW
+- set safe default policies
+- allow SSH before enabling the firewall
+- allow only the ports your server actually needs
+- verify the active rules
+- test that your services still work
+- roll back safely if needed
+
+## What you'll build
+
+At the end of this guide, your server will use a simple host firewall with this model:
+
+- **deny incoming** by default
+- **allow outgoing** by default
+- allow only required services such as:
+  - SSH
+  - HTTP
+  - HTTPS
+
+That is a strong baseline for many VPS, app, and web servers.
+
+:::warning Do not enable a firewall before allowing SSH
+If you enable UFW before allowing SSH, you can lock yourself out of your server.
+:::
+
+## Prerequisites
+
+This guide is for:
+
+- Ubuntu
+- Debian
+- other Linux servers where UFW is available
+
+You should already have:
+
+- SSH access
+- `sudo` privileges
+- a second terminal open for testing
+
+:::tip Keep your current SSH session open
+Do not close your current SSH session while testing firewall changes.
+:::
+
+## Step 1: Check if UFW is installed
+
+On Ubuntu, UFW is often already installed.
+
+Check:
+
+```bash
+sudo ufw status
+````
+
+If it is not installed:
+
+```bash
+sudo apt update
+sudo apt install -y ufw
+```
+
+## Step 2: Check available app profiles
+
+UFW can use application profiles for common services.
+
+List them:
+
+```bash
+sudo ufw app list
+```
+
+You may see profiles such as:
+
+* `OpenSSH`
+* `Nginx Full`
+* `Apache Full`
+
+If `OpenSSH` exists, use it instead of manually allowing port 22.
+
+## Step 3: Set safe default policies
+
+Set the baseline policy first:
+
+```bash
+sudo ufw default deny incoming
+sudo ufw default allow outgoing
+```
+
+This means:
+
+* new inbound connections are blocked unless you explicitly allow them
+* outbound connections are allowed unless you explicitly block them
+
+## Step 4: Allow SSH before enabling UFW
+
+If your server uses the default SSH port:
+
+```bash
+sudo ufw allow OpenSSH
+```
+
+Or:
+
+```bash
+sudo ufw allow ssh
+```
+
+Or explicitly by port:
+
+```bash
+sudo ufw allow 22/tcp
+```
+
+If your SSH server runs on a custom port such as `2222`:
+
+```bash
+sudo ufw allow 2222/tcp
+```
+
+## Step 5: Optional but recommended — rate limit SSH
+
+This is a nice extra baseline for public servers:
+
+```bash
+sudo ufw limit ssh
+```
+
+Or, if you use a custom SSH port:
+
+```bash
+sudo ufw limit 2222/tcp
+```
+
+This helps reduce brute-force noise against SSH.
+
+## Step 6: Allow only the services you actually need
+
+### Web server example
+
+If this server runs a website, allow HTTP and HTTPS:
+
+```bash
+sudo ufw allow 80/tcp
+sudo ufw allow 443/tcp
+```
+
+Or with app profiles, if available:
+
+```bash
+sudo ufw allow 'Nginx Full'
+```
+
+### App server example
+
+If your app needs a custom port such as `3000`:
+
+```bash
+sudo ufw allow 3000/tcp
+```
+
+Only do this if that service should really be reachable from the network.
+
+### Database server example
+
+Do **not** expose databases publicly unless you truly mean to.
+
+Instead of opening MySQL or PostgreSQL to the world, prefer source-restricted rules.
+
+Example for MySQL from one trusted admin IP:
+
+```bash
+sudo ufw allow from 203.0.113.10 to any port 3306 proto tcp
+```
+
+Example for PostgreSQL from a private subnet:
+
+```bash
+sudo ufw allow from 10.0.0.0/24 to any port 5432 proto tcp
+```
+
+## Step 7: Review the rules before enabling
+
+Check what has been added so far:
+
+```bash
+sudo ufw show added
+```
+
+Check full status:
+
+```bash
+sudo ufw status verbose
+```
+
+If you want to preview a command without applying it, use `--dry-run`.
+
+Example:
+
+```bash
+sudo ufw --dry-run allow http
+```
+
+## Step 8: Enable the firewall
+
+Once you have confirmed that SSH is allowed, enable UFW:
+
+```bash
+sudo ufw enable
+```
+
+Then check status again:
+
+```bash
+sudo ufw status verbose
+```
+
+## Step 9: Test from a second terminal
+
+Open a second terminal and verify SSH still works:
+
+```bash
+ssh your-user@your-server
+```
+
+Then test public services from your workstation.
+
+### Test HTTP
+
+```bash
+curl -I http://your-domain-or-ip
+```
+
+### Test HTTPS
+
+```bash
+curl -I https://your-domain-or-ip
+```
+
+### Test a closed port
+
+From another machine, test a port that should not be open:
+
+```bash
+nc -zv your-server-ip 3306
+```
+
+That should fail unless you explicitly allowed it.
+
+## Step 10: Allow only specific IPs for sensitive services
+
+For admin-only or internal services, allow only trusted source IPs.
+
+Example: allow SSH only from your office IP:
+
+```bash
+sudo ufw delete allow OpenSSH
+sudo ufw allow from 203.0.113.10 to any port 22 proto tcp
+```
+
+Example: allow an internal dashboard only from a private subnet:
+
+```bash
+sudo ufw allow from 10.0.1.0/24 to any port 8080 proto tcp
+```
+
+This is much safer than exposing everything to the internet.
+
+## Step 11: Enable logging
+
+For most servers, low logging is a good start:
+
+```bash
+sudo ufw logging low
+```
+
+Check status:
+
+```bash
+sudo ufw status verbose
+```
+
+## Common real-world setups
+
+## Web server baseline
+
+For a typical web server:
+
+```bash
+sudo ufw default deny incoming
+sudo ufw default allow outgoing
+
+sudo ufw allow OpenSSH
+sudo ufw limit ssh
+
+sudo ufw allow 80/tcp
+sudo ufw allow 443/tcp
+
+sudo ufw enable
+```
+
+## SSH-only server baseline
+
+For a server that should only accept SSH:
+
+```bash
+sudo ufw default deny incoming
+sudo ufw default allow outgoing
+
+sudo ufw allow OpenSSH
+sudo ufw limit ssh
+
+sudo ufw enable
+```
+
+## Internal database server baseline
+
+For a database server reachable only from a private app subnet:
+
+```bash
+sudo ufw default deny incoming
+sudo ufw default allow outgoing
+
+sudo ufw allow OpenSSH
+sudo ufw limit ssh
+
+sudo ufw allow from 10.0.10.0/24 to any port 5432 proto tcp
+
+sudo ufw enable
+```
+
+## Useful day-to-day commands
+
+Show current rules:
+
+```bash
+sudo ufw status verbose
+```
+
+Show numbered rules:
+
+```bash
+sudo ufw status numbered
+```
+
+Delete a rule by number:
+
+```bash
+sudo ufw delete 3
+```
+
+Delete a rule by exact command:
+
+```bash
+sudo ufw delete allow 3000/tcp
+```
+
+Deny a specific IP:
+
+```bash
+sudo ufw deny from 198.51.100.25
+```
+
+Allow a subnet:
+
+```bash
+sudo ufw allow from 10.0.0.0/24
+```
+
+Allow a port range:
+
+```bash
+sudo ufw allow 6000:6007/tcp
+```
+
+## Troubleshooting
+
+### I got locked out after enabling UFW
+
+Use your VPS console or recovery panel and run:
+
+```bash
+sudo ufw disable
+```
+
+Then fix the SSH rule and try again.
+
+### My site returns connection refused or times out
+
+Check whether the needed port is allowed:
+
+```bash
+sudo ufw status numbered
+```
+
+If HTTP or HTTPS is missing, add it:
+
+```bash
+sudo ufw allow 80/tcp
+sudo ufw allow 443/tcp
+```
+
+### SSH still works, but only on one network
+
+You may have created a source-restricted rule.
+
+Check your rules:
+
+```bash
+sudo ufw status numbered
+```
+
+### I added the wrong rule
+
+Delete it by number:
+
+```bash
+sudo ufw status numbered
+sudo ufw delete RULE_NUMBER
+```
+
+## Rollback
+
+Temporarily disable UFW:
+
+```bash
+sudo ufw disable
+```
+
+Completely reset all UFW rules and start over:
+
+```bash
+sudo ufw reset
+```
+
+Then rebuild your rules from scratch.
+
+## Final working examples
+
+## Example 1 — Basic web server
+
+```bash
+sudo ufw default deny incoming
+sudo ufw default allow outgoing
+
+sudo ufw allow OpenSSH
+sudo ufw limit ssh
+
+sudo ufw allow 80/tcp
+sudo ufw allow 443/tcp
+
+sudo ufw logging low
+sudo ufw enable
+```
+
+## Example 2 — Web server using app profiles
+
+```bash
+sudo ufw default deny incoming
+sudo ufw default allow outgoing
+
+sudo ufw allow OpenSSH
+sudo ufw limit ssh
+
+sudo ufw allow 'Nginx Full'
+
+sudo ufw logging low
+sudo ufw enable
+```
+
+## Final verification commands
+
+```bash
+sudo ufw show added
+sudo ufw status verbose
+sudo ufw status numbered
+```
+
+## What to do next
+
+Once this works, the best next guides are:
+
+* [SSH Hardening](/docs/security/system-hardening/linux/ssh-hardening)
+* [Fail2Ban for SSH](/docs/security/system-hardening/linux/fail2ban)
+* [File Permissions](/docs/security/system-hardening/linux/file-permissions)
+* [Block Malicious Scanners in Nginx](/docs/security/web-security/nginx/block-malicious-scanners)
+
+This guide gives you the host firewall baseline most Linux servers actually need:
+
+* deny by default
+* allow only what is required
+* verify from a second session
+* roll back safely if needed

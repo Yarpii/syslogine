@@ -2,7 +2,7 @@ import type {SidebarsConfig} from '@docusaurus/plugin-content-docs';
 
 const sidebars: SidebarsConfig = {
   mainSidebar: [
-    'intro', // algemene intro
+    'intro',
 
     {
       type: 'category',
@@ -22,8 +22,133 @@ const sidebars: SidebarsConfig = {
       type: 'category',
       label: 'Security',
       link: { type: 'doc', id: 'security/index' },
-      items: [],
+      items: [
+        {
+          type: 'category',
+          label: 'Fundamentals',
+          link: { type: 'doc', id: 'security/fundamentals/index' },
+          items: [
+            'security/fundamentals/security-principles',
+            'security/fundamentals/threat-modeling',
+          ],
+        },
+        {
+          type: 'category',
+          label: 'System Hardening',
+          link: { type: 'doc', id: 'security/system-hardening/index' },
+          items: [
+            {
+              type: 'category',
+              label: 'Linux',
+              link: { type: 'doc', id: 'security/system-hardening/linux/index' },
+              items: [
+                'security/system-hardening/linux/ssh-hardening',
+                'security/system-hardening/linux/firewall-basics',
+                'security/system-hardening/linux/file-permissions',
+              ],
+            },
+            {
+              type: 'category',
+              label: 'Windows',
+              link: { type: 'doc', id: 'security/system-hardening/windows/index' },
+              items: [
+                'security/system-hardening/windows/group-policy-security',
+                'security/system-hardening/windows/bitlocker',
+                'security/system-hardening/windows/defender-hardening',
+              ],
+            },
+          ],
+        },
+        {
+          type: 'category',
+          label: 'Network Security',
+          link: { type: 'doc', id: 'security/network-security/index' },
+          items: [
+            {
+              type: 'category',
+              label: 'Firewalls',
+              link: { type: 'doc', id: 'security/network-security/firewalls/index' },
+              items: [
+                'security/network-security/firewalls/pfsense',
+                'security/network-security/firewalls/iptables',
+              ],
+            },
+            {
+              type: 'category',
+              label: 'VPN',
+              link: { type: 'doc', id: 'security/network-security/vpn/index' },
+              items: [
+                'security/network-security/vpn/openvpn',
+                'security/network-security/vpn/wireguard',
+              ],
+            },
+          ],
+        },
+        {
+          type: 'category',
+          label: 'Web Security',
+          link: { type: 'doc', id: 'security/web-security/index' },
+          items: [
+            {
+              type: 'category',
+              label: 'Nginx',
+              link: { type: 'doc', id: 'security/web-security/nginx/index' },
+              items: [
+                'security/web-security/nginx/block-malicious-scanners',
+                'security/web-security/nginx/rate-limiting',
+                'security/web-security/nginx/bot-protection',
+                'security/web-security/nginx/security-headers',
+                'security/web-security/nginx/tls-hardening',
+              ],
+            },
+            {
+              type: 'category',
+              label: 'Apache',
+              link: { type: 'doc', id: 'security/web-security/apache/index' },
+              items: [
+                'security/web-security/apache/block-malicious-scanners',
+              ],
+            },
+          ],
+        },
+        {
+          type: 'category',
+          label: 'Authentication',
+          link: { type: 'doc', id: 'security/authentication/index' },
+          items: [
+            'security/authentication/mfa',
+            'security/authentication/password-policies',
+          ],
+        },
+        {
+          type: 'category',
+          label: 'Compliance',
+          link: { type: 'doc', id: 'security/compliance/index' },
+          items: [
+            'security/compliance/gdpr',
+            'security/compliance/iso27001',
+            'security/compliance/audit-logging',
+          ],
+        },
+        {
+          type: 'category',
+          label: 'Monitoring',
+          link: { type: 'doc', id: 'security/monitoring/index' },
+          items: [
+            'security/monitoring/elk-stack',
+          ],
+        },
+        {
+          type: 'category',
+          label: 'Incident Response',
+          link: { type: 'doc', id: 'security/incident-response/index' },
+          items: [
+            'security/incident-response/playbooks',
+          ],
+        },
+      ],
     },
+
     {
       type: 'category',
       label: 'Web Development',
@@ -45,8 +170,6 @@ const sidebars: SidebarsConfig = {
       ],
     },
   ],
-
-
   linuxSidebar: [
     'linux/index',
     {

@@ -1,0 +1,454 @@
+---
+title: "Multi-Factor Authentication"
+sidebar_label: "MFA"
+sidebar_position: 1
+description: "Strengthen access control with practical multi-factor authentication guidance for users, admins, recovery flows, and phishing-resistant sign-in."
+keywords:
+  - mfa
+  - multi-factor authentication
+  - passkeys
+  - fido2
+  - phishing resistant authentication
+  - totp
+tags:
+  - security
+  - authentication
+  - mfa
+slug: /security/authentication/mfa
+---
+
+# Multi-Factor Authentication
+
+Passwords alone are not enough.
+
+Users reuse them, attackers phish them, malware steals them, and leaked credentials get replayed across services. Multi-factor authentication adds another layer so a stolen password is much less likely to become a full account compromise.
+
+This guide focuses on **practical MFA implementation** for websites, applications, internal systems, and admin access.
+
+## What MFA means
+
+MFA requires more than one **independent** authentication factor.
+
+Common factor types include:
+
+- **Something you know** — password or PIN
+- **Something you have** — authenticator app, hardware security key, smart card, passkey-enabled device
+- **Something you are** — fingerprint or face recognition
+
+Using two things from the same category does **not** count as proper MFA.
+
+Examples:
+
+- password + PIN = **not real MFA**
+- password + TOTP code = **MFA**
+- passkey + device biometric/PIN = **MFA**
+
+## Why MFA matters
+
+MFA is one of the highest-value security controls you can add to an account system.
+
+It helps reduce the impact of:
+
+- phishing
+- password reuse
+- credential stuffing
+- password spraying
+- guessed or weak passwords
+- stolen password databases
+
+It is especially important for:
+
+- admin accounts
+- email accounts
+- cloud dashboards
+- source code platforms
+- billing systems
+- HR systems
+- support tooling
+- VPN access
+- SSH and remote administration
+
+## Best-practice hierarchy
+
+Not all MFA methods are equally strong.
+
+### Best option: phishing-resistant MFA
+
+Phishing-resistant MFA is the strongest mainstream option for most organisations.
+
+Examples:
+
+- passkeys
+- FIDO2 security keys
+- some certificate-based or smart-card solutions
+
+These are much harder to phish or relay than codes sent by SMS, email, or standard push prompts.
+
+### Good option: authenticator app with TOTP
+
+TOTP apps are still widely used and much better than password-only authentication.
+
+They are a solid default for many communities and self-hosted platforms.
+
+### Weaker fallback options
+
+These are better than nothing, but should not be your ideal target for high-risk accounts:
+
+- SMS codes
+- email codes
+- basic push approval without extra protections
+
+## Recommended policy for most communities and platforms
+
+A practical starting policy looks like this:
+
+- Require MFA for all administrator accounts
+- Strongly encourage or require MFA for all user accounts
+- Prefer passkeys or hardware-backed methods where supported
+- Offer TOTP as a broad compatibility option
+- Use backup codes for recovery
+- Require re-authentication or step-up MFA for sensitive actions
+- Log all MFA enrollment, disablement, reset, and failure events
+
+## Where MFA should be required
+
+The most important place to require MFA is at login.
+
+But that is not enough by itself.
+
+You should also require MFA or step-up authentication for sensitive actions such as:
+
+- changing password
+- changing primary email address
+- disabling MFA
+- generating API keys
+- viewing or exporting sensitive data
+- elevating to an admin session
+- changing billing details
+- modifying team roles or permissions
+
+## Strong recommendation for admins
+
+If a user can administer the platform, manage infrastructure, view sensitive records, or impersonate users, that account should not rely on password-only access.
+
+For admin accounts, the strongest practical baseline is:
+
+- passkey or FIDO2 security key preferred
+- TOTP acceptable if phishing-resistant methods are not yet available
+- backup codes stored securely
+- separate recovery process
+- security event notifications enabled
+
+## Step 1: Choose your supported MFA methods deliberately
+
+Do not enable every method just because your identity provider offers them.
+
+A clean support model is usually better.
+
+### Recommended method stack
+
+For many platforms, this is a strong and practical order:
+
+1. **Passkeys / FIDO2**
+2. **TOTP authenticator app**
+3. **Backup recovery codes**
+4. **SMS only as a fallback if absolutely necessary**
+
+If you support SMS or email as a fallback, be explicit that they are weaker and should not be the preferred method for privileged accounts.
+
+## Step 2: Design enrollment carefully
+
+Enrollment is part of the security boundary.
+
+A weak enrollment flow can undermine strong MFA later.
+
+### Good enrollment practices
+
+- Require the user to already be authenticated
+- Re-prompt for password before enrolling a new factor
+- Confirm enrollment with a live verification step
+- Show backup codes once and tell the user to store them securely
+- Notify the user when MFA is enabled
+- Log who enrolled what method and when
+
+### Example enrollment flow
+
+1. User signs in
+2. User opens security settings
+3. System asks for current password again
+4. User registers passkey or scans TOTP secret
+5. User verifies with first challenge
+6. System generates backup codes
+7. User receives confirmation notification
+
+## Step 3: Provide backup recovery codes
+
+Users lose phones, replace devices, and forget to migrate authenticators.
+
+Backup codes help prevent unnecessary lockouts.
+
+### Good backup-code practices
+
+- Generate multiple one-time recovery codes
+- Show them only at enrollment or explicit regeneration time
+- Store only hashed versions server-side when possible
+- Invalidate old recovery codes when new ones are issued
+- Encourage offline storage in a password manager or secure vault
+
+Backup codes are powerful. Treat them like high-value secrets.
+
+## Step 4: Make recovery and reset flows as strong as login
+
+This is one of the most important MFA lessons.
+
+Attackers often go after the recovery flow instead of the normal login flow.
+
+A great MFA setup can still fail if account recovery is weak.
+
+### Bad recovery examples
+
+- “Email support and we will turn MFA off”
+- “Answer these easy personal questions”
+- “Click this email link and bypass the second factor”
+- “Use SMS reset for every account regardless of privilege”
+
+### Better recovery approaches
+
+- Backup recovery codes
+- Recovery using another already-enrolled strong factor
+- Admin-reviewed recovery with strong identity verification for high-risk accounts
+- Delayed recovery for sensitive accounts
+- User notification when recovery starts or completes
+
+### High-risk account recovery
+
+For administrator, finance, or security-sensitive accounts, recovery should be more controlled than for normal users.
+
+That may include:
+
+- manual review
+- out-of-band verification
+- mandatory waiting period
+- additional alerting
+- temporary restrictions after recovery
+
+## Step 5: Protect against MFA fatigue and push abuse
+
+Push-based MFA can be abused if users are spammed with approval prompts.
+
+If you must use push notifications, improve them with extra safeguards such as:
+
+- number matching
+- device context
+- location or session details
+- suspicious-sign-in detection
+
+Phishing-resistant MFA is the long-term fix, but number matching is a useful improvement over blind push approval.
+
+## Step 6: Use step-up MFA for sensitive actions
+
+Even after login, some actions deserve stronger confirmation.
+
+This is often called **step-up authentication**.
+
+Require it for actions like:
+
+- disabling MFA
+- changing recovery settings
+- changing email address
+- viewing sensitive exports
+- accessing admin panels
+- creating long-lived tokens
+- deleting accounts or tenant data
+
+That way, a stolen session alone is less dangerous.
+
+## Step 7: Log MFA events properly
+
+MFA should be part of your audit trail.
+
+At minimum, log:
+
+- MFA enabled
+- MFA disabled
+- MFA method added
+- MFA method removed
+- backup codes regenerated
+- recovery started
+- recovery completed
+- MFA challenge success
+- MFA challenge failure
+- repeated second-factor failures
+- step-up authentication events
+
+Useful fields include:
+
+- timestamp
+- actor ID
+- account ID
+- source IP
+- device or client context
+- method type
+- result
+- request or correlation ID
+
+## Step 8: Notify users about important MFA events
+
+Users should know when security settings change.
+
+Send clear notifications for:
+
+- MFA enabled
+- MFA disabled
+- new MFA method added
+- recovery initiated
+- recovery completed
+- unusual failed login patterns
+
+This helps users spot account abuse early.
+
+## Step 9: Treat service accounts differently
+
+Service accounts, API integrations, and machine identities usually do not use human MFA the same way user accounts do.
+
+Instead, protect them with controls such as:
+
+- short-lived tokens
+- workload identity
+- strict scoping
+- rotation
+- IP restrictions where appropriate
+- audit logging
+- no interactive login unless absolutely required
+
+Do not “solve” service-account security by trying to force human MFA patterns onto automation.
+
+## Choosing between passkeys, TOTP, SMS, and email
+
+### Passkeys / FIDO2
+
+Best when you want:
+
+- phishing resistance
+- better user experience
+- strong authentication for admins
+- fewer shared-secret problems
+
+### TOTP apps
+
+Best when you want:
+
+- broad compatibility
+- a strong improvement over passwords
+- a widely understood second factor
+
+### SMS
+
+Use only when necessary and with clear limitations.
+
+It is better than password-only authentication, but it is not phishing-resistant and should not be your preferred option for sensitive accounts.
+
+### Email codes
+
+Usually one of the weakest MFA options, especially if email is already the primary account recovery channel.
+
+Use carefully, if at all.
+
+## Suggested rollout for a community platform
+
+If you run a website or platform with a broad community, a practical rollout could be:
+
+### Phase 1
+
+- Require MFA for admins and moderators
+- Offer TOTP to all users
+- Add backup codes
+- Log MFA events
+- Notify users on MFA changes
+
+### Phase 2
+
+- Add passkey support
+- Encourage passkeys for staff and privileged users
+- Add step-up MFA for sensitive actions
+- Harden recovery workflow
+
+### Phase 3
+
+- Require MFA for all users or for all users with elevated capabilities
+- Prefer phishing-resistant methods for privileged roles
+- Add risk-based prompts for suspicious logins
+- Review and reduce weaker fallback methods
+
+## Common mistakes
+
+### Supporting MFA but not requiring it anywhere important
+
+If admins can still use password-only login, the biggest risk remains open.
+
+### Weak recovery flow
+
+Recovery is often the easiest MFA bypass path.
+
+### Allowing MFA disablement without fresh verification
+
+Disabling MFA should itself require strong re-authentication.
+
+### No backup-code strategy
+
+This creates unnecessary support load and unsafe manual exceptions.
+
+### Not logging MFA events
+
+Without logging, investigations and abuse detection are much harder.
+
+### Blind trust in SMS or email OTP
+
+These are compatibility tools, not the strongest long-term answer.
+
+### Ignoring APIs and alternate login paths
+
+If the web UI requires MFA but the API or mobile path does not, attackers will use the weaker path.
+
+## Practical checklist
+
+Use this as a working baseline:
+
+- Require MFA for admin accounts
+- Offer MFA to all users
+- Prefer passkeys or FIDO2 when possible
+- Offer TOTP for compatibility
+- Generate one-time backup codes
+- Re-authenticate before MFA changes
+- Protect recovery and reset flows
+- Add step-up MFA for sensitive actions
+- Log MFA lifecycle events
+- Notify users of MFA changes
+- Review weaker fallback methods regularly
+
+## Summary
+
+MFA is one of the most valuable authentication controls you can deploy.
+
+A strong implementation does not stop at “enter a six-digit code.” It also includes:
+
+- strong method choices
+- safe enrollment
+- secure recovery
+- logging and alerts
+- step-up protection for sensitive actions
+- clear policy for privileged accounts
+
+If you want the best practical direction, aim for:
+
+- **phishing-resistant MFA where possible**
+- **TOTP where broad compatibility matters**
+- **strong recovery and audit controls everywhere**
+
+:::tip Good next guides
+This page pairs especially well with:
+
+- [Password Policies](/docs/security/authentication/password-policies)
+- [SSH Hardening](/docs/security/system-hardening/linux/ssh-hardening)
+- [Audit Logging Setup](/docs/security/compliance/audit-logging)
+:::

@@ -1,0 +1,469 @@
+---
+title: "SSH Hardening"
+sidebar_label: "SSH Hardening"
+sidebar_position: 1
+description: "Harden SSH on Linux with safer authentication, restricted access, and a rollout process that avoids locking you out."
+keywords:
+  - ssh hardening
+  - openssh
+  - linux ssh security
+  - ssh keys
+  - disable password login
+tags:
+  - security
+  - linux
+  - ssh
+  - hardening
+slug: /security/system-hardening/linux/ssh-hardening
+---
+
+# SSH Hardening
+
+SSH is one of the most important services to harden on a Linux server.
+
+If your server is public, SSH will be scanned constantly. A good SSH setup should do three things well:
+
+- allow trusted administrators in
+- reject weak or unnecessary authentication paths
+- reduce the chance of mistakes during rollout
+
+This guide focuses on practical OpenSSH hardening for Linux servers.
+
+## What you'll do
+
+In this guide, you will:
+
+- move to SSH keys
+- disable direct root logins over SSH
+- disable password-based SSH authentication
+- limit who can log in
+- reduce unnecessary SSH features
+- test changes safely before cutting off old access
+
+:::warning Do not lock yourself out
+Before changing SSH settings:
+
+- keep your current SSH session open
+- test from a **second** terminal
+- make sure you have console, VPS panel, or rescue access
+- confirm your admin user has `sudo` access before disabling root SSH login
+:::
+
+## Recommended hardening order
+
+The safest order is:
+
+1. create and test a non-root admin account
+2. add your SSH key
+3. verify key-based login works
+4. restrict SSH to that user or group
+5. disable password authentication
+6. disable direct root SSH login
+7. reload SSH and test again from a second session
+
+That order is much safer than changing everything at once.
+
+## Step 1: Create or verify an admin user
+
+Do not harden SSH around `root` as your primary login.
+
+Create a normal administrative user if you do not already have one:
+
+```bash
+sudo adduser deploy
+sudo usermod -aG sudo deploy
+````
+
+On distributions that use the `wheel` group instead of `sudo`, add the user to the correct administrative group for that system.
+
+## Step 2: Generate a strong SSH key on your local machine
+
+On your local computer, generate a key pair:
+
+```bash
+ssh-keygen -t ed25519 -a 100 -C "deploy@example-server"
+```
+
+This creates a modern SSH key you can use for public key authentication.
+
+If you already use a strong key and manage it properly, you do not need to create a new one just for this guide.
+
+:::tip Use a passphrase
+A passphrase protects your private key if your laptop or workstation is compromised.
+
+A strong key without a passphrase is still better than password-only SSH, but a passphrase is the safer setup.
+:::
+
+## Step 3: Install your public key on the server
+
+If `ssh-copy-id` is available:
+
+```bash
+ssh-copy-id deploy@example.com
+```
+
+Or install it manually:
+
+```bash
+mkdir -p ~/.ssh
+chmod 700 ~/.ssh
+nano ~/.ssh/authorized_keys
+chmod 600 ~/.ssh/authorized_keys
+```
+
+Paste your public key into `~/.ssh/authorized_keys`.
+
+## Step 4: Test key-based login before changing SSH settings
+
+From a new terminal:
+
+```bash
+ssh deploy@example.com
+```
+
+Do not continue until this works reliably.
+
+Also test privilege escalation:
+
+```bash
+sudo -v
+```
+
+If your admin account cannot elevate properly, fix that first.
+
+## Step 5: Back up your SSH server configuration
+
+Back up the current config before editing it:
+
+```bash
+sudo cp /etc/ssh/sshd_config /etc/ssh/sshd_config.bak
+```
+
+## Step 6: Apply a practical SSH hardening baseline
+
+Edit:
+
+```bash
+sudo nano /etc/ssh/sshd_config
+```
+
+Use a clean baseline like this:
+
+```sshconfig
+# Listen on the default SSH port
+Port 22
+
+# Authentication
+PermitRootLogin no
+PubkeyAuthentication yes
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PermitEmptyPasswords no
+
+# Access control
+AllowUsers deploy
+
+# Reduce brute-force room
+MaxAuthTries 3
+LoginGraceTime 30
+
+# Keep sessions healthy
+ClientAliveInterval 300
+ClientAliveCountMax 2
+
+# Reduce unnecessary features
+X11Forwarding no
+
+# Logging
+LogLevel VERBOSE
+```
+
+## Why these settings are good defaults
+
+### `PermitRootLogin no`
+
+Do not allow direct SSH login as `root`.
+
+Administrators should log in as a normal user and escalate privileges when needed.
+
+That gives you cleaner operational habits and reduces the impact of weak or stolen credentials.
+
+### `PubkeyAuthentication yes`
+
+Keep public key authentication enabled.
+
+This should become your primary administrative login method.
+
+### `PasswordAuthentication no`
+
+Disable password-based SSH login once your SSH keys are working.
+
+This removes one of the most heavily targeted authentication paths on internet-facing servers.
+
+### `KbdInteractiveAuthentication no`
+
+Disable keyboard-interactive authentication unless you explicitly need it.
+
+This matters because on many systems, keyboard-interactive authentication can still provide a password-like login path even after you disable `PasswordAuthentication`.
+
+### `AllowUsers deploy`
+
+Limit SSH access to only the accounts that actually need it.
+
+If you have multiple administrators, list them explicitly:
+
+```sshconfig
+AllowUsers deploy alice bob
+```
+
+## Alternative: use a group instead of a hardcoded user list
+
+If you manage several admins, a group is often easier to maintain.
+
+Example:
+
+```bash
+sudo groupadd sshusers
+sudo usermod -aG sshusers deploy
+```
+
+Then in `sshd_config`:
+
+```sshconfig
+AllowGroups sshusers
+```
+
+That way, access is managed through group membership instead of editing the SSH config every time.
+
+## Optional: reduce forwarding features if you do not use them
+
+If the server is only for shell access and administration, you may want to disable extra forwarding features.
+
+Example:
+
+```sshconfig
+AllowAgentForwarding no
+AllowTcpForwarding no
+```
+
+Only do this if it matches how your team actually works.
+
+If you rely on SSH tunnels, local forwarding, remote forwarding, or agent forwarding, leave those enabled or control them more selectively.
+
+## Optional: use a restricted `Match` block for special accounts
+
+If you have a backup or automation user, you can apply narrower rules with a `Match` block.
+
+Example:
+
+```sshconfig
+Match User backup
+    X11Forwarding no
+    AllowTcpForwarding no
+    PermitTTY no
+```
+
+For highly restricted SSH accounts, this is often cleaner than forcing one global policy on every user.
+
+## About changing the SSH port
+
+Changing the SSH port can reduce background noise in your logs, but it is **not** real authentication hardening.
+
+If you want to move it for operational reasons, do it only after key-based access is working and your firewall rules are updated.
+
+Do not treat a port change as a replacement for proper SSH hardening.
+
+## Step 7: Validate the configuration before reloading
+
+Check the syntax and key sanity first:
+
+```bash
+sudo sshd -t
+```
+
+If you want to inspect the effective configuration too:
+
+```bash
+sudo sshd -T
+```
+
+Do not reload SSH until `sshd -t` succeeds cleanly.
+
+## Step 8: Reload SSH safely
+
+The service name varies by distro, so one of these is usually correct:
+
+```bash
+sudo systemctl reload sshd
+```
+
+or:
+
+```bash
+sudo systemctl reload ssh
+```
+
+If reload is not available in your environment, use restart carefully:
+
+```bash
+sudo systemctl restart sshd
+```
+
+## Step 9: Test from a second terminal
+
+Open a **new** terminal and test login again:
+
+```bash
+ssh deploy@example.com
+```
+
+Confirm that:
+
+* your SSH key works
+* password login is no longer accepted
+* root cannot log in directly
+* `sudo` still works after login
+
+Only close your original session after that test succeeds.
+
+## A safer phased rollout if you're nervous
+
+If you want an extra-cautious rollout, split the change into two passes.
+
+### Pass 1
+
+Set:
+
+```sshconfig
+PermitRootLogin no
+PubkeyAuthentication yes
+PasswordAuthentication yes
+KbdInteractiveAuthentication yes
+AllowUsers deploy
+```
+
+Test your new admin user first.
+
+### Pass 2
+
+After key-based login is confirmed, change to:
+
+```sshconfig
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+```
+
+Then test again.
+
+This phased approach is slower, but it is friendlier for production servers.
+
+## Optional companion protection: Fail2Ban
+
+Fail2Ban can help reduce repeated SSH password guessing and nuisance login attempts.
+
+It is a useful companion, but it should be treated as **secondary protection**, not as a substitute for:
+
+* SSH keys
+* no direct root SSH login
+* restricted SSH users
+* proper firewalling
+
+That is why this guide keeps SSH hardening focused on OpenSSH itself.
+
+## What to avoid
+
+### Do not disable root SSH before verifying sudo access
+
+If your new admin user cannot elevate privileges, you can strand yourself.
+
+### Do not disable passwords before testing keys
+
+Always prove key-based login works first.
+
+### Do not make many SSH changes in one shot without a second session
+
+That is one of the most common lockout mistakes.
+
+### Do not copy giant legacy crypto blocks from old tutorials
+
+Modern OpenSSH already has sensible cryptographic defaults.
+
+If you need legacy compatibility, handle it deliberately instead of pasting outdated cipher lists into production.
+
+### Do not overcomplicate the first version
+
+A short, understandable `sshd_config` is better than a giant file no one on the team can reason about.
+
+## Example final config
+
+Here is a strong, clean baseline for many Linux VPS and dedicated servers:
+
+```sshconfig
+Port 22
+
+PermitRootLogin no
+PubkeyAuthentication yes
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PermitEmptyPasswords no
+
+AllowUsers deploy
+
+MaxAuthTries 3
+LoginGraceTime 30
+
+ClientAliveInterval 300
+ClientAliveCountMax 2
+
+X11Forwarding no
+LogLevel VERBOSE
+```
+
+## Troubleshooting
+
+### I can still log in with a password
+
+Check whether keyboard-interactive authentication is still enabled.
+
+On many Linux systems, `KbdInteractiveAuthentication` is the setting people forget.
+
+### My new user can log in but cannot use `sudo`
+
+Fix group membership or sudoers configuration before disabling root SSH access.
+
+### `AllowUsers` blocked me accidentally
+
+Use console or rescue access, restore the backup config, and test again more carefully.
+
+### Reload failed
+
+Run:
+
+```bash
+sudo sshd -t
+```
+
+again and fix the reported error before retrying.
+
+## Summary
+
+SSH hardening does not need to be complicated.
+
+A strong baseline is:
+
+* no direct root SSH login
+* public key authentication
+* no password or keyboard-interactive login
+* only approved users allowed
+* careful validation before reload
+* testing from a second session before closing the first one
+
+That gives your server a much safer administrative entry point without turning day-to-day operations into a headache.
+
+:::tip Good next guides
+This guide pairs especially well with:
+
+* [Firewall Basics](/docs/security/system-hardening/linux/firewall-basics)
+* [Multi-Factor Authentication](/docs/security/authentication/mfa)
+* [Incident Response Playbooks](/docs/security/incident-response/playbooks)
+  :::

@@ -1,0 +1,287 @@
+---
+title: "Bot Protection in Nginx"
+sidebar_label: "Bot Protection"
+sidebar_position: 3
+description: "Reduce nuisance automation and low-value bot traffic in Nginx with practical filtering, rate limiting, and access control."
+keywords:
+  - nginx
+  - bot protection
+  - bot filtering
+  - bad bots
+  - user-agent filtering
+tags:
+  - security
+  - nginx
+  - web-security
+slug: /security/web-security/nginx/bot-protection
+---
+
+# Bot Protection in Nginx
+
+Bot protection in Nginx is about **reducing low-value automated traffic** without breaking real users.
+
+That includes things like:
+
+- noisy scanners
+- basic scrapers
+- request floods against expensive endpoints
+- repeated probes against admin paths
+- obvious automation using common tool user agents
+
+This guide keeps things practical and lightweight.
+
+## Important reality check
+
+Nginx can block and slow down a lot of nuisance traffic, but it cannot magically identify every “bad bot”.
+
+A bot can:
+
+- spoof a user agent
+- rotate IPs
+- distribute traffic across many clients
+
+That means the best Nginx approach is usually a combination of:
+
+- path blocking
+- rate limiting
+- connection limiting
+- IP allowlists on sensitive routes
+- narrow user-agent filtering for obvious cases
+
+:::warning Do not rely on user-agent matching alone
+User-agent strings are easy to spoof.
+
+Treat user-agent filtering as a **cheap first layer**, not as your only defense.
+:::
+
+## Step 1: Make sure client IPs are correct
+
+If you are behind a trusted CDN, reverse proxy, or load balancer, configure real IP handling first.
+
+```nginx
+# http context
+set_real_ip_from 10.0.0.0/8;
+set_real_ip_from 172.16.0.0/12;
+set_real_ip_from 192.168.0.0/16;
+
+real_ip_header X-Forwarded-For;
+real_ip_recursive on;
+````
+
+If you skip this in a proxied setup, later controls such as rate limits and allow/deny rules may behave incorrectly.
+
+## Step 2: Define lightweight bot-related maps and zones
+
+Create a shared snippet in the `http` context:
+
+```bash
+/etc/nginx/snippets/bot-protection-zones.conf
+```
+
+Add:
+
+```nginx
+# Flag a few obvious automation user agents
+map $http_user_agent $is_obvious_bot {
+  default 0;
+
+  ~*(?:curl|wget|python-requests|python-urllib|libwww-perl) 1;
+  ~*(?:sqlmap|nikto|masscan|zgrab|acunetix|nessus) 1;
+  ~*(?:scrapy|httpclient|go-http-client|java/) 1;
+}
+
+# Request-rate controls for dynamic paths
+limit_req_zone $binary_remote_addr zone=bot_per_ip:10m rate=5r/s;
+
+# Optional connection cap for expensive locations
+limit_conn_zone $binary_remote_addr zone=bot_conn_per_ip:10m;
+```
+
+## Step 3: Apply practical controls in the server block
+
+```nginx
+server {
+  listen 443 ssl http2;
+  server_name example.com www.example.com;
+
+  limit_req_status 429;
+  limit_req_log_level notice;
+
+  # Optional: cheap first-pass block for obvious automation tools
+  if ($is_obvious_bot) {
+    return 403;
+  }
+
+  # Quiet down common noise
+  location = /favicon.ico {
+    access_log off;
+    log_not_found off;
+  }
+
+  # Protect admin paths with an IP allowlist whenever possible
+  location ^~ /admin/ {
+    allow 203.0.113.10;
+    allow 198.51.100.25;
+    deny all;
+
+    proxy_pass http://app_backend;
+  }
+
+  # Protect login endpoints
+  location = /login {
+    limit_req zone=bot_per_ip burst=10 nodelay;
+    limit_conn bot_conn_per_ip 10;
+    proxy_pass http://app_backend;
+  }
+
+  # Protect APIs or expensive dynamic routes
+  location /api/ {
+    limit_req zone=bot_per_ip burst=20 nodelay;
+    limit_conn bot_conn_per_ip 20;
+    proxy_pass http://app_backend;
+  }
+
+  location / {
+    proxy_pass http://app_backend;
+  }
+}
+```
+
+## Why this pattern works
+
+This guide uses **several small controls together** instead of pretending one rule solves everything.
+
+### 1. Narrow user-agent filtering
+
+The `map` block lets you flag obvious automation clients with case-insensitive matching.
+
+This is useful for:
+
+* common CLI tools
+* security scanners
+* trivial scraping clients
+
+Keep the list short and intentional.
+
+### 2. Request limiting
+
+If a client is too aggressive on login or API routes, `limit_req` slows or rejects it.
+
+### 3. Connection limiting
+
+`limit_conn` is helpful when a client opens too many concurrent requests against expensive routes.
+
+### 4. IP allowlists
+
+Sensitive admin paths are often best protected by **allow/deny** rules rather than public exposure.
+
+If a route should only be used by your team, say so at the web layer.
+
+## Optional: block selected paths for everyone except your team
+
+If you have internal tools or dashboard routes, combine allow/deny with exact paths.
+
+```nginx
+location = /internal-dashboard {
+  allow 203.0.113.10;
+  allow 198.51.100.25;
+  deny all;
+
+  proxy_pass http://app_backend;
+}
+```
+
+## Optional: protect download or export endpoints
+
+Heavy endpoints are common bot targets.
+
+```nginx
+location /exports/ {
+  limit_req zone=bot_per_ip burst=5 nodelay;
+  limit_conn bot_conn_per_ip 5;
+  proxy_pass http://app_backend;
+}
+```
+
+## What to avoid
+
+### Giant bad-bot lists
+
+Huge copied user-agent lists are hard to maintain and often become noisy and brittle.
+
+### Blocking search engines blindly
+
+Do not casually block legitimate crawlers if discoverability matters for your site.
+
+### Exposing admin paths publicly “because authentication exists”
+
+If a path does not need to be public, do not leave it public.
+
+### Mixing too many concerns into one rule
+
+Bot protection is more maintainable when you keep concerns separate:
+
+* scanner path blocking
+* login rate limiting
+* admin IP allowlisting
+* headers
+* TLS
+
+## Testing
+
+Validate config:
+
+```bash
+sudo nginx -t
+```
+
+Reload:
+
+```bash
+sudo nginx -s reload
+```
+
+Check a blocked user-agent:
+
+```bash
+curl -A "curl/8.0.1" -I https://example.com/
+```
+
+Check an allowlisted admin route from an unauthorized IP:
+
+```bash
+curl -I https://example.com/admin/
+```
+
+## Troubleshooting
+
+### My CDN IP is getting blocked instead of users
+
+You likely need correct real IP handling.
+
+### Legitimate clients are getting blocked
+
+Your user-agent match is probably too broad, or your login/API limits are too strict.
+
+### My admin panel is still getting hammered
+
+If possible, combine this guide with:
+
+* [Block Malicious Scanners](/docs/security/web-security/nginx/block-malicious-scanners)
+* a non-public admin path
+* stronger authentication
+* upstream application protections
+
+## Summary
+
+Good Nginx bot protection is not one magic rule.
+
+The practical formula is:
+
+1. trust the real client IP
+2. block obvious automation carefully
+3. rate-limit sensitive endpoints
+4. limit concurrency where needed
+5. IP-restrict admin paths whenever possible
+
+That is simple, maintainable, and effective against a large amount of low-value bot traffic.

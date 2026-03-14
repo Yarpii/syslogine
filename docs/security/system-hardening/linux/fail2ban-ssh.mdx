@@ -1,0 +1,414 @@
+---
+title: "Fail2Ban for SSH"
+sidebar_label: "Fail2Ban for SSH"
+sidebar_position: 4
+description: "Install and configure Fail2Ban to protect SSH from brute-force attempts on Linux servers."
+keywords:
+  - fail2ban
+  - ssh
+  - linux security
+  - brute force protection
+  - ssh hardening
+tags:
+  - security
+  - linux
+  - ssh
+  - fail2ban
+slug: /security/system-hardening/linux/fail2ban-ssh
+---
+
+# Fail2Ban for SSH
+
+This guide shows you how to install **Fail2Ban** and use it to protect **SSH** from brute-force login attempts.
+
+You will:
+
+- install Fail2Ban
+- enable the `sshd` jail
+- ban repeat login failures
+- verify it works
+- unban an IP if you lock yourself out
+- roll back cleanly if needed
+
+:::warning Keep your current SSH session open
+Before you change anything:
+
+- keep your current SSH terminal open
+- open a second terminal for testing
+- make sure you have VPS console or recovery access
+:::
+
+## What you'll build
+
+At the end of this guide, your server will:
+
+- watch SSH authentication failures
+- ban IPs that fail too many times
+- automatically unban them after a set time
+- let you inspect bans with `fail2ban-client`
+
+## Prerequisites
+
+This guide is written for:
+
+- Debian
+- Ubuntu
+- other systemd-based Linux servers with OpenSSH
+
+You should already have:
+
+- SSH access
+- `sudo` privileges
+- OpenSSH server running
+
+## Step 1: Install Fail2Ban
+
+On Debian or Ubuntu:
+
+```bash
+sudo apt update
+sudo apt install -y fail2ban
+````
+
+Enable it at boot:
+
+```bash
+sudo systemctl enable fail2ban
+```
+
+Start it now:
+
+```bash
+sudo systemctl start fail2ban
+```
+
+Check that the service is running:
+
+```bash
+sudo systemctl status fail2ban
+```
+
+## Step 2: Create an SSH jail
+
+Do **not** edit `/etc/fail2ban/jail.conf`.
+
+Create a local override instead:
+
+```bash
+sudo mkdir -p /etc/fail2ban/jail.d
+sudo nano /etc/fail2ban/jail.d/sshd.local
+```
+
+Paste this:
+
+```ini
+[DEFAULT]
+bantime  = 1h
+findtime = 10m
+maxretry = 5
+ignoreip = 127.0.0.1/8 ::1
+
+[sshd]
+enabled = true
+backend = systemd
+mode = normal
+```
+
+Save the file.
+
+## What this config does
+
+* `bantime = 1h`
+  Ban the IP for 1 hour
+
+* `findtime = 10m`
+  Count failures inside a 10 minute window
+
+* `maxretry = 5`
+  Ban after 5 failed attempts in that window
+
+* `ignoreip = 127.0.0.1/8 ::1`
+  Never ban localhost
+
+* `enabled = true`
+  Turn on the SSH jail
+
+* `backend = systemd`
+  Read SSH events from the systemd journal
+
+* `mode = normal`
+  Start with the default SSH filter mode
+
+:::tip Start with `mode = normal`
+`normal` is the safest starting point.
+
+Once you verify everything works, you can test `mode = aggressive` later.
+:::
+
+## Step 3: Restart Fail2Ban
+
+Apply the config:
+
+```bash
+sudo systemctl restart fail2ban
+```
+
+Check the service again:
+
+```bash
+sudo systemctl status fail2ban
+```
+
+## Step 4: Verify the SSH jail is loaded
+
+List active jails:
+
+```bash
+sudo fail2ban-client status
+```
+
+You should see `sshd` in the jail list.
+
+Now inspect the SSH jail:
+
+```bash
+sudo fail2ban-client status sshd
+```
+
+You should see details like:
+
+* currently failed attempts
+* total failed attempts
+* banned IP list
+
+## Step 5: Check logs
+
+If something does not look right, inspect the service logs:
+
+```bash
+sudo journalctl -u fail2ban --no-pager -n 50
+```
+
+This is usually the fastest way to spot config mistakes.
+
+## Step 6: Safe test without locking yourself out
+
+A safe first test is to manually ban and unban an IP.
+
+First, find your public IP from your workstation, then run:
+
+```bash
+sudo fail2ban-client set sshd banip YOUR.IP.ADDRESS.HERE
+```
+
+Check status:
+
+```bash
+sudo fail2ban-client status sshd
+```
+
+Now unban it:
+
+```bash
+sudo fail2ban-client set sshd unbanip YOUR.IP.ADDRESS.HERE
+```
+
+Check again:
+
+```bash
+sudo fail2ban-client status sshd
+```
+
+## Step 7: Real test with failed SSH logins
+
+Now test actual detection.
+
+From a **different terminal** or a **different device**, intentionally fail SSH login 5 times.
+
+Example:
+
+```bash
+ssh fakeuser@your-server-ip
+```
+
+Enter a wrong password repeatedly until the retry threshold is reached.
+
+Then check:
+
+```bash
+sudo fail2ban-client status sshd
+```
+
+You should see the attacking IP in the banned list.
+
+:::warning Do not test from your only active admin session
+If you test from the same IP you are actively using for real administration, you can ban yourself.
+
+Use a second device, a mobile hotspot, or be ready to unban yourself from console access.
+:::
+
+## Optional: Use a stricter SSH mode later
+
+Once the base setup works, you can try a stricter mode.
+
+Edit:
+
+```bash
+sudo nano /etc/fail2ban/jail.d/sshd.local
+```
+
+Change:
+
+```ini
+mode = aggressive
+```
+
+Then restart:
+
+```bash
+sudo systemctl restart fail2ban
+```
+
+Check status again:
+
+```bash
+sudo fail2ban-client status sshd
+```
+
+## Optional: Use a custom SSH port
+
+If your SSH server listens on a custom port, add it to the jail:
+
+```ini
+[sshd]
+enabled = true
+backend = systemd
+mode = normal
+port = 2222
+```
+
+If you use the standard SSH port, you can leave `port` out.
+
+## Optional: If your server uses log files instead of journald
+
+Some systems read SSH auth failures from a log file instead of the systemd journal.
+
+If `backend = systemd` does not work for your environment, replace the jail section with:
+
+```ini
+[sshd]
+enabled = true
+logpath = /var/log/auth.log
+mode = normal
+```
+
+Then restart Fail2Ban again:
+
+```bash
+sudo systemctl restart fail2ban
+```
+
+## Troubleshooting
+
+### `sshd` jail does not appear
+
+Check config syntax and restart logs:
+
+```bash
+sudo fail2ban-client -d
+sudo journalctl -u fail2ban --no-pager -n 100
+```
+
+### Service starts but nothing gets banned
+
+Check that SSH failures are actually being logged.
+
+Try:
+
+```bash
+sudo journalctl -u ssh --no-pager -n 50
+```
+
+or:
+
+```bash
+sudo journalctl -u sshd --no-pager -n 50
+```
+
+If your distro writes SSH logs to a file instead, use the `logpath` version of the jail.
+
+### You banned yourself
+
+Use server console or another allowed session and run:
+
+```bash
+sudo fail2ban-client set sshd unbanip YOUR.IP.ADDRESS.HERE
+```
+
+### You changed the config and it stopped working
+
+Review the Fail2Ban logs:
+
+```bash
+sudo journalctl -u fail2ban --no-pager -n 100
+```
+
+Then restore the working config from backup.
+
+## Rollback
+
+If you want to disable this guide completely:
+
+Stop using the custom jail:
+
+```bash
+sudo rm -f /etc/fail2ban/jail.d/sshd.local
+sudo systemctl restart fail2ban
+```
+
+Or disable Fail2Ban entirely:
+
+```bash
+sudo systemctl disable --now fail2ban
+```
+
+## Final working config
+
+```ini
+[DEFAULT]
+bantime  = 1h
+findtime = 10m
+maxretry = 5
+ignoreip = 127.0.0.1/8 ::1
+
+[sshd]
+enabled = true
+backend = systemd
+mode = normal
+```
+
+## Final verification commands
+
+```bash
+sudo systemctl status fail2ban
+sudo fail2ban-client status
+sudo fail2ban-client status sshd
+sudo journalctl -u fail2ban --no-pager -n 50
+```
+
+## What to do next
+
+Once this works, the best next guides are:
+
+* [SSH Hardening](/docs/security/system-hardening/linux/ssh-hardening)
+* Firewall basics
+* UFW setup
+* WireGuard
+* Nginx hardening
+
+Fail2Ban is a great layer, but it works best when combined with:
+
+* SSH keys
+* disabled password logins where possible
+* restricted admin users
+* a proper firewall

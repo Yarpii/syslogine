@@ -1,0 +1,219 @@
+---
+title: "Block Malicious Scanners in Nginx"
+sidebar_label: "Block Malicious Scanners"
+sidebar_position: 1
+description: "Reduce noisy probes and opportunistic scans in Nginx by blocking common WordPress, phpMyAdmin, and related scanner paths."
+keywords:
+  - nginx
+  - security
+  - scanner blocking
+  - bot blocking
+  - wp-admin
+  - wp-login
+  - xmlrpc
+  - phpmyadmin
+tags:
+  - security
+  - nginx
+  - web-security
+slug: /security/web-security/nginx/block-malicious-scanners
+---
+
+# Block Malicious Scanners in Nginx
+
+Public-facing servers are constantly scanned for common admin panels, CMS logins, backup paths, and known default endpoints such as `/wp-admin`, `/wp-login.php`, `/xmlrpc.php`, and `/phpmyadmin/`.
+
+This guide shows how to block those requests directly in **Nginx** using a small reusable snippet.
+
+## What this guide covers
+
+In this guide you will:
+
+- Block common scanner paths before they reach your app
+- Reduce noise from opportunistic probes
+- Keep the config modular so you can reuse it across sites
+- Use a safe default response that is easy to test
+
+:::danger Do not block paths you actually use
+If this server really runs WordPress, phpMyAdmin, Joomla, or another app that depends on these routes, do **not** block those paths here.
+:::
+
+:::tip Recommended default
+Start with `return 404;` because it is predictable and easy to validate.  
+Once you are happy with the behavior, you can switch selected rules to `return 444;` if you prefer dropping the connection instead.
+:::
+
+## Recommended approach
+
+Create a reusable Nginx snippet and include it inside the relevant `server` block.
+
+### Step 1: Create the scanner-blocking snippet
+
+Create this file:
+
+```bash
+/etc/nginx/snippets/block-common-scanners.conf
+````
+
+Add:
+
+```nginx
+# Block common WordPress probes
+location = /wp-login.php {
+  access_log off;
+  return 404;
+}
+
+location = /xmlrpc.php {
+  access_log off;
+  return 404;
+}
+
+location ^~ /wp-admin/ {
+  access_log off;
+  return 404;
+}
+
+location ^~ /wp-content/ {
+  access_log off;
+  return 404;
+}
+
+location ^~ /wp-includes/ {
+  access_log off;
+  return 404;
+}
+
+# Block common phpMyAdmin probes
+location ^~ /phpmyadmin/ {
+  access_log off;
+  return 404;
+}
+
+location ^~ /phpMyAdmin/ {
+  access_log off;
+  return 404;
+}
+
+location ^~ /pma/ {
+  access_log off;
+  return 404;
+}
+
+# Block a few other common admin probes
+location ^~ /cgi-bin/ {
+  access_log off;
+  return 404;
+}
+
+location = /administrator/index.php {
+  access_log off;
+  return 404;
+}
+```
+
+## Step 2: Include the snippet in your site config
+
+Inside your site’s `server` block:
+
+```nginx
+server {
+  listen 80;
+  server_name example.com www.example.com;
+
+  include /etc/nginx/snippets/block-common-scanners.conf;
+
+  location / {
+    try_files $uri $uri/ /index.html;
+  }
+}
+```
+
+If you also serve HTTPS, include the same snippet in the TLS `server` block too.
+
+## Step 3: Test the configuration
+
+Always test before reloading:
+
+```bash
+sudo nginx -t
+```
+
+If the syntax test passes, reload Nginx:
+
+```bash
+sudo nginx -s reload
+```
+
+## Step 4: Verify the behavior
+
+Run a few quick checks:
+
+```bash
+curl -I https://example.com/wp-login.php
+curl -I https://example.com/xmlrpc.php
+curl -I https://example.com/wp-admin/
+curl -I https://example.com/phpmyadmin/
+```
+
+Expected result with this guide:
+
+```text
+HTTP/1.1 404 Not Found
+```
+
+## Optional: Drop the connection instead of returning 404
+
+If you want Nginx to close the connection without sending a normal response, replace selected rules like this:
+
+```nginx
+location = /xmlrpc.php {
+  access_log off;
+  return 444;
+}
+```
+
+This is useful for high-noise probes, but it can make testing a bit less friendly because some clients will report an empty or closed connection instead of a normal HTTP status.
+
+## Why this setup works well
+
+This guide intentionally uses a small set of **exact-match** and **prefix-match** rules.
+
+That gives you a few advantages:
+
+* Easy to read
+* Easy to audit later
+* Less chance of blocking legitimate application routes by mistake
+* Easy to reuse across multiple virtual hosts
+
+It also keeps scanner blocking separate from other Nginx hardening topics such as:
+
+* rate limiting
+* bot mitigation
+* security headers
+* TLS hardening
+* geo/IP restrictions
+
+Those should live in their own guides.
+
+## Suggested next guides
+
+Once this page is in place, the next Nginx docs that pair well with it are:
+
+* **Rate Limiting**
+* **Bot Protection**
+* **Security Headers**
+* **TLS Hardening**
+
+Together, those guides create a clean and practical Nginx hardening section without mixing too many concerns into one page.
+
+:::warning Keep this list intentional
+Do not turn this into a giant list of random blocked paths. Only block routes you are confident your application does not need.
+:::
+
+## Summary
+
+You do not need a firewall rule or a WAF for every noisy probe.
+For common low-value scans, a few targeted Nginx `location` rules can reduce noise and stop pointless requests from ever reaching your application.
+
+Use a small reusable snippet, test it carefully, and keep this guide focused on **scanner-path blocking only**.

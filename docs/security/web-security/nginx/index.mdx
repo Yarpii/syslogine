@@ -1,0 +1,172 @@
+---
+title: "Nginx Security"
+sidebar_label: "Nginx"
+sidebar_position: 1
+description: "Harden Nginx with practical guides for scanner blocking, rate limiting, bot protection, security headers, and TLS best practices."
+keywords:
+  - nginx
+  - nginx security
+  - web security
+  - hardening
+  - rate limiting
+  - security headers
+  - tls
+tags:
+  - security
+  - nginx
+  - web-security
+slug: /security/web-security/nginx
+---
+
+# Nginx Security
+
+Nginx is often the first layer exposed to the internet, which makes it one of the most important places to apply practical security controls.
+
+This section focuses on **real-world Nginx hardening** for public-facing websites and applications. The goal is to help you reduce attack surface, block noisy probes, improve request handling, and apply safer defaults without turning your configuration into a mess.
+
+## What you'll learn
+
+In this section, you'll find focused guides for:
+
+- **Scanner Blocking**: Stop common probes for WordPress, phpMyAdmin, and other well-known paths
+- **Rate Limiting**: Slow down abusive clients and protect login pages or APIs
+- **Bot Protection**: Filter unwanted traffic patterns and reduce noise
+- **Security Headers**: Add browser-side protections with clear, maintainable policies
+- **TLS Hardening**: Improve HTTPS configuration and certificate handling
+
+## Available guides
+
+<div className="row">
+  <div className="col col--6">
+    <div className="card">
+      <div className="card__header">
+        <h3>🚫 Block Malicious Scanners</h3>
+      </div>
+      <div className="card__body">
+        <p>Block common requests for <code>/wp-admin</code>, <code>/wp-login.php</code>, <code>/xmlrpc.php</code>, <code>/phpmyadmin</code>, and other frequently scanned paths.</p>
+      </div>
+      <div className="card__footer">
+        <a href="/docs/security/web-security/nginx/block-malicious-scanners" className="button button--primary button--block">
+          Read Guide
+        </a>
+      </div>
+    </div>
+  </div>
+
+  <div className="col col--6">
+    <div className="card">
+      <div className="card__header">
+        <h3>⏱️ Rate Limiting</h3>
+      </div>
+      <div className="card__body">
+        <p>Protect login pages, APIs, and sensitive routes from brute-force attempts and abusive bursts of traffic.</p>
+      </div>
+      <div className="card__footer">
+        <a href="/docs/security/web-security/nginx/rate-limiting" className="button button--secondary button--block">
+          Coming Soon
+        </a>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div className="row">
+  <div className="col col--6">
+    <div className="card">
+      <div className="card__header">
+        <h3>🤖 Bot Protection</h3>
+      </div>
+      <div className="card__body">
+        <p>Reduce low-quality traffic and nuisance automation with practical Nginx filtering techniques.</p>
+      </div>
+      <div className="card__footer">
+        <a href="/docs/security/web-security/nginx/bot-protection" className="button button--secondary button--block">
+          Coming Soon
+        </a>
+      </div>
+    </div>
+  </div>
+
+  <div className="col col--6">
+    <div className="card">
+      <div className="card__header">
+        <h3>🛡️ Security Headers</h3>
+      </div>
+      <div className="card__body">
+        <p>Add modern response headers such as Content-Security-Policy, X-Frame-Options, and Referrer-Policy.</p>
+      </div>
+      <div className="card__footer">
+        <a href="/docs/security/web-security/nginx/security-headers" className="button button--secondary button--block">
+          Coming Soon
+        </a>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div className="row">
+  <div className="col col--6">
+    <div className="card">
+      <div className="card__header">
+        <h3>🔒 TLS Hardening</h3>
+      </div>
+      <div className="card__body">
+        <p>Improve HTTPS security with better protocol choices, cleaner certificate setup, and stronger defaults.</p>
+      </div>
+      <div className="card__footer">
+        <a href="/docs/security/web-security/nginx/tls-hardening" className="button button--secondary button--block">
+          Coming Soon
+        </a>
+      </div>
+    </div>
+  </div>
+</div>
+
+## Recommended learning path
+
+If you're just getting started, follow this order:
+
+1. [Block Malicious Scanners](/docs/security/web-security/nginx/block-malicious-scanners)
+2. Rate Limiting
+3. Bot Protection
+4. Security Headers
+5. TLS Hardening
+
+This progression starts with quick wins and then moves into deeper protection layers.
+
+## Best practices for this section
+
+To keep the Nginx guides useful for the community, each page in this section should stay focused on **one topic only**.
+
+That means:
+
+- one guide for scanner blocking
+- one guide for rate limiting
+- one guide for headers
+- one guide for TLS
+- one guide for bot filtering
+
+This makes it easier for readers to copy only what they need, test changes safely, and avoid mixing unrelated configuration patterns.
+
+:::tip Keep configs modular
+A great pattern for Nginx hardening is to place reusable snippets in a dedicated directory and include them inside the correct `server` blocks. That keeps your configs easier to audit, reuse, and maintain.
+:::
+
+:::warning Test every change
+Always validate your configuration with `nginx -t` before reloading. Small syntax issues can break deployments, especially when working with includes and nested blocks.
+:::
+
+## Who this section is for
+
+These guides are useful for:
+
+- self-hosters
+- VPS users
+- DevOps engineers
+- sysadmins
+- platform teams
+- anyone running public web services behind Nginx
+
+Whether you're hosting a personal project or protecting production infrastructure, the goal is the same: **make Nginx safer, cleaner, and more deliberate**.
+
+Ready to harden your web edge? Start with [Block Malicious Scanners](/docs/security/web-security/nginx/block-malicious-scanners).

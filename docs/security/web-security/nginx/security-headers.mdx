@@ -1,0 +1,289 @@
+---
+title: "Security Headers in Nginx"
+sidebar_label: "Security Headers"
+sidebar_position: 4
+description: "Improve browser-side protections with practical Nginx security headers, including CSP, HSTS, Referrer-Policy, and more."
+keywords:
+  - nginx
+  - security headers
+  - csp
+  - hsts
+  - x-frame-options
+  - referrer-policy
+tags:
+  - security
+  - nginx
+  - headers
+slug: /security/web-security/nginx/security-headers
+---
+
+# Security Headers in Nginx
+
+Security headers help browsers enforce safer behavior for your site.
+
+They do not replace secure application code, but they do provide important browser-side protection against issues such as:
+
+- clickjacking
+- MIME type sniffing
+- overly broad referrer leakage
+- mixed-content migration problems
+- over-permissive browser features
+
+This guide focuses on a practical Nginx baseline that you can roll out safely.
+
+## One important Nginx detail
+
+In Nginx, `add_header` does **not** apply to every response by default.
+
+To make your headers show up consistently on responses such as errors, use the `always` parameter.
+
+Example:
+
+```nginx
+add_header X-Content-Type-Options "nosniff" always;
+````
+
+## Step 1: Create a baseline headers snippet
+
+Create:
+
+```bash
+/etc/nginx/snippets/security-headers.conf
+```
+
+Add:
+
+```nginx
+# Baseline browser security headers
+add_header X-Content-Type-Options "nosniff" always;
+add_header X-Frame-Options "SAMEORIGIN" always;
+add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+
+# Disable browser features your site probably does not need
+add_header Permissions-Policy "accelerometer=(), camera=(), geolocation=(), gyroscope=(), microphone=(), payment=(), usb=()" always;
+```
+
+Then include it in your HTTPS `server` block:
+
+```nginx
+server {
+  listen 443 ssl http2;
+  server_name example.com www.example.com;
+
+  include /etc/nginx/snippets/security-headers.conf;
+
+  location / {
+    proxy_pass http://app_backend;
+  }
+}
+```
+
+## What these headers do
+
+### `X-Content-Type-Options: nosniff`
+
+This tells browsers to respect declared MIME types instead of trying to guess.
+
+That helps prevent certain script and style loading issues caused by MIME sniffing.
+
+### `X-Frame-Options: SAMEORIGIN`
+
+This reduces clickjacking risk by preventing your pages from being embedded by unrelated sites.
+
+If your site never needs embedding, `DENY` is even stricter.
+
+### `Referrer-Policy: strict-origin-when-cross-origin`
+
+This is a very sensible modern default.
+
+It keeps full referrer information for same-origin requests, but sends only the origin to cross-origin HTTPS destinations and sends nothing to less secure destinations.
+
+### `Permissions-Policy`
+
+This lets you explicitly disable browser capabilities your site does not need.
+
+Start small and add only the features you intentionally require.
+
+## Step 2: Add HSTS only on HTTPS
+
+Create a separate snippet so you can enable it deliberately:
+
+```bash
+/etc/nginx/snippets/hsts.conf
+```
+
+Add:
+
+```nginx
+add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+```
+
+Include it only in the **HTTPS** server block:
+
+```nginx
+server {
+  listen 443 ssl http2;
+  server_name example.com www.example.com;
+
+  include /etc/nginx/snippets/security-headers.conf;
+  include /etc/nginx/snippets/hsts.conf;
+
+  location / {
+    proxy_pass http://app_backend;
+  }
+}
+```
+
+:::warning Roll out HSTS carefully
+HSTS tells browsers to use HTTPS for future requests to the host.
+
+Do not enable it until:
+
+* HTTPS works correctly
+* your certificate renewal is reliable
+* you understand the impact on subdomains if you use `includeSubDomains`
+  :::
+
+## About `preload`
+
+Do **not** add `preload` automatically.
+
+Only consider this when you fully understand the consequences across your domain and subdomains.
+
+If you eventually choose it, the common form is:
+
+```nginx
+add_header Strict-Transport-Security "max-age=31536000; includeSubDomains; preload" always;
+```
+
+## Step 3: Add a CSP carefully
+
+Content Security Policy is powerful, but it is also the easiest header to break if you copy a policy that does not match your site.
+
+For many sites, the safest rollout is:
+
+1. start in report-only mode
+2. observe what would break
+3. tighten the policy gradually
+4. switch to enforcement when ready
+
+### Example report-only CSP snippet
+
+Create:
+
+```bash
+/etc/nginx/snippets/csp-report-only.conf
+```
+
+Add:
+
+```nginx
+add_header Content-Security-Policy-Report-Only "default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'self'; img-src 'self' data: https:; font-src 'self' data: https:; style-src 'self' 'unsafe-inline' https:; script-src 'self' 'unsafe-inline' https:; upgrade-insecure-requests" always;
+```
+
+Include it:
+
+```nginx
+server {
+  listen 443 ssl http2;
+  server_name example.com www.example.com;
+
+  include /etc/nginx/snippets/security-headers.conf;
+  include /etc/nginx/snippets/hsts.conf;
+  include /etc/nginx/snippets/csp-report-only.conf;
+
+  location / {
+    proxy_pass http://app_backend;
+  }
+}
+```
+
+:::tip Start with report-only for real apps
+If your app uses third-party scripts, inline scripts, tag managers, or legacy assets, a CSP can break things quickly.
+
+Use report-only first, then tighten it based on actual behavior.
+:::
+
+## Why `frame-ancestors` matters
+
+`X-Frame-Options` is still useful, but CSP’s `frame-ancestors` is more flexible and more comprehensive for embedding control.
+
+That is why the CSP example includes:
+
+```text
+frame-ancestors 'self'
+```
+
+## Should you use `upgrade-insecure-requests`?
+
+It can be useful during HTTPS migrations because it tells browsers to rewrite insecure resource URLs to HTTPS.
+
+That said, it does **not** replace HSTS.
+
+It is helpful for legacy mixed-content cleanup, not as a substitute for HTTPS enforcement.
+
+## What not to add blindly
+
+### `X-XSS-Protection`
+
+Do not cargo-cult this header into modern configs.
+
+Modern guidance prefers CSP, and MDN warns that `X-XSS-Protection` can be unnecessary or even problematic in some cases.
+
+### Huge CSPs you do not understand
+
+A copied CSP with random domains is hard to maintain and often less secure than a policy you actually understand.
+
+## Testing
+
+Validate config:
+
+```bash
+sudo nginx -t
+```
+
+Reload:
+
+```bash
+sudo nginx -s reload
+```
+
+Inspect headers:
+
+```bash
+curl -I https://example.com/
+```
+
+You should see headers like:
+
+```text
+X-Content-Type-Options: nosniff
+X-Frame-Options: SAMEORIGIN
+Referrer-Policy: strict-origin-when-cross-origin
+Permissions-Policy: ...
+Strict-Transport-Security: ...
+```
+
+## Recommended rollout order
+
+A safe order for most sites is:
+
+1. `X-Content-Type-Options`
+2. `Referrer-Policy`
+3. `X-Frame-Options`
+4. `Permissions-Policy`
+5. HSTS
+6. CSP report-only
+7. enforced CSP
+
+## Summary
+
+A good Nginx headers setup is not about adding every header you have ever seen.
+
+It is about adding the right headers deliberately:
+
+* baseline browser protections first
+* HSTS only when HTTPS is fully ready
+* CSP carefully, preferably in report-only mode first
+
+That gives your community something practical, safe, and maintainable.

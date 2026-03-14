@@ -1,0 +1,354 @@
+---
+title: "File Permissions"
+sidebar_label: "File Permissions"
+sidebar_position: 3
+description: "Fix Linux file permissions safely for web apps, deployments, and writable directories without breaking your site."
+keywords:
+  - linux file permissions
+  - chmod
+  - chown
+  - setfacl
+  - web root permissions
+  - linux hardening
+tags:
+  - security
+  - linux
+  - permissions
+slug: /security/system-hardening/linux/file-permissions
+---
+
+# File Permissions
+
+This guide shows you how to fix Linux file permissions for a typical web app safely.
+
+You will:
+
+- inspect the current ownership and permissions
+- back them up
+- set a safe owner and group
+- apply sane defaults for files and directories
+- make only the required folders writable
+- test the result
+- roll back if needed
+
+Linux permissions are mainly controlled through **ownership** and **mode bits**, and tools like `chmod` and `chown` change those directly. POSIX ACLs exist for more fine-grained permissions when the normal owner/group/other model is not enough. :contentReference[oaicite:0]{index=0}
+
+## What you'll build
+
+In this guide, we will use this practical pattern:
+
+- app owner: `deploy`
+- web server group: `www-data`
+- normal directories: `2755`
+- normal files: `0644`
+- writable app folders such as `storage`, `cache`, or `uploads`: group-writable with setgid
+
+That gives you a strong default for many PHP, Node, Python, and static-site deployments: the app code is not writable by everyone, and only the folders that actually need writes are writable. This is an operational recommendation for a common web-root pattern.
+
+:::warning Do not run `chmod -R 777`
+`777` gives read, write, and execute to owner, group, and everyone else. That is almost never the right answer for application code or web roots.
+:::
+
+## Prerequisites
+
+This guide assumes:
+
+- you have `sudo`
+- your site lives under something like `/var/www/myapp`
+- your web server user or group is `www-data`
+- you have a separate deploy user such as `deploy`
+
+If your distro uses another web user such as `nginx` or `apache`, replace `www-data` in the commands below.
+
+## Step 1: Set your project path
+
+Replace this with your real app path:
+
+```bash
+APP_ROOT="/var/www/myapp"
+````
+
+Check it exists:
+
+```bash
+ls -ld "$APP_ROOT"
+```
+
+## Step 2: Back up the current permissions first
+
+Before changing anything, create a permissions backup.
+
+`getfacl` can export standard permissions and ACL-related information, and `setfacl --restore` can later restore a full subtree from that backup. ([man7.org][1])
+
+```bash
+sudo getfacl -R "$APP_ROOT" > "$HOME/myapp.permissions.backup"
+```
+
+Also take a quick ownership snapshot:
+
+```bash
+sudo ls -lR "$APP_ROOT" > "$HOME/myapp.ls-backup.txt"
+```
+
+## Step 3: Inspect the current state
+
+Check the top level:
+
+```bash
+ls -lah "$APP_ROOT"
+```
+
+Check owner, group, and permissions more clearly:
+
+```bash
+stat -c "%A %U:%G %n" "$APP_ROOT"
+find "$APP_ROOT" -maxdepth 2 -printf "%M %u:%g %p\n" | head -n 50
+```
+
+If ACLs might already be in use, inspect them too:
+
+```bash
+getfacl "$APP_ROOT"
+```
+
+## Step 4: Set the correct owner and group
+
+`chown` changes file owner and group. The `owner:group` form sets both at once. ([man7.org][2])
+
+For a common deployment setup:
+
+```bash
+sudo chown -R deploy:www-data "$APP_ROOT"
+```
+
+Check the result:
+
+```bash
+find "$APP_ROOT" -maxdepth 2 -printf "%u:%g %p\n" | head -n 30
+```
+
+## Step 5: Apply safe defaults for normal directories and files
+
+`chmod` changes the file mode bits, either with symbolic modes or octal numeric modes. ([man7.org][3])
+
+For normal app code, a very practical baseline is:
+
+* directories: `2755`
+* files: `0644`
+
+Apply it like this:
+
+```bash
+sudo find "$APP_ROOT" -type d -exec chmod 2755 {} \;
+sudo find "$APP_ROOT" -type f -exec chmod 0644 {} \;
+```
+
+Why `2755` on directories?
+
+* `2` sets the **setgid** bit
+* `755` gives:
+
+  * owner: read, write, execute
+  * group: read, execute
+  * others: read, execute
+
+On most systems, the setgid bit on a directory causes new files and subdirectories created inside it to inherit the directory’s group, which is extremely useful for shared deploy/web-server workflows. GNU Coreutils also documents that directory setgid behavior and notes that directory special bits need to be handled deliberately. ([GNU][4])
+
+## Step 6: Make only the required folders writable
+
+Do **not** make the whole application writable.
+
+Only make the folders writable that actually need it, such as:
+
+* `storage`
+* `cache`
+* `uploads`
+* `tmp`
+
+Example:
+
+```bash
+sudo mkdir -p "$APP_ROOT/storage" "$APP_ROOT/cache" "$APP_ROOT/uploads"
+sudo chown -R deploy:www-data "$APP_ROOT/storage" "$APP_ROOT/cache" "$APP_ROOT/uploads"
+
+sudo find "$APP_ROOT/storage" "$APP_ROOT/cache" "$APP_ROOT/uploads" -type d -exec chmod 2775 {} \;
+sudo find "$APP_ROOT/storage" "$APP_ROOT/cache" "$APP_ROOT/uploads" -type f -exec chmod 0664 {} \;
+```
+
+This gives the owner and group write access only where it is needed, while preserving group inheritance through the setgid bit on directories. ([GNU][4])
+
+## Step 7: Fix executable scripts separately
+
+If your app has scripts that must be executable, set them explicitly instead of making everything executable.
+
+Examples:
+
+```bash
+sudo chmod 0755 "$APP_ROOT/bin/deploy.sh"
+sudo chmod 0755 "$APP_ROOT/scripts/worker-restart.sh"
+```
+
+That is safer than applying `755` to every file in the tree.
+
+## Step 8: Test it as the web server user
+
+Now verify that the web server can read the app and write only to the intended folders.
+
+Test read access:
+
+```bash
+sudo -u www-data test -r "$APP_ROOT/public/index.php" && echo "www-data can read app files"
+```
+
+Test write access to a writable folder:
+
+```bash
+sudo -u www-data touch "$APP_ROOT/storage/.perm-test" && echo "write OK"
+sudo -u www-data rm "$APP_ROOT/storage/.perm-test"
+```
+
+Test that a non-writable code file is not writable:
+
+```bash
+sudo -u www-data touch "$APP_ROOT/app/should-not-work.txt"
+```
+
+That last command should fail if your permissions are correct.
+
+## Step 9: Optional shared-write setup with ACLs
+
+If the normal owner/group model is not enough, use POSIX ACLs.
+
+ACLs provide more fine-grained access rights than the traditional mode bits, and `setfacl` / `getfacl` are the standard tools for managing them. `setfacl -d` applies **default ACLs** to directories so new children inherit those entries. ([man7.org][5])
+
+Example: give `www-data` explicit read/write/execute access to a writable app folder, and make new files inherit it:
+
+```bash
+sudo setfacl -R -m u:www-data:rwx "$APP_ROOT/storage"
+sudo setfacl -R -m u:www-data:rwx "$APP_ROOT/cache"
+sudo setfacl -R -m u:www-data:rwx "$APP_ROOT/uploads"
+
+sudo setfacl -R -d -m u:www-data:rwx "$APP_ROOT/storage"
+sudo setfacl -R -d -m u:www-data:rwx "$APP_ROOT/cache"
+sudo setfacl -R -d -m u:www-data:rwx "$APP_ROOT/uploads"
+```
+
+Check the result:
+
+```bash
+getfacl "$APP_ROOT/storage"
+```
+
+Use ACLs when you truly need them. For many apps, correct ownership plus sane directory/file modes is already enough.
+
+## Step 10: Know what not to change
+
+### Symlinks
+
+On Linux, normal symbolic-link permissions are not used for access checks; symlink permissions are effectively always `0777` and are not the control point you should be hardening. ([man7.org][6])
+
+### Special bits on directories
+
+Be deliberate with commands that overwrite modes recursively. GNU Coreutils notes that some mode forms can clear or preserve setuid/setgid bits differently, especially on directories. That is one reason this guide uses explicit `find ... chmod ...` commands rather than one blunt recursive mode change everywhere. ([GNU][7])
+
+## Troubleshooting
+
+### The site returns 403 after the change
+
+Usually one of these is wrong:
+
+* the web server cannot traverse a parent directory
+* the web server cannot read the app files
+* the writable folder is not actually writable by the web server user or group
+
+Check a path quickly:
+
+```bash
+namei -l "$APP_ROOT/public/index.php"
+```
+
+Also inspect a problem folder directly:
+
+```bash
+stat -c "%A %U:%G %n" "$APP_ROOT" "$APP_ROOT/public" "$APP_ROOT/public/index.php"
+```
+
+### The app can write nowhere
+
+Your writable folders probably need group write, correct ownership, or an ACL.
+
+Re-check them:
+
+```bash
+find "$APP_ROOT/storage" -printf "%M %u:%g %p\n" | head -n 20
+getfacl "$APP_ROOT/storage"
+```
+
+### New files get the wrong group
+
+That usually means the directory setgid bit is missing.
+
+Re-apply it:
+
+```bash
+sudo find "$APP_ROOT/storage" "$APP_ROOT/cache" "$APP_ROOT/uploads" -type d -exec chmod 2775 {} \;
+```
+
+## Rollback
+
+If you created the ACL backup in Step 2, restore it like this:
+
+```bash
+sudo setfacl --restore="$HOME/myapp.permissions.backup"
+```
+
+`setfacl --restore` restores a permission backup created by `getfacl -R` and can also restore owner, group, and special bits when that data is present in the backup. ([man7.org][8])
+
+If you only need a quick manual rollback of the example changes, you can also reset ownership and modes yourself.
+
+## Final working example
+
+For a common Linux web app deployment:
+
+```bash
+APP_ROOT="/var/www/myapp"
+
+sudo getfacl -R "$APP_ROOT" > "$HOME/myapp.permissions.backup"
+
+sudo chown -R deploy:www-data "$APP_ROOT"
+
+sudo find "$APP_ROOT" -type d -exec chmod 2755 {} \;
+sudo find "$APP_ROOT" -type f -exec chmod 0644 {} \;
+
+sudo mkdir -p "$APP_ROOT/storage" "$APP_ROOT/cache" "$APP_ROOT/uploads"
+sudo chown -R deploy:www-data "$APP_ROOT/storage" "$APP_ROOT/cache" "$APP_ROOT/uploads"
+
+sudo find "$APP_ROOT/storage" "$APP_ROOT/cache" "$APP_ROOT/uploads" -type d -exec chmod 2775 {} \;
+sudo find "$APP_ROOT/storage" "$APP_ROOT/cache" "$APP_ROOT/uploads" -type f -exec chmod 0664 {} \;
+```
+
+## Final verification commands
+
+```bash
+stat -c "%A %U:%G %n" "$APP_ROOT"
+find "$APP_ROOT" -maxdepth 2 -printf "%M %u:%g %p\n" | head -n 50
+sudo -u www-data test -r "$APP_ROOT/public/index.php" && echo "read OK"
+sudo -u www-data touch "$APP_ROOT/storage/.perm-test" && echo "write OK"
+sudo -u www-data rm "$APP_ROOT/storage/.perm-test"
+```
+
+## What to do next
+
+The best follow-up guides after this are:
+
+* [SSH Hardening](/docs/security/system-hardening/linux/ssh-hardening)
+* Fail2Ban for SSH
+* Firewall Basics
+* Nginx Security Headers
+
+This guide gives your users the practical baseline they actually need:
+
+* code readable by the web server
+* code not writable by everyone
+* only the right folders writable
+* a clean rollback path
