@@ -224,7 +224,7 @@ ls -la /etc/cron.d/myapp-maintenance
 
 The output should show `root root` ownership and permissions no more permissive than `644`.
 
-### /etc/cron.{hourly,daily,weekly,monthly}/
+### `/etc/cron.{hourly,daily,weekly,monthly}/`
 
 These directories contain executable scripts (not crontab entries) that are run at fixed intervals by `run-parts`, called from `/etc/crontab`. Drop a script into the appropriate directory and it will be executed at that interval:
 
