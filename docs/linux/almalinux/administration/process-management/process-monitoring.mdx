@@ -1,0 +1,440 @@
+---
+sidebar_position: 7
+title: "Process Monitoring | AlmaLinux"
+sidebar_label: "Process Monitoring"
+description: "Monitor processes with top, htop, systemd-cgtop, and integrate with enterprise monitoring solutions on AlmaLinux."
+keywords:
+  - "almalinux process monitoring"
+  - "almalinux top htop"
+  - "almalinux systemd-cgtop"
+  - "almalinux pidstat"
+  - "rhel process monitoring"
+tags:
+  - almalinux
+  - process-management
+  - monitoring
+  - systemd
+slug: /linux/almalinux/administration/process-management/process-monitoring
+---
+
+# Process Monitoring
+
+Knowing what your processes are doing in real time — and over time — is essential for maintaining a stable system. AlmaLinux provides tools that range from interactive terminal dashboards to historical per-process statistics, giving you visibility at every level from individual threads to full service cgroups.
+
+## Install monitoring tools
+
+```bash
+sudo dnf install -y \
+  procps-ng \
+  htop \
+  sysstat \
+  psmisc \
+  lsof
+```
+
+Enable sysstat for historical data collection:
+
+```bash
+sudo systemctl enable --now sysstat
+```
+
+## Real-time overview with top
+
+`top` is the classic real-time process monitor — available on every Linux system without installation.
+
+```bash
+top
+```
+
+### Useful top keybindings
+
+| Key | Action |
+|-----|--------|
+| `1` | Toggle per-core CPU view |
+| `M` | Sort by memory usage |
+| `P` | Sort by CPU usage |
+| `T` | Sort by cumulative CPU time |
+| `N` | Sort by PID |
+| `u` | Filter by username |
+| `k` | Kill a process by PID |
+| `r` | Renice a process |
+| `H` | Toggle thread view |
+| `i` | Toggle idle processes |
+| `q` | Quit |
+
+### Run top non-interactively
+
+```bash
+# 3 iterations, 2 second delay, output to file
+top -b -n 3 -d 2 > /tmp/top-snapshot-$(date +%F-%H%M).txt
+
+# Monitor a specific PID
+top -p $(pgrep nginx | head -1)
+
+# Monitor multiple PIDs
+top -p $(pgrep nginx | paste -sd ',')
+```
+
+## Interactive monitoring with htop
+
+`htop` improves on `top` with colour coding, mouse support, and easier navigation.
+
+```bash
+htop
+
+# Start filtered to a specific user
+htop -u jdoe
+
+# Start sorted by memory
+htop --sort-key=PERCENT_MEM
+
+# Start in tree view
+htop -t
+```
+
+### Useful htop keybindings
+
+| Key | Action |
+|-----|--------|
+| `F2` | Setup — add/remove columns, change colours |
+| `F3` | Search for a process |
+| `F4` | Filter by string |
+| `F5` | Toggle tree view |
+| `F6` | Sort by column |
+| `F9` | Send a signal to a process |
+| `u` | Filter by user |
+| `t` | Toggle tree view |
+| `Space` | Tag a process |
+| `U` | Untag all |
+
+## Per-process statistics with pidstat
+
+`pidstat` from the `sysstat` package shows detailed per-process CPU, memory, and I/O statistics over time — useful for trend analysis and identifying gradual resource growth.
+
+```bash
+# CPU usage per process, update every 2 seconds
+pidstat 2
+
+# Memory usage per process
+pidstat -r 2
+
+# I/O stats per process
+pidstat -d 2
+
+# All stats combined
+pidstat -urd 2
+
+# Stats for a specific PID
+pidstat -p $(pgrep nginx | head -1) 2
+
+# Stats for a specific command
+pidstat -C nginx 2
+
+# Stats for all threads of a process
+pidstat -t -p $(pgrep nginx | head -1) 2
+```
+
+## Service-level monitoring with systemctl
+
+For systemd-managed services, monitoring at the unit level gives a cleaner picture than tracking individual PIDs.
+
+```bash
+# Status of a specific service
+systemctl status nginx
+
+# Watch a service status in real time
+watch -n 2 systemctl status nginx
+
+# All active services
+systemctl list-units --type=service --state=active
+
+# All failed services
+systemctl list-units --type=service --state=failed
+
+# Service uptime and restart count
+systemctl show nginx --property=ActiveEnterTimestamp
+systemctl show nginx --property=NRestarts
+```
+
+## Resource usage per service with systemd-cgtop
+
+`systemd-cgtop` shows CPU, memory, and I/O usage broken down by systemd service and cgroup — the best tool for identifying which service is the biggest resource consumer.
+
+```bash
+# Live view
+systemd-cgtop
+
+# Sort by memory
+systemd-cgtop -m
+
+# Sort by CPU
+systemd-cgtop -c
+
+# Sort by I/O
+systemd-cgtop -i
+
+# Non-interactive, 10 iterations
+systemd-cgtop -n 10 -b
+
+# Limit to a specific cgroup depth
+systemd-cgtop -d 3
+```
+
+## Monitor cgroup metrics directly
+
+For scripting and alerting, read cgroup metrics directly from the filesystem.
+
+```bash
+SERVICE="nginx"
+CGROUP="/sys/fs/cgroup/system.slice/${SERVICE}.service"
+
+# Current memory usage in bytes
+cat "${CGROUP}/memory.current"
+
+# Memory limit
+cat "${CGROUP}/memory.max"
+
+# CPU usage statistics
+cat "${CGROUP}/cpu.stat"
+
+# Current task (process/thread) count
+cat "${CGROUP}/pids.current"
+
+# I/O statistics
+cat "${CGROUP}/io.stat"
+```
+
+Convert memory to MB for readability:
+
+```bash
+MEM_BYTES=$(cat /sys/fs/cgroup/system.slice/nginx.service/memory.current)
+echo "$((MEM_BYTES / 1024 / 1024)) MB"
+```
+
+## Monitor open files and connections
+
+```bash
+# Count open file descriptors for a service
+ls /proc/$(pgrep nginx | head -1)/fd | wc -l
+
+# All files open by a process
+sudo lsof -p $(pgrep nginx | head -1)
+
+# Network connections for a process
+sudo lsof -i -p $(pgrep nginx | head -1)
+
+# All processes with the most open files
+for pid in /proc/[0-9]*; do
+  echo "$(ls ${pid}/fd 2>/dev/null | wc -l) $(cat ${pid}/comm 2>/dev/null) (${pid##*/})"
+done | sort -rn | head -10
+```
+
+## Track service restarts
+
+Frequent restarts are a sign of instability. Monitor restart counts for critical services.
+
+```bash
+# Restart count for a service
+systemctl show nginx --property=NRestarts
+
+# All services with restart counts
+systemctl show '*' --property=Id,NRestarts 2>/dev/null | \
+  paste - - | awk -F= '$4 > 0 {print $2, "restarts:", $4}' | sort -k3 -rn
+
+# Watch for new journal entries indicating restarts
+journalctl -u nginx -f | grep -i "started\|stopped\|failed"
+```
+
+## Historical process data with sar
+
+```bash
+# System CPU usage today
+sar -u
+
+# Memory usage today
+sar -r
+
+# I/O stats today
+sar -b
+
+# All stats from a specific hour
+sar -u --start 10:00:00 --end 11:00:00
+```
+
+For per-process historical data, use `pidstat` with output redirection:
+
+```bash
+# Record per-process CPU and memory every 30 seconds for 1 hour
+pidstat -urd 30 120 > /tmp/pidstat-$(date +%F-%H).txt
+```
+
+## Watch for process crashes with journald
+
+```bash
+# Watch for service failures in real time
+journalctl -f | grep -i "failed\|error\|segfault\|killed"
+
+# Show all service failures since last boot
+journalctl -b -p err
+
+# Show crash events for a specific service
+journalctl -u nginx -b | grep -i "failed\|crash\|signal"
+
+# Show kernel OOM kills
+journalctl -k | grep -i "killed process\|out of memory"
+```
+
+## Scripted process monitoring with alerting
+
+A script that monitors service health, resource usage, and restart counts:
+
+```bash
+#!/bin/bash
+# process-monitor.sh — monitor critical services and alert on anomalies
+
+SERVICES=("nginx" "postgresql" "redis" "sshd")
+MAX_RESTARTS=5
+MEM_WARN_MB=800
+ALERT_EMAIL="ops@example.com"
+HOSTNAME=$(hostname)
+ALERTS=()
+
+for service in "${SERVICES[@]}"; do
+  # Check service is active
+  if ! systemctl is-active --quiet "$service"; then
+    STATE=$(systemctl show "$service" --property=ActiveState | cut -d= -f2)
+    ALERTS+=("SERVICE DOWN: $service is $STATE")
+    continue
+  fi
+
+  # Check restart count
+  RESTARTS=$(systemctl show "$service" --property=NRestarts | cut -d= -f2)
+  if [[ "${RESTARTS:-0}" -gt "$MAX_RESTARTS" ]]; then
+    ALERTS+=("HIGH RESTARTS: $service has restarted ${RESTARTS} times")
+  fi
+
+  # Check memory usage via cgroup
+  CGROUP="/sys/fs/cgroup/system.slice/${service}.service"
+  if [[ -f "${CGROUP}/memory.current" ]]; then
+    MEM_BYTES=$(cat "${CGROUP}/memory.current")
+    MEM_MB=$((MEM_BYTES / 1024 / 1024))
+    if [[ "$MEM_MB" -gt "$MEM_WARN_MB" ]]; then
+      ALERTS+=("HIGH MEMORY: $service using ${MEM_MB}MB")
+    fi
+  fi
+done
+
+# Check for zombie processes
+ZOMBIE_COUNT=$(ps aux | awk '$8 == "Z"' | wc -l)
+if [[ "$ZOMBIE_COUNT" -gt 10 ]]; then
+  ALERTS+=("ZOMBIES: $ZOMBIE_COUNT zombie processes detected")
+fi
+
+# Check for D-state processes
+DSTATE_COUNT=$(ps aux | awk '$8 ~ /^D/' | wc -l)
+if [[ "$DSTATE_COUNT" -gt 5 ]]; then
+  ALERTS+=("IO WAIT: $DSTATE_COUNT processes in uninterruptible sleep (D state)")
+fi
+
+# Send alert if needed
+if [[ "${#ALERTS[@]}" -gt 0 ]]; then
+  MESSAGE="Process alert on ${HOSTNAME}:\n\n$(printf '%s\n' "${ALERTS[@]}")"
+  echo -e "$MESSAGE" | mail -s "Process Alert: ${HOSTNAME}" "$ALERT_EMAIL"
+  echo -e "$MESSAGE"
+fi
+```
+
+Schedule with cron:
+
+```bash
+sudo crontab -e
+```
+
+```
+*/3 * * * * /usr/local/bin/process-monitor.sh >> /var/log/process-monitor.log 2>&1
+```
+
+## Integrate with Prometheus
+
+If you use Prometheus, Node Exporter exposes process and systemd metrics automatically.
+
+```bash
+# Systemd service state (1 = active)
+node_systemd_unit_state{name="nginx.service", state="active"}
+
+# Number of processes per state
+node_processes_state{state="R"}
+node_processes_state{state="Z"}
+node_processes_state{state="D"}
+```
+
+Enable the processes and systemd collectors in Node Exporter:
+
+```bash
+sudo systemctl edit node_exporter
+```
+
+```ini
+[Service]
+ExecStart=
+ExecStart=/usr/local/bin/node_exporter \
+  --collector.systemd \
+  --collector.processes \
+  --web.listen-address=:9100
+```
+
+```bash
+sudo systemctl restart node_exporter
+```
+
+## Common mistakes
+
+### Only monitoring service state without checking resource usage
+
+A service can be `active` while slowly leaking memory or consuming excessive CPU. Check both.
+
+```bash
+systemctl is-active nginx && \
+  cat /sys/fs/cgroup/system.slice/nginx.service/memory.current
+```
+
+### Not tracking restart counts
+
+A service restarting silently every few hours signals a real problem. Monitor `NRestarts` and alert when it climbs.
+
+```bash
+systemctl show nginx --property=NRestarts
+```
+
+### Using top %CPU as a sustained metric
+
+`top` and `ps` show CPU as a point-in-time or average figure. Use `pidstat` for sustained trend data.
+
+```bash
+pidstat -C nginx 5 12
+```
+
+### Ignoring D-state and zombie counts
+
+Both are leading indicators of deeper problems — storage issues and broken parent processes respectively. Include them in monitoring scripts.
+
+## Summary
+
+Process monitoring on AlmaLinux works best as a combination of real-time interactive tools, historical data collection, and automated alerting.
+
+Key points:
+
+- use `htop` for interactive real-time monitoring with easy filtering and tree view
+- use `systemd-cgtop` for service-level resource breakdown
+- use `pidstat` for per-process trends over time — more useful than point-in-time `ps`
+- read cgroup metrics directly for scripted monitoring and alerting
+- track `NRestarts` for critical services — frequent restarts signal instability
+- watch for D-state and zombie process counts as leading indicators of deeper problems
+- enable `--collector.processes` and `--collector.systemd` in Node Exporter for Prometheus integration
+
+:::tip Related pages
+- [Process Discovery](./process-discovery)
+- [Process Control](./process-control)
+- [Resource Controls](./resource-controls)
+- [Process Debugging](./process-debugging)
+:::

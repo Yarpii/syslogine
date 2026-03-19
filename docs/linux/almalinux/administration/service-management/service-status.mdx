@@ -1,0 +1,421 @@
+---
+sidebar_position: 5
+title: "Service Status | AlmaLinux"
+sidebar_label: "Service Status"
+description: "Monitor service status with systemctl status, analyze service health, and troubleshoot service issues on AlmaLinux."
+keywords:
+  - "almalinux service status"
+  - "almalinux systemctl status"
+  - "almalinux service health"
+  - "almalinux journalctl"
+  - "rhel service monitoring"
+tags:
+  - almalinux
+  - service-management
+  - systemd
+  - monitoring
+slug: /linux/almalinux/administration/service-management/service-status
+---
+
+# Service Status
+
+Knowing the state of your services at any given moment is fundamental to operating a reliable system. AlmaLinux provides a rich set of tools for inspecting service state, reading logs, understanding why a service failed, and checking the health of the entire system at a glance.
+
+## Basic status check
+
+```bash
+# Full status with recent log output
+systemctl status nginx
+
+# Multiple services at once
+systemctl status nginx postgresql redis
+```
+
+Example output:
+
+```
+● nginx.service - The nginx HTTP and reverse proxy server
+     Loaded: loaded (/usr/lib/systemd/system/nginx.service; enabled; preset: disabled)
+     Active: active (running) since Thu 2026-03-19 10:42:17 CET; 2h ago
+    Process: 1234 ExecStartPre=/usr/bin/rm -f /run/nginx.pid (code=exited, status=0/SUCCESS)
+   Main PID: 1238 (nginx)
+      Tasks: 3 (limit: 4096)
+     Memory: 6.2M
+        CPU: 1.243s
+     CGroup: /system.slice/nginx.service
+             ├─1238 "nginx: master process /usr/sbin/nginx"
+             ├─1239 "nginx: worker process"
+             └─1240 "nginx: worker process"
+
+Mar 19 10:42:17 hostname systemd[1]: Starting nginx...
+Mar 19 10:42:17 hostname systemd[1]: Started nginx.
+```
+
+### Reading the status output
+
+| Field | Meaning |
+|-------|---------|
+| `Loaded` | Whether the unit file is loaded and whether it is enabled |
+| `Active` | Current state — active, inactive, failed, activating |
+| `Main PID` | PID of the main process |
+| `Tasks` | Number of running threads and processes |
+| `Memory` | Current memory usage |
+| `CPU` | Total CPU time consumed |
+| `CGroup` | All processes belonging to this service |
+
+## Quick state checks
+
+For scripts and monitoring, use these one-word checks:
+
+```bash
+# Is the service running?
+systemctl is-active nginx
+# Returns: active, inactive, failed, activating, deactivating
+
+# Is the service enabled at boot?
+systemctl is-enabled nginx
+# Returns: enabled, disabled, masked, static, indirect
+
+# Has the service failed?
+systemctl is-failed nginx
+# Returns: failed or active
+
+# Exit code check — 0 = yes, non-zero = no
+systemctl is-active --quiet nginx && echo "running" || echo "not running"
+```
+
+## Inspect all service properties
+
+```bash
+# Show all properties of a service
+systemctl show nginx
+
+# Show a specific property
+systemctl show nginx --property=ActiveState
+systemctl show nginx --property=MainPID
+systemctl show nginx --property=NRestarts
+systemctl show nginx --property=Result
+systemctl show nginx --property=ExecMainStartTimestamp
+systemctl show nginx --property=ActiveEnterTimestamp
+```
+
+### Key properties to check
+
+| Property | Meaning |
+|----------|---------|
+| `ActiveState` | Current state: active, inactive, failed |
+| `SubState` | Detailed sub-state: running, dead, exited |
+| `Result` | Why the service stopped: success, timeout, signal, exit-code |
+| `MainPID` | PID of the main process |
+| `NRestarts` | Number of times the service has restarted |
+| `ExecMainStatus` | Exit code of the main process |
+| `ActiveEnterTimestamp` | When the service last became active |
+| `InactiveEnterTimestamp` | When the service last became inactive |
+
+## Check service uptime
+
+```bash
+# When did the service last start?
+systemctl show nginx --property=ActiveEnterTimestamp
+
+# Calculate uptime
+START=$(systemctl show nginx --property=ActiveEnterTimestampMonotonic | cut -d= -f2)
+NOW=$(date +%s%6N)
+UPTIME_SEC=$(( (NOW - START) / 1000000 ))
+echo "Uptime: $((UPTIME_SEC / 3600))h $(( (UPTIME_SEC % 3600) / 60 ))m"
+```
+
+## Check restart count
+
+Frequent restarts signal instability. Monitor this for critical services.
+
+```bash
+# Restart count for a service
+systemctl show nginx --property=NRestarts
+
+# All services with non-zero restart counts
+systemctl show '*' --property=Id,NRestarts 2>/dev/null | \
+  paste - - | awk -F= '$4 > 0 {print $2, "— restarts:", $4}' | sort -k3 -rn
+```
+
+## View service logs with journalctl
+
+```bash
+# All logs for a service
+journalctl -u nginx
+
+# Follow in real time
+journalctl -u nginx -f
+
+# Logs since last boot
+journalctl -u nginx -b
+
+# Logs from the previous boot
+journalctl -u nginx -b -1
+
+# Last 50 lines
+journalctl -u nginx -n 50
+
+# Only errors and above
+journalctl -u nginx -p err
+
+# Logs in a time range
+journalctl -u nginx --since "1 hour ago"
+journalctl -u nginx --since "2026-03-19 08:00" --until "2026-03-19 12:00"
+
+# Logs for multiple services
+journalctl -u nginx -u php-fpm -f
+```
+
+## Understand why a service failed
+
+When `Result` is not `success`, investigate:
+
+```bash
+# Check the result
+systemctl show nginx --property=Result
+
+# Common results and what they mean:
+# success      — clean exit
+# exit-code    — process exited with non-zero code
+# signal       — process killed by a signal
+# timeout      — start or stop timed out
+# watchdog     — watchdog timeout
+# oom-kill     — killed by the OOM killer
+```
+
+```bash
+# Full log for the failed service since last boot
+journalctl -u nginx -b --no-pager
+
+# Show only the relevant error lines
+journalctl -u nginx -b -p err --no-pager
+
+# Check exit code
+systemctl show nginx --property=ExecMainStatus
+
+# Check what signal killed it
+systemctl show nginx --property=ExecMainCode
+```
+
+## List all services and their states
+
+```bash
+# All active services
+systemctl list-units --type=service --state=active
+
+# All failed services
+systemctl list-units --type=service --state=failed
+
+# All inactive services
+systemctl list-units --type=service --state=inactive
+
+# All services regardless of state
+systemctl list-units --type=service --all
+
+# All unit files and their enabled/disabled state
+systemctl list-unit-files --type=service
+```
+
+## System-wide health overview
+
+```bash
+# Overall system state — degraded means at least one unit has failed
+systemctl is-system-running
+
+# Summary of all failed units
+systemctl --failed
+
+# Full system status
+systemctl status
+```
+
+`systemctl is-system-running` returns:
+- `running` — all units are active
+- `degraded` — at least one unit has failed
+- `maintenance` — the system is in rescue or emergency mode
+- `starting` — the system is still booting
+- `stopping` — the system is shutting down
+
+## Boot time analysis
+
+```bash
+# Total boot time breakdown
+systemd-analyze
+
+# Time spent by each service at boot
+systemd-analyze blame
+
+# Critical path of the boot
+systemd-analyze critical-chain
+
+# Critical chain for a specific service
+systemd-analyze critical-chain nginx
+
+# Plot a boot timing diagram (SVG)
+systemd-analyze plot > /tmp/boot-$(date +%F).svg
+```
+
+## Monitor service status in real time
+
+```bash
+# Watch a service status — refreshes every 2 seconds
+watch -n 2 systemctl status nginx
+
+# Watch for any service state changes
+journalctl -f | grep -E "Started|Stopped|Failed|Reloading"
+
+# Watch failed services
+watch -n 5 systemctl --failed
+```
+
+## Check resource usage per service
+
+```bash
+# Memory and CPU for a service
+systemctl status nginx | grep -E "Memory|CPU|Tasks"
+
+# Live resource usage per service
+systemd-cgtop
+
+# Read directly from cgroup filesystem
+cat /sys/fs/cgroup/system.slice/nginx.service/memory.current
+cat /sys/fs/cgroup/system.slice/nginx.service/cpu.stat
+```
+
+## Scripted health check across all critical services
+
+```bash
+#!/bin/bash
+# service-health.sh — check all critical services and report status
+
+SERVICES=("nginx" "postgresql" "redis" "sshd" "firewalld")
+ALERT_EMAIL="ops@example.com"
+HOSTNAME=$(hostname)
+FAILED=()
+WARNINGS=()
+
+for service in "${SERVICES[@]}"; do
+  # Check active state
+  STATE=$(systemctl show "$service" --property=ActiveState | cut -d= -f2)
+  RESULT=$(systemctl show "$service" --property=Result | cut -d= -f2)
+  RESTARTS=$(systemctl show "$service" --property=NRestarts | cut -d= -f2)
+
+  if [[ "$STATE" != "active" ]]; then
+    FAILED+=("FAILED: $service — state: $STATE, result: $RESULT")
+    continue
+  fi
+
+  if [[ "${RESTARTS:-0}" -gt 5 ]]; then
+    WARNINGS+=("UNSTABLE: $service has restarted ${RESTARTS} times")
+  fi
+done
+
+# System-wide check
+SYS_STATE=$(systemctl is-system-running)
+if [[ "$SYS_STATE" == "degraded" ]]; then
+  DEGRADED=$(systemctl --failed --no-legend | awk '{print $1}' | tr '\n' ' ')
+  WARNINGS+=("DEGRADED: system state is degraded — failed units: $DEGRADED")
+fi
+
+# Report
+{
+  echo "=== Service Health Report: $(date) on ${HOSTNAME} ==="
+  echo ""
+
+  if [[ "${#FAILED[@]}" -gt 0 ]]; then
+    echo "--- CRITICAL ---"
+    printf '%s\n' "${FAILED[@]}"
+    echo ""
+  fi
+
+  if [[ "${#WARNINGS[@]}" -gt 0 ]]; then
+    echo "--- WARNINGS ---"
+    printf '%s\n' "${WARNINGS[@]}"
+    echo ""
+  fi
+
+  if [[ "${#FAILED[@]}" -eq 0 && "${#WARNINGS[@]}" -eq 0 ]]; then
+    echo "All services healthy."
+  fi
+}
+
+# Send alert if there are failures
+if [[ "${#FAILED[@]}" -gt 0 ]]; then
+  {
+    echo "Service health alert on ${HOSTNAME}:"
+    echo ""
+    printf '%s\n' "${FAILED[@]}"
+    [[ "${#WARNINGS[@]}" -gt 0 ]] && printf '%s\n' "${WARNINGS[@]}"
+  } | mail -s "Service Alert: ${HOSTNAME}" "$ALERT_EMAIL"
+fi
+```
+
+Schedule with cron:
+
+```bash
+sudo crontab -e
+```
+
+```
+*/5 * * * * /usr/local/bin/service-health.sh >> /var/log/service-health.log 2>&1
+```
+
+## Common mistakes
+
+### Using systemctl status for scripting
+
+`systemctl status` output is designed for humans. Use `systemctl is-active`, `systemctl show`, and `systemctl is-failed` in scripts.
+
+```bash
+# WRONG — brittle, parses human output
+systemctl status nginx | grep "active (running)"
+
+# CORRECT — machine-readable
+systemctl is-active --quiet nginx
+```
+
+### Not checking NRestarts for stability
+
+A service that is `active` but has restarted 20 times in the past hour is not healthy.
+
+```bash
+systemctl show nginx --property=NRestarts
+```
+
+### Ignoring degraded system state
+
+`systemctl is-system-running` returning `degraded` means something has failed. Always investigate.
+
+```bash
+systemctl is-system-running
+systemctl --failed
+```
+
+### Not reading the full journal after a failure
+
+`systemctl status` only shows the last few log lines. The cause of a failure is often further back.
+
+```bash
+journalctl -u myapp -b --no-pager | tail -100
+```
+
+## Summary
+
+Service status on AlmaLinux is more than a single `systemctl status` call. Combining state checks, log analysis, restart counts, and system-wide health gives you a complete picture.
+
+Key points:
+
+- use `systemctl is-active --quiet` in scripts — not `systemctl status`
+- check `Result=` and `NRestarts` to understand service stability, not just current state
+- use `journalctl -u servicename -b -p err` to quickly find errors after a failure
+- use `systemctl is-system-running` for a system-wide health check
+- use `systemd-analyze blame` to identify slow-starting services at boot
+- script regular health checks across critical services and alert on failures
+
+:::tip Related pages
+- [Starting Services](./starting-services)
+- [Stopping Services](./stopping-services)
+- [Service Configuration](./service-configuration)
+- [Service Dependencies](./service-dependencies)
+:::

@@ -1,0 +1,470 @@
+---
+sidebar_position: 8
+title: "User Auditing | AlmaLinux"
+sidebar_label: "User Auditing"
+description: "Monitor user activity with auditd, track privileged operations, implement compliance logging, and detect suspicious behaviour on AlmaLinux."
+keywords:
+  - "almalinux auditd"
+  - "almalinux user auditing"
+  - "almalinux audit logging"
+  - "almalinux aureport"
+  - "rhel auditd compliance"
+tags:
+  - almalinux
+  - user-management
+  - auditing
+  - compliance
+  - security
+slug: /linux/almalinux/administration/user-management/user-auditing
+---
+
+# User Auditing
+
+Auditing tracks who did what, when, and from where. On AlmaLinux, the **auditd** daemon is the primary tool for capturing security-relevant events — logins, sudo usage, file access, privilege escalation, and account changes. A well-configured audit setup is essential for incident response, forensics, and compliance with frameworks like CIS, PCI-DSS, and DISA STIG.
+
+## How auditd works
+
+The Linux kernel generates audit events and sends them to `auditd`, which writes them to `/var/log/audit/audit.log`. Rules control which events are captured. The `ausearch` and `aureport` tools query and summarize the log.
+
+```
+Kernel audit subsystem
+        │
+      auditd
+        │
+  /var/log/audit/audit.log
+        │
+   ┌────┴────┐
+ausearch  aureport
+```
+
+## Install and enable auditd
+
+`auditd` is installed and enabled by default on AlmaLinux. Verify it is running:
+
+```bash
+sudo systemctl status auditd
+```
+
+If it is not running:
+
+```bash
+sudo dnf install -y audit audit-libs
+sudo systemctl enable --now auditd
+```
+
+## View the current audit rules
+
+```bash
+# List active rules loaded in the kernel
+sudo auditctl -l
+
+# View the persistent rules file
+cat /etc/audit/rules.d/audit.rules
+```
+
+## Configure auditd settings
+
+The main configuration file controls log rotation, file size, and what happens when the disk is full.
+
+```bash
+sudo nano /etc/audit/auditd.conf
+```
+
+Key settings:
+
+```ini
+# Maximum log file size in MB before rotation
+max_log_file = 100
+
+# Number of rotated log files to keep
+num_logs = 10
+
+# What to do when max size is reached: rotate, keep_logs, or ignore
+max_log_file_action = rotate
+
+# What to do when disk space runs low: ignore, syslog, suspend, single, halt
+disk_full_action = syslog
+disk_error_action = syslog
+
+# Write logs in a format enriched with user and group names
+log_format = ENRICHED
+```
+
+Restart auditd after changes:
+
+```bash
+sudo systemctl restart auditd
+```
+
+## Write audit rules
+
+Audit rules are written to `/etc/audit/rules.d/` and loaded at boot. Use `auditctl` to load rules immediately without a restart.
+
+### Rule syntax
+
+```
+-w /path/to/watch  -p permissions  -k keyname
+-a action,list  -S syscall  -F field=value  -k keyname
+```
+
+| Permission flag | Meaning |
+|---|---|
+| `r` | Read |
+| `w` | Write |
+| `x` | Execute |
+| `a` | Attribute change |
+
+### Watch a file or directory
+
+```bash
+# Audit all writes and attribute changes to the sudoers file
+sudo auditctl -w /etc/sudoers -p wa -k sudoers_changes
+
+# Audit changes to user and group databases
+sudo auditctl -w /etc/passwd  -p wa -k user_changes
+sudo auditctl -w /etc/shadow  -p wa -k user_changes
+sudo auditctl -w /etc/group   -p wa -k group_changes
+
+# Audit changes to SSH configuration
+sudo auditctl -w /etc/ssh/sshd_config -p wa -k ssh_config
+```
+
+### Make rules persistent
+
+Write them to a file in `/etc/audit/rules.d/`:
+
+```bash
+sudo nano /etc/audit/rules.d/user-monitoring.rules
+```
+
+```bash
+# User and group database changes
+-w /etc/passwd  -p wa -k user_changes
+-w /etc/shadow  -p wa -k user_changes
+-w /etc/group   -p wa -k group_changes
+-w /etc/gshadow -p wa -k group_changes
+
+# Sudoers changes
+-w /etc/sudoers     -p wa -k sudoers_changes
+-w /etc/sudoers.d/  -p wa -k sudoers_changes
+
+# Authentication configuration
+-w /etc/pam.d/      -p wa -k pam_changes
+-w /etc/sssd/       -p wa -k sssd_changes
+
+# SSH configuration
+-w /etc/ssh/sshd_config -p wa -k ssh_config
+
+# Login and logout events
+-w /var/log/lastlog  -p wa -k logins
+-w /var/run/faillock/ -p wa -k account_lockout
+
+# Privileged command execution
+-a always,exit -F path=/usr/bin/sudo  -F perm=x -k privileged
+-a always,exit -F path=/usr/bin/su    -F perm=x -k privileged
+-a always,exit -F path=/usr/bin/newgrp -F perm=x -k privileged
+
+# User management commands
+-a always,exit -F path=/usr/sbin/useradd  -F perm=x -k user_mgmt
+-a always,exit -F path=/usr/sbin/userdel  -F perm=x -k user_mgmt
+-a always,exit -F path=/usr/sbin/usermod  -F perm=x -k user_mgmt
+-a always,exit -F path=/usr/sbin/groupadd -F perm=x -k user_mgmt
+-a always,exit -F path=/usr/sbin/groupdel -F perm=x -k user_mgmt
+-a always,exit -F path=/usr/sbin/groupmod -F perm=x -k user_mgmt
+-a always,exit -F path=/usr/bin/passwd    -F perm=x -k user_mgmt
+
+# Make the audit configuration immutable (requires reboot to change rules)
+# Uncomment in production after rules are finalized
+#-e 2
+```
+
+Reload the rules:
+
+```bash
+sudo augenrules --load
+```
+
+## Search audit logs with ausearch
+
+```bash
+# Search by key
+sudo ausearch -k user_changes
+
+# Search for events in the last hour
+sudo ausearch -k sudoers_changes --start recent
+
+# Search for events from a specific user
+sudo ausearch -ua jdoe
+
+# Search for failed login attempts
+sudo ausearch -m USER_LOGIN -sv no
+
+# Search for all privilege escalation events
+sudo ausearch -k privileged
+
+# Output in a more readable format
+sudo ausearch -k user_mgmt -i
+```
+
+The `-i` flag interprets numeric UIDs and GIDs into names, making the output much easier to read.
+
+## Generate reports with aureport
+
+`aureport` produces summary reports from the audit log.
+
+```bash
+# Overall summary of all audit events
+sudo aureport
+
+# Summary of authentication events
+sudo aureport --auth
+
+# Summary of login events
+sudo aureport --login
+
+# Failed login attempts
+sudo aureport --login --failed
+
+# Summary of account modifications
+sudo aureport --mods
+
+# Summary of all sudo and privileged command usage
+sudo aureport --comm
+
+# Summary of anomaly events
+sudo aureport --anomaly
+
+# Events for a specific time range
+sudo aureport --start 03/19/2026 00:00:00 --end 03/19/2026 23:59:59
+```
+
+## Monitor login and logout events
+
+```bash
+# View recent logins
+last
+
+# View failed login attempts
+lastb
+
+# View currently logged-in users
+who
+
+# View login history from the audit log
+sudo aureport --login | head -30
+```
+
+## Track sudo usage
+
+```bash
+# All sudo events in the audit log
+sudo ausearch -k privileged -i
+
+# Sudo events from a specific user
+sudo ausearch -k privileged -ua jdoe -i
+
+# Summarise sudo command usage
+sudo aureport --comm | grep sudo
+```
+
+Cross-reference with the secure log:
+
+```bash
+sudo grep sudo /var/log/secure | tail -30
+```
+
+## Monitor a specific user's activity
+
+```bash
+# All audit events for a user by UID
+sudo ausearch -ua 1001 -i
+
+# File access events for a user
+sudo ausearch -ua 1001 -m PATH -i
+
+# Syscall events for a user
+sudo ausearch -ua 1001 -m SYSCALL -i
+```
+
+## Detect account changes
+
+```bash
+# All user and group management events
+sudo ausearch -k user_mgmt -i
+
+# Specifically look for new user creation
+sudo ausearch -k user_mgmt -i | grep useradd
+
+# Changes to sudoers
+sudo ausearch -k sudoers_changes -i
+
+# Changes to PAM configuration
+sudo ausearch -k pam_changes -i
+```
+
+## Set up log forwarding with rsyslog
+
+For centralized logging, forward audit events to a SIEM or log aggregator using `rsyslog`.
+
+```bash
+sudo nano /etc/rsyslog.d/audit-forward.conf
+```
+
+```bash
+# Forward all audit log entries to a remote syslog server
+if $programname == 'audispd' then @@siem.example.com:514
+& stop
+```
+
+Or use the audisp-remote plugin for native audit forwarding:
+
+```bash
+sudo dnf install -y audispd-plugins
+
+sudo nano /etc/audit/plugins.d/au-remote.conf
+```
+
+```ini
+active = yes
+direction = out
+path = /sbin/audisp-remote
+type = always
+args = /etc/audisp/audisp-remote.conf
+format = string
+```
+
+```bash
+sudo nano /etc/audisp/audisp-remote.conf
+```
+
+```ini
+remote_server = siem.example.com
+port = 60
+transport = tcp
+```
+
+Restart auditd:
+
+```bash
+sudo systemctl restart auditd
+```
+
+## Protect audit logs
+
+Audit logs are only useful if they have not been tampered with. Restrict access and consider forwarding to an external system immediately.
+
+```bash
+# Verify permissions on the audit log
+ls -la /var/log/audit/audit.log
+# Should be: -rw------- 1 root root
+
+# Verify permissions on the audit config
+ls -la /etc/audit/auditd.conf
+# Should be: -rw-r--r-- 1 root root
+
+# Lock audit rules so they cannot be changed without a reboot
+# Add to the end of /etc/audit/rules.d/audit.rules
+echo "-e 2" | sudo tee -a /etc/audit/rules.d/audit.rules
+sudo augenrules --load
+```
+
+:::warning
+Once `-e 2` (immutable mode) is loaded, audit rules cannot be changed until the next reboot. Only enable this in production after your ruleset is finalized and tested.
+:::
+
+## Scheduled audit report
+
+Automate a daily summary of key events with a cron job:
+
+```bash
+sudo nano /etc/cron.daily/audit-report
+```
+
+```bash
+#!/bin/bash
+# Daily audit summary report
+REPORT_DIR="/var/log/audit/reports"
+DATE=$(date +%F)
+
+mkdir -p "$REPORT_DIR"
+
+{
+  echo "=== Audit Summary: $DATE ==="
+  echo ""
+  echo "--- Failed Logins ---"
+  aureport --login --failed
+
+  echo ""
+  echo "--- Account Modifications ---"
+  aureport --mods
+
+  echo ""
+  echo "--- Privileged Commands ---"
+  ausearch -k privileged -i --start yesterday --end now
+
+  echo ""
+  echo "--- Sudoers Changes ---"
+  ausearch -k sudoers_changes -i --start yesterday --end now
+
+} > "$REPORT_DIR/audit-$DATE.txt"
+
+chmod 640 "$REPORT_DIR/audit-$DATE.txt"
+```
+
+Make it executable:
+
+```bash
+sudo chmod +x /etc/cron.daily/audit-report
+```
+
+## Common mistakes
+
+### No persistent audit rules
+
+Rules loaded with `auditctl` are lost on reboot. Always write rules to `/etc/audit/rules.d/` and reload with `augenrules --load`.
+
+```bash
+sudo augenrules --load
+```
+
+### Audit log fills the disk
+
+Without proper rotation settings, `/var/log/audit/` can fill the disk. Set `max_log_file` and `max_log_file_action = rotate` in `auditd.conf`.
+
+### Not forwarding logs off the system
+
+Local logs can be deleted or tampered with if an account is compromised. Forward to a remote syslog or SIEM as soon as possible.
+
+### Ignoring aureport anomaly events
+
+```bash
+sudo aureport --anomaly
+```
+
+Anomaly events often indicate probing, failed privilege escalation, or misconfigured services. Review them regularly.
+
+### Enabling immutable mode before testing rules
+
+`-e 2` locks rules until reboot. Enable it only after your ruleset is complete and verified.
+
+## Summary
+
+A well-configured audit setup gives you a reliable record of everything security-relevant that happens on your system — logins, privilege use, account changes, and configuration modifications.
+
+Key points:
+
+- auditd is enabled by default on AlmaLinux — verify it is running
+- write persistent rules to `/etc/audit/rules.d/` and load with `augenrules --load`
+- use `-k` keys to group related rules and make searching easy
+- use `ausearch -i` for readable event output and `aureport` for summaries
+- forward logs to a remote system or SIEM so they cannot be tampered with locally
+- set up log rotation in `auditd.conf` to prevent disk exhaustion
+- schedule a daily report to stay on top of key events
+- enable immutable mode (`-e 2`) in production after your ruleset is finalized
+
+:::tip Related pages
+- [Security Policies](./security-policies)
+- [Authentication Systems](./authentication-systems)
+- [Sudo & Privileges](./sudo-privileges)
+- [LDAP Integration](./ldap-integration)
+:::

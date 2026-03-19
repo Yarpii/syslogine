@@ -1,0 +1,566 @@
+---
+sidebar_position: 1
+title: "Package Management | AlmaLinux"
+sidebar_label: "Package Management"
+description: "Manage packages on AlmaLinux with DNF. Install, update, remove, and query packages, manage repositories, work with package groups, and resolve dependency issues."
+keywords:
+  - "almalinux package management"
+  - "almalinux dnf"
+  - "almalinux rpm"
+  - "almalinux repositories"
+  - "rhel package management"
+tags:
+  - almalinux
+  - system-maintenance
+  - dnf
+  - rpm
+  - packages
+slug: /linux/almalinux/administration/system-maintenance/package-management
+---
+
+# Package Management on AlmaLinux
+
+Package management is the foundation of system maintenance on AlmaLinux. Every piece of software on the system — from the kernel to the web server to the text editor — is installed, tracked, and updated through the package management system. Understanding how to use DNF (Dandified YUM) effectively, how repositories are structured, and how to work with RPM packages directly gives you reliable control over what is installed on your systems and why.
+
+AlmaLinux uses DNF as its primary package manager, with RPM as the underlying package format. DNF handles dependency resolution, repository management, and transaction history automatically. RPM provides lower-level inspection and manipulation of individual package files. Both are essential tools in a production environment.
+
+---
+
+## DNF Fundamentals
+
+DNF manages software through transactions — atomic operations that either complete fully or are rolled back. This means a failed update does not leave the system in a half-updated state. Every transaction is recorded in the DNF history database, making it possible to review what changed and when, and to undo changes if needed.
+
+### Checking DNF Version and Configuration
+
+Verify DNF is installed and check its version:
+
+```bash
+dnf --version
+```
+
+Review the main DNF configuration:
+
+```bash
+cat /etc/dnf/dnf.conf
+```
+
+Key settings in `dnf.conf` that affect production systems:
+
+| Setting | Default | Description |
+|---|---|---|
+| `installonly_limit` | `3` | Number of kernel versions to keep |
+| `clean_requirements_on_remove` | `True` | Remove unused dependencies when a package is removed |
+| `best` | `True` | Prefer the best available version, fail if unavailable |
+| `skip_if_unavailable` | `False` | Skip repositories that cannot be reached |
+| `fastestmirror` | `False` | Select the fastest available mirror |
+
+---
+
+## Installing Packages
+
+### Installing a Single Package
+
+```bash
+dnf install nginx
+```
+
+DNF resolves all dependencies automatically and shows a summary of what will be installed before asking for confirmation. Review the summary carefully in production environments — a single package installation can pull in many dependencies.
+
+To install without a confirmation prompt (useful in scripts):
+
+```bash
+dnf install -y nginx
+```
+
+To install a specific version of a package:
+
+```bash
+dnf install nginx-1.20.1
+```
+
+To install a package from a specific repository when multiple repositories provide it:
+
+```bash
+dnf install --repo=epel nginx
+```
+
+### Installing Multiple Packages
+
+Multiple package names can be specified in a single command:
+
+```bash
+dnf install nginx postgresql-server redis
+```
+
+This installs all three in a single transaction, which is more efficient than separate installs and ensures all dependencies are resolved together.
+
+### Installing from a Local RPM File
+
+To install a package from a local `.rpm` file:
+
+```bash
+dnf install /tmp/mypackage-1.0-1.el9.x86_64.rpm
+```
+
+Using `dnf` rather than `rpm -i` for local file installation has the advantage of automatic dependency resolution from configured repositories — if the local RPM requires dependencies, DNF will download and install them.
+
+### Installing Package Groups
+
+Package groups bundle related packages that are commonly installed together. To list available groups:
+
+```bash
+dnf group list
+```
+
+To see what a group contains:
+
+```bash
+dnf group info "Development Tools"
+```
+
+To install a group:
+
+```bash
+dnf group install "Development Tools"
+```
+
+---
+
+## Updating Packages
+
+### Checking for Available Updates
+
+To see all available updates without installing them:
+
+```bash
+dnf check-update
+```
+
+The output lists each package with its current version, available version, and the repository providing the update. Exit code 100 means updates are available; exit code 0 means the system is up to date. This exit code behavior is useful in scripts.
+
+To check for updates to a specific package:
+
+```bash
+dnf check-update nginx
+```
+
+### Applying All Updates
+
+To update all packages to their latest available versions:
+
+```bash
+dnf upgrade
+```
+
+`dnf upgrade` is equivalent to `dnf update` on modern DNF — both update packages and also handle package obsoletes (replacing packages that have been superseded by different package names).
+
+### Applying Security Updates Only
+
+To update only packages that have security advisories:
+
+```bash
+dnf upgrade --security
+```
+
+To update only packages addressing a specific severity of security issue:
+
+```bash
+dnf upgrade --sec-severity=Critical
+```
+
+### Updating a Specific Package
+
+To update only one package:
+
+```bash
+dnf upgrade nginx
+```
+
+### Excluding Packages from Updates
+
+To prevent a specific package from being updated — for example, because a specific version is required for application compatibility:
+
+```bash
+dnf upgrade --exclude=nginx
+```
+
+For a permanent exclusion that applies to all DNF operations, add it to `dnf.conf`:
+
+```bash
+nano /etc/dnf/dnf.conf
+```
+
+```ini
+[main]
+exclude=nginx postgresql-server
+```
+
+Excluded packages are skipped during all updates, including `dnf-automatic` runs. Document any exclusions clearly — they are a maintenance debt that can accumulate into significant security exposure if left unreviewed.
+
+---
+
+## Removing Packages
+
+### Removing a Package
+
+```bash
+dnf remove nginx
+```
+
+DNF removes the package and, by default, any dependencies that were installed solely for that package and are no longer needed by anything else (`clean_requirements_on_remove = True`). Review the removal summary carefully — dependency cleanup can sometimes remove more than expected.
+
+### Removing a Package Without Removing Dependencies
+
+To remove only the named package without touching its dependencies:
+
+```bash
+dnf remove --noautoremove nginx
+```
+
+### Checking What Would Be Removed
+
+Before removing a package, see what else depends on it:
+
+```bash
+dnf repoquery --dependson nginx
+```
+
+If other installed packages depend on `nginx`, removing it will also remove those packages (or the removal will fail if they are protected). Understanding the dependency chain prevents unexpected removals.
+
+---
+
+## Querying Packages
+
+DNF and RPM provide complementary query capabilities. DNF queries work against both installed packages and repository metadata; RPM queries work against the local RPM database.
+
+### Finding Which Package Provides a File
+
+When a command is not found or a library is missing, find which package provides it:
+
+```bash
+dnf provides /usr/bin/psql
+dnf provides "libssl.so.3"
+```
+
+This searches repository metadata to find which package contains the specified file or capability.
+
+### Searching for Packages by Name or Description
+
+```bash
+dnf search postgresql
+```
+
+For a more targeted search that looks only in package names:
+
+```bash
+dnf search --names-only postgresql
+```
+
+### Listing Installed Packages
+
+To list all installed packages:
+
+```bash
+dnf list installed
+```
+
+To list installed packages matching a pattern:
+
+```bash
+dnf list installed "python3*"
+```
+
+To list packages available in repositories but not installed:
+
+```bash
+dnf list available
+```
+
+### Getting Package Information
+
+To see detailed information about a package — version, description, dependencies, installed size:
+
+```bash
+dnf info nginx
+```
+
+For an installed package, this shows the installed version. For an available but not-yet-installed package, it shows the repository version.
+
+### Listing Files in a Package
+
+To see which files an installed package provides:
+
+```bash
+rpm -ql nginx
+```
+
+To see which files a package in a repository would install (without installing it):
+
+```bash
+dnf repoquery -l nginx
+```
+
+### Finding Which Package Owns a File
+
+To find which package installed a specific file:
+
+```bash
+rpm -qf /etc/nginx/nginx.conf
+```
+
+This is useful when you need to know which package to report a bug against, or which package to reinstall if a configuration file is missing.
+
+### Checking Package Integrity
+
+To verify that the files belonging to an installed package have not been modified:
+
+```bash
+rpm -V nginx
+```
+
+The output lists files that differ from the package's recorded state. Each line begins with a string of flags indicating what changed: `S` (size), `M` (permissions), `5` (MD5 hash), `T` (modification time), and so on. A line beginning with `.........` means the file is unchanged. This is useful for detecting unauthorized modifications to system binaries or configuration files.
+
+---
+
+## Repository Management
+
+### Listing Configured Repositories
+
+To see all configured repositories and their enabled/disabled status:
+
+```bash
+dnf repolist all
+```
+
+To see only enabled repositories:
+
+```bash
+dnf repolist
+```
+
+### Enabling and Disabling Repositories
+
+To enable a repository for a single transaction:
+
+```bash
+dnf install --enablerepo=epel nginx
+```
+
+To disable a repository for a single transaction:
+
+```bash
+dnf upgrade --disablerepo=epel
+```
+
+To permanently enable or disable a repository:
+
+```bash
+dnf config-manager --enable epel
+dnf config-manager --disable epel
+```
+
+### Adding a Repository
+
+The recommended way to add a repository is by installing its repository configuration package, which sets up the correct GPG key and repository URL automatically. For EPEL (Extra Packages for Enterprise Linux):
+
+```bash
+dnf install epel-release
+```
+
+To add a repository manually, create a `.repo` file in `/etc/yum.repos.d/`:
+
+```bash
+nano /etc/yum.repos.d/myrepo.repo
+```
+
+```ini
+[myrepo]
+name=My Custom Repository
+baseurl=https://repo.example.com/almalinux/9/
+enabled=1
+gpgcheck=1
+gpgkey=https://repo.example.com/GPG-KEY-myrepo
+```
+
+Always enable GPG checking (`gpgcheck=1`) for third-party repositories. A repository without GPG verification can serve malicious packages that will be installed with full trust.
+
+### Removing a Repository
+
+To remove a repository, delete its `.repo` file:
+
+```bash
+rm /etc/yum.repos.d/myrepo.repo
+```
+
+Any packages installed from that repository remain installed — removing the repository only prevents future updates from being pulled from it.
+
+### Refreshing Repository Metadata
+
+To force DNF to download fresh metadata from all repositories:
+
+```bash
+dnf makecache
+```
+
+This is useful after adding or modifying a repository, or when `dnf check-update` seems to show stale results.
+
+---
+
+## DNF History and Rollback
+
+Every DNF transaction is recorded in the history database. This makes it possible to review what was installed or updated and when, and to undo transactions if a change causes problems.
+
+### Viewing Transaction History
+
+To list recent transactions:
+
+```bash
+dnf history list
+```
+
+To see the details of a specific transaction:
+
+```bash
+dnf history info 42
+```
+
+This shows exactly which packages were installed, updated, or removed in that transaction, along with the user who ran it and the timestamp.
+
+### Undoing a Transaction
+
+To undo a specific transaction — reverting all packages to their state before that transaction:
+
+```bash
+dnf history undo 42
+```
+
+This is powerful for rolling back a failed update. For example, if transaction 42 updated `nginx` and the new version has a bug, `dnf history undo 42` downgrades `nginx` back to the previous version.
+
+### Rolling Back to a Previous State
+
+To roll back all changes since a specific transaction:
+
+```bash
+dnf history rollback 35
+```
+
+This undoes all transactions from the current state back to the state after transaction 35. Use with care — rolling back many transactions can have complex dependency effects.
+
+:::tip
+Before any significant update on a production system, note the current DNF history transaction ID:
+
+```bash
+dnf history list | head -5
+```
+
+If the update causes problems, you have the transaction ID ready for a quick rollback without needing to search the history.
+:::
+
+---
+
+## Working with RPM Directly
+
+While DNF should be used for installing and removing packages, RPM provides direct access to the package database for inspection and verification tasks that DNF does not expose.
+
+### Querying the RPM Database
+
+To list all installed packages with their version and release:
+
+```bash
+rpm -qa
+```
+
+To query a specific installed package:
+
+```bash
+rpm -qi nginx
+```
+
+To see the changelog for an installed package:
+
+```bash
+rpm -q --changelog nginx | head -50
+```
+
+The changelog shows what changed between versions, which is useful for understanding what a security update fixes.
+
+### Extracting Files from an RPM Without Installing
+
+To extract files from an RPM package without installing it — for example, to recover a configuration file from the package:
+
+```bash
+rpm2cpio /tmp/nginx-1.20.1-1.el9.x86_64.rpm | cpio -idmv ./etc/nginx/nginx.conf
+```
+
+This extracts only `./etc/nginx/nginx.conf` from the RPM into the current directory, preserving the path structure. The result is a file at `./etc/nginx/nginx.conf` relative to where the command is run.
+
+### Reinstalling a Package
+
+To reinstall a package — useful when package files have been accidentally deleted or modified:
+
+```bash
+dnf reinstall nginx
+```
+
+This downloads and reinstalls the package without changing any other packages. Configuration files that were modified after installation are left unchanged; only the package-owned files that differ from the package's recorded state are replaced.
+
+---
+
+## Managing Modules
+
+AlmaLinux 9 uses DNF modules to provide multiple versions of certain software stacks — for example, different versions of Python, Node.js, or PostgreSQL — without conflicting with each other.
+
+### Listing Available Modules
+
+```bash
+dnf module list
+```
+
+To see available streams for a specific module:
+
+```bash
+dnf module list nodejs
+```
+
+### Enabling a Module Stream
+
+To enable a specific version of a module — for example, Node.js 18:
+
+```bash
+dnf module enable nodejs:18
+dnf install nodejs
+```
+
+Only one stream of a module can be active at a time. Switching streams requires resetting the module first:
+
+```bash
+dnf module reset nodejs
+dnf module enable nodejs:20
+dnf distro-sync
+```
+
+The `dnf distro-sync` command updates all installed packages from the module to the versions provided by the newly enabled stream.
+
+---
+
+## Summary
+
+Package management on AlmaLinux through DNF provides a reliable, transactional approach to software installation and maintenance. Every change is recorded, dependencies are managed automatically, and problematic updates can be rolled back. RPM complements DNF with inspection and verification capabilities that are essential for security and compliance.
+
+Key points to remember:
+
+- Use `dnf upgrade --security` for targeted security patching without updating all packages
+- Always review the transaction summary before confirming — DNF's dependency resolution can pull in or remove unexpected packages
+- Document package exclusions in `dnf.conf` — excluded packages accumulate security debt
+- Use `rpm -V <package>` to verify package file integrity on systems where tampering is a concern
+- Use `dnf history undo <id>` to roll back a problematic update quickly
+- Always enable GPG checking when adding third-party repositories
+- Use `dnf provides` to find which package supplies a missing binary or library
+- Module streams allow multiple software versions to coexist; only one stream per module can be active at a time
+
+### Related Pages
+
+- [Security Patching](./security-patching) — applying security updates and managing CVEs
+- [System Cleanup](./system-cleanup) — removing old packages, kernels, and clearing caches
+- [Maintenance Automation](./maintenance-automation) — automating updates with dnf-automatic
+- [System Auditing](./system-auditing) — verifying package integrity and compliance

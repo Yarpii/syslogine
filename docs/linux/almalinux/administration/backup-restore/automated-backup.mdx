@@ -1,0 +1,608 @@
+---
+sidebar_position: 6
+title: "Automated Backup | AlmaLinux"
+sidebar_label: "Automated Backup"
+description: "Automate backup schedules on AlmaLinux using cron and systemd timers. Script backup procedures, handle errors, send notifications, and manage retention automatically."
+keywords:
+  - "almalinux automated backup"
+  - "almalinux backup cron"
+  - "almalinux systemd timer backup"
+  - "almalinux backup script"
+  - "rhel automated backup"
+tags:
+  - almalinux
+  - backup-restore
+  - automation
+  - cron
+  - systemd
+slug: /linux/almalinux/administration/backup-restore/automated-backup
+---
+
+# Automated Backup on AlmaLinux
+
+A backup that depends on someone remembering to run it manually will eventually be missed. Automation removes the human dependency from the backup process, ensuring that backups happen on schedule regardless of how busy the team is or whether anyone is paying attention. On AlmaLinux, two mechanisms are available for scheduling automated tasks: the traditional `cron` daemon and systemd timers. Both can drive backup scripts reliably, and each has characteristics that make it more suitable for different scenarios.
+
+This page covers how to write robust backup scripts, how to schedule them with both cron and systemd timers, how to handle errors and send notifications when something goes wrong, and how to manage retention automatically so that backup storage does not fill up indefinitely.
+
+---
+
+## Principles of a Good Backup Script
+
+Before looking at scheduling, it is worth establishing what a well-written backup script should do. A backup that runs silently and produces no output makes it impossible to tell whether it succeeded or failed. A backup that fills the disk without pruning old archives stops working until someone intervenes manually. A backup that does not log its activity leaves no audit trail.
+
+A robust automated backup script should:
+
+- Log its start time, end time, and outcome to a file
+- Check that the backup destination has sufficient free space before starting
+- Exit with a non-zero status code if anything goes wrong, so the scheduler can detect the failure
+- Send a notification when a backup fails
+- Prune old backups to keep storage consumption bounded
+- Be readable — comments explaining each step make it maintainable by anyone on the team
+
+These principles are applied throughout the examples in this page.
+
+---
+
+## Writing a Backup Script
+
+The following script performs a tar-based backup of key system directories to a local backup path, logs its activity, checks for errors, and removes archives older than the configured retention period. It is designed to be called by cron or a systemd timer.
+
+```bash
+nano /usr/local/sbin/system-backup.sh
+```
+
+```bash
+#!/bin/bash
+# system-backup.sh
+# Backs up key system directories to a tar archive.
+# Intended to be run by cron or a systemd timer as root.
+
+# ── Configuration ────────────────────────────────────────────────────────────
+BACKUP_DIR="/backup/daily"
+HOSTNAME=$(hostname -s)
+TIMESTAMP=$(date +%Y%m%d-%H%M)
+ARCHIVE="${BACKUP_DIR}/${HOSTNAME}-${TIMESTAMP}.tar.gz"
+LOGFILE="/var/log/backup/system-backup.log"
+RETENTION_DAYS=14
+MIN_FREE_GB=5
+ALERT_EMAIL="admin@example.com"
+
+# Directories to back up
+SOURCES="/etc /home /root /var/www /usr/local"
+
+# Paths to exclude from the archive
+EXCLUDES=(
+    /proc /sys /dev /run /tmp /var/tmp
+    /var/cache/dnf
+    /home/*/.cache
+    "${BACKUP_DIR}"
+)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Build the --exclude flags for tar
+EXCLUDE_ARGS=()
+for path in "${EXCLUDES[@]}"; do
+    EXCLUDE_ARGS+=("--exclude=${path}")
+done
+
+# Ensure the backup and log directories exist
+mkdir -p "${BACKUP_DIR}"
+mkdir -p "$(dirname "${LOGFILE}")"
+
+# Logging helper — writes timestamped messages to both the log file and stdout
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "${LOGFILE}"
+}
+
+# Error handler — logs the failure, sends an alert, and exits non-zero
+fail() {
+    log "ERROR: $*"
+    echo "Backup failed on ${HOSTNAME} at $(date). Error: $*" \
+        | mail -s "Backup Failed: ${HOSTNAME}" "${ALERT_EMAIL}"
+    exit 1
+}
+
+log "──────────────────────────────────────────────"
+log "Backup started: ${ARCHIVE}"
+
+# ── Pre-flight checks ─────────────────────────────────────────────────────────
+
+# Check that the backup destination is mounted and writable
+if [[ ! -d "${BACKUP_DIR}" ]]; then
+    fail "Backup directory does not exist: ${BACKUP_DIR}"
+fi
+
+if [[ ! -w "${BACKUP_DIR}" ]]; then
+    fail "Backup directory is not writable: ${BACKUP_DIR}"
+fi
+
+# Check free space on the backup destination
+FREE_GB=$(df -BG "${BACKUP_DIR}" | awk 'NR==2 {gsub("G",""); print $4}')
+if [[ "${FREE_GB}" -lt "${MIN_FREE_GB}" ]]; then
+    fail "Insufficient free space on backup destination: ${FREE_GB}G available, ${MIN_FREE_GB}G required"
+fi
+
+log "Pre-flight checks passed. Free space: ${FREE_GB}G"
+
+# ── Create the backup archive ─────────────────────────────────────────────────
+
+tar "${EXCLUDE_ARGS[@]}" -czpf "${ARCHIVE}" ${SOURCES} 2>> "${LOGFILE}"
+TAR_EXIT=$?
+
+# tar exit code 1 means "some files changed during backup" — acceptable for a live system
+# Exit code 2 or higher means a real error occurred
+if [[ "${TAR_EXIT}" -ge 2 ]]; then
+    fail "tar exited with code ${TAR_EXIT}. Archive may be incomplete: ${ARCHIVE}"
+fi
+
+if [[ "${TAR_EXIT}" -eq 1 ]]; then
+    log "WARNING: Some files changed during backup (tar exit code 1). Archive is usable."
+fi
+
+ARCHIVE_SIZE=$(du -sh "${ARCHIVE}" | cut -f1)
+log "Archive created: ${ARCHIVE} (${ARCHIVE_SIZE})"
+
+# ── Verify the archive ────────────────────────────────────────────────────────
+
+tar -tzf "${ARCHIVE}" > /dev/null 2>&1 \
+    || fail "Archive verification failed — archive may be corrupt: ${ARCHIVE}"
+
+log "Archive verified successfully"
+
+# ── Prune old archives ────────────────────────────────────────────────────────
+
+DELETED=$(find "${BACKUP_DIR}" -name "${HOSTNAME}-*.tar.gz" \
+    -mtime "+${RETENTION_DAYS}" -print -delete 2>&1)
+
+if [[ -n "${DELETED}" ]]; then
+    log "Pruned old archives:"
+    echo "${DELETED}" | while read -r line; do log "  Deleted: ${line}"; done
+fi
+
+# ── Done ──────────────────────────────────────────────────────────────────────
+
+log "Backup completed successfully"
+log "──────────────────────────────────────────────"
+exit 0
+```
+
+Make the script executable:
+
+```bash
+chmod 700 /usr/local/sbin/system-backup.sh
+```
+
+The `700` permission ensures only root can read or execute the script, which is appropriate since it handles backup paths and alert email configuration.
+
+### Testing the Script
+
+Always run a new backup script manually before scheduling it, to confirm it works correctly and produces the expected output:
+
+```bash
+/usr/local/sbin/system-backup.sh
+```
+
+Review the log after the run:
+
+```bash
+cat /var/log/backup/system-backup.log
+```
+
+Confirm an archive was created:
+
+```bash
+ls -lh /backup/daily/
+```
+
+---
+
+## Scheduling with Cron
+
+Cron is the traditional Unix task scheduler. It reads job definitions from crontab files and runs them at the specified times. System-wide cron jobs for root are best placed in `/etc/cron.d/` as named files, which is cleaner than editing `/etc/crontab` directly and survives system updates.
+
+### Crontab Syntax
+
+A cron entry has five time fields followed by the user and the command:
+
+```
+┌────────── minute (0–59)
+│  ┌──────── hour (0–23)
+│  │  ┌────── day of month (1–31)
+│  │  │  ┌─── month (1–12)
+│  │  │  │  ┌── day of week (0–7, 0 and 7 are Sunday)
+│  │  │  │  │
+*  *  *  *  *  user  command
+```
+
+### Creating a Cron Job
+
+Create a cron drop-in file for the backup:
+
+```bash
+nano /etc/cron.d/system-backup
+```
+
+```
+# Run system backup daily at 02:00
+0 2 * * *  root  /usr/local/sbin/system-backup.sh
+```
+
+Cron reads files in `/etc/cron.d/` automatically. No reload is needed.
+
+To run the backup at different intervals for different components, use multiple entries:
+
+```bash
+nano /etc/cron.d/system-backup
+```
+
+```
+# Daily backup of configuration and home directories at 02:00
+0 2 * * *    root  /usr/local/sbin/system-backup.sh
+
+# Weekly full system backup on Sunday at 01:00
+0 1 * * 0    root  /usr/local/sbin/weekly-backup.sh
+
+# Hourly database dump
+0 * * * *    root  /usr/local/sbin/db-backup.sh
+```
+
+### Capturing Cron Output
+
+By default, cron emails the output of a job to the local root mailbox. For backup jobs that produce verbose output, redirect it to the backup log instead:
+
+```bash
+0 2 * * *  root  /usr/local/sbin/system-backup.sh >> /var/log/backup/cron.log 2>&1
+```
+
+The `>> /var/log/backup/cron.log 2>&1` redirects both standard output and standard error to the log file, appending to it rather than overwriting. This captures any output the script produces that is not already written to the log internally.
+
+To prevent this secondary log from growing indefinitely, add a logrotate rule:
+
+```bash
+nano /etc/logrotate.d/backup-cron
+```
+
+```
+/var/log/backup/cron.log
+/var/log/backup/system-backup.log {
+    daily
+    rotate 30
+    compress
+    missingok
+    notifempty
+}
+```
+
+### Verifying Cron Is Running
+
+If scheduled backups do not appear to be running, check that the cron daemon is active:
+
+```bash
+systemctl status crond
+```
+
+To see recent cron activity in the journal:
+
+```bash
+journalctl -u crond --since "24 hours ago"
+```
+
+---
+
+## Scheduling with systemd Timers
+
+systemd timers are an alternative to cron with several advantages: they integrate with the journal for logging, support monotonic timers that run a fixed interval after boot (useful for systems that are not always on), can be set to run missed jobs when the system next starts (`Persistent=true`), and can model complex dependencies between jobs and other system units.
+
+A systemd timer always comes in a pair: the timer unit that defines when to run, and the service unit that defines what to run.
+
+### Creating a Service Unit
+
+The service unit describes the backup job itself:
+
+```bash
+nano /etc/systemd/system/system-backup.service
+```
+
+```ini
+[Unit]
+Description=Daily system backup
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/system-backup.sh
+StandardOutput=append:/var/log/backup/system-backup.log
+StandardError=append:/var/log/backup/system-backup.log
+```
+
+`Type=oneshot` is correct for a task that runs to completion and exits. `StandardOutput` and `StandardError` redirect the service's output to the backup log, supplementing the logging the script does internally.
+
+### Creating a Timer Unit
+
+The timer unit defines when the service runs:
+
+```bash
+nano /etc/systemd/system/system-backup.timer
+```
+
+```ini
+[Unit]
+Description=Run system backup daily at 02:00
+
+[Timer]
+OnCalendar=*-*-* 02:00:00
+RandomizedDelaySec=300
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+```
+
+`OnCalendar=*-*-* 02:00:00` runs the timer every day at 02:00. `RandomizedDelaySec=300` adds a random delay of up to 5 minutes, which is useful when multiple servers run the same timer — staggering their start times prevents them all from hitting the backup server simultaneously. `Persistent=true` causes a missed run (because the system was off at 02:00) to execute at the next boot.
+
+### Enabling and Starting the Timer
+
+```bash
+systemctl daemon-reload
+systemctl enable --now system-backup.timer
+```
+
+Verify the timer is active and see when it will next fire:
+
+```bash
+systemctl list-timers system-backup.timer
+```
+
+The output shows the last run time, the next scheduled run time, and the time remaining until the next run.
+
+### Checking Timer Logs
+
+Because the service unit is a proper systemd unit, its output is captured in the journal:
+
+```bash
+journalctl -u system-backup.service
+```
+
+To see only the most recent run:
+
+```bash
+journalctl -u system-backup.service -n 50
+```
+
+To watch the next backup run in real time as it executes:
+
+```bash
+journalctl -f -u system-backup.service
+```
+
+### Triggering a Timer Manually
+
+To run the backup immediately without waiting for the scheduled time — useful for testing or for creating an on-demand backup:
+
+```bash
+systemctl start system-backup.service
+```
+
+This starts the service directly, not the timer. The timer's schedule is unaffected.
+
+### Calendar Expression Examples
+
+systemd timer calendar expressions are more expressive than cron syntax:
+
+| Expression | Meaning |
+|---|---|
+| `daily` | Every day at midnight |
+| `weekly` | Every Monday at midnight |
+| `monthly` | First day of each month at midnight |
+| `*-*-* 02:00:00` | Every day at 02:00 |
+| `Mon *-*-* 03:00:00` | Every Monday at 03:00 |
+| `*-*-1 04:00:00` | First day of every month at 04:00 |
+| `*-*-* 00/6:00:00` | Every 6 hours |
+| `Sat,Sun *-*-* 05:00:00` | Every weekend day at 05:00 |
+
+To verify that a calendar expression fires when you expect, use `systemd-analyze calendar`:
+
+```bash
+systemd-analyze calendar "*-*-* 02:00:00"
+```
+
+This shows the next several times the expression would fire, which is a reliable way to confirm the expression is correct before deploying it.
+
+---
+
+## Cron vs. systemd Timers: When to Use Which
+
+Both mechanisms are reliable and appropriate for automated backups. The choice often comes down to familiarity and the specific features you need.
+
+| Feature | cron | systemd timer |
+|---|---|---|
+| Syntax familiarity | Widely known | Less familiar |
+| Logging | Email or redirect to file | Integrated with journal |
+| Missed job handling | No (job is skipped) | Yes, with `Persistent=true` |
+| Random delay | Not built-in | `RandomizedDelaySec` |
+| Dependencies on other units | No | Yes, via `After=`, `Requires=` |
+| Resource limits on job | No | Yes, via `[Service]` options |
+| Per-user jobs | Yes | Requires user linger |
+
+For most backup scenarios on AlmaLinux, either works well. systemd timers are particularly worth choosing when you need `Persistent=true` (to catch up missed runs on servers that are sometimes off), when you want backup jobs to have explicit dependencies on network availability (`After=network-online.target`), or when resource limiting the backup process is important on production servers.
+
+---
+
+## Handling Errors and Sending Notifications
+
+A backup job that fails silently is a serious risk — the failure may go unnoticed until a restore is needed. The backup script shown earlier sends an email on failure using `mail`. This requires a working mail transfer agent (such as Postfix) configured to relay mail externally.
+
+### Testing Email Delivery
+
+Before relying on email alerts, confirm that the mail path works:
+
+```bash
+echo "Test alert from $(hostname)" | mail -s "Backup Alert Test" admin@example.com
+```
+
+If no email arrives within a few minutes, check the mail queue and logs:
+
+```bash
+postqueue -p
+journalctl -u postfix --since "10 minutes ago"
+```
+
+### Notifying on Success as Well
+
+For critical systems, it can be useful to receive a success notification as well, so that silence itself becomes an alert (if you stop receiving success notifications, something is wrong). Add a success notification at the end of the backup script:
+
+```bash
+echo "Backup completed successfully on ${HOSTNAME} at $(date). Archive: ${ARCHIVE} (${ARCHIVE_SIZE})" \
+    | mail -s "Backup OK: ${HOSTNAME}" "${ALERT_EMAIL}"
+```
+
+This produces a daily email for each backed-up system. For environments with many servers, consider aggregating these into a summary report rather than sending individual emails.
+
+### Systemd OnFailure Notification
+
+For backups run by systemd timers, the `OnFailure` directive can trigger a notification unit whenever the backup service exits with a non-zero status. This works independently of anything inside the backup script:
+
+```bash
+systemctl edit system-backup.service
+```
+
+```ini
+[Unit]
+OnFailure=notify-failure@%n.service
+```
+
+This references the template notification unit described in the [Log Monitoring](../log-management/log-monitoring) page. It provides a safety net that catches failures even if the script's own error handling is bypassed.
+
+---
+
+## Automating Retention
+
+Backup retention — deleting old archives to keep storage consumption bounded — should be automated as part of the same job that creates backups, or as a separate scheduled cleanup job. The backup script shown earlier includes retention as part of the main script. For rsnapshot, retention is configured in `rsnapshot.conf` and managed automatically. For other setups, a dedicated cleanup is sometimes cleaner.
+
+### Cleanup Script for a Backup Directory
+
+The following removes archives beyond the retention window from a backup directory, with logging:
+
+```bash
+nano /usr/local/sbin/backup-cleanup.sh
+```
+
+```bash
+#!/bin/bash
+# backup-cleanup.sh
+# Removes backup archives older than RETENTION_DAYS from BACKUP_DIR.
+
+BACKUP_DIR="/backup/daily"
+RETENTION_DAYS=30
+LOGFILE="/var/log/backup/cleanup.log"
+
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "${LOGFILE}"
+}
+
+mkdir -p "$(dirname "${LOGFILE}")"
+log "Cleanup started — removing archives older than ${RETENTION_DAYS} days"
+
+COUNT=0
+while IFS= read -r -d '' file; do
+    rm -f "${file}"
+    log "Deleted: ${file}"
+    ((COUNT++))
+done < <(find "${BACKUP_DIR}" -name "*.tar.gz" -mtime "+${RETENTION_DAYS}" -print0)
+
+log "Cleanup complete — ${COUNT} archive(s) removed"
+```
+
+```bash
+chmod 700 /usr/local/sbin/backup-cleanup.sh
+```
+
+Schedule it to run daily, after backups have completed:
+
+```bash
+nano /etc/cron.d/backup-cleanup
+```
+
+```
+# Run backup cleanup daily at 04:00 (after the 02:00 backup)
+0 4 * * *  root  /usr/local/sbin/backup-cleanup.sh
+```
+
+---
+
+## Monitoring Automated Backups
+
+Scheduling a backup is not the same as knowing it is working. Automated backup monitoring confirms that backups are actually completing successfully on schedule.
+
+### Checking the Last Successful Backup
+
+A simple monitoring check compares the modification time of the most recent backup archive against a maximum age threshold. If the newest archive is older than expected, a backup has been missed:
+
+```bash
+nano /usr/local/sbin/check-backup-freshness.sh
+```
+
+```bash
+#!/bin/bash
+# check-backup-freshness.sh
+# Alerts if no backup archive was created in the last MAX_AGE_HOURS hours.
+
+BACKUP_DIR="/backup/daily"
+MAX_AGE_HOURS=26
+ALERT_EMAIL="admin@example.com"
+HOSTNAME=$(hostname -s)
+
+NEWEST=$(find "${BACKUP_DIR}" -name "*.tar.gz" -printf '%T@ %p\n' \
+    | sort -rn | head -1 | awk '{print $2}')
+
+if [[ -z "${NEWEST}" ]]; then
+    echo "No backup archives found in ${BACKUP_DIR} on ${HOSTNAME}" \
+        | mail -s "Backup Missing: ${HOSTNAME}" "${ALERT_EMAIL}"
+    exit 1
+fi
+
+AGE_SECONDS=$(( $(date +%s) - $(stat -c %Y "${NEWEST}") ))
+AGE_HOURS=$(( AGE_SECONDS / 3600 ))
+
+if [[ "${AGE_HOURS}" -gt "${MAX_AGE_HOURS}" ]]; then
+    echo "Most recent backup on ${HOSTNAME} is ${AGE_HOURS} hours old (${NEWEST}). Expected within ${MAX_AGE_HOURS} hours." \
+        | mail -s "Backup Stale: ${HOSTNAME}" "${ALERT_EMAIL}"
+    exit 1
+fi
+```
+
+```bash
+chmod 700 /usr/local/sbin/check-backup-freshness.sh
+```
+
+Schedule this to run at a different time than the backup, giving the backup time to complete first:
+
+```bash
+echo "0 6 * * *  root  /usr/local/sbin/check-backup-freshness.sh" >> /etc/cron.d/system-backup
+```
+
+Running at 06:00 gives the 02:00 backup four hours to complete, and a 26-hour age threshold catches a missed backup from the previous day without false-positives for brief delays.
+
+---
+
+## Summary
+
+Automated backups on AlmaLinux are built on well-written scripts driven by either cron or systemd timers. The script handles the logic — pre-flight checks, archive creation, verification, retention, and error notification. The scheduler ensures the script runs reliably without manual intervention.
+
+Key points to remember:
+
+- Always include pre-flight checks in backup scripts: destination exists, is writable, and has sufficient free space
+- tar exit code 1 (files changed during backup) is acceptable on live systems; exit code 2 or higher is a real error
+- Use `/etc/cron.d/` for system backup cron jobs rather than editing `/etc/crontab` directly
+- systemd timer `Persistent=true` catches missed runs when the system was powered off at the scheduled time
+- Use `RandomizedDelaySec` when multiple servers run the same timer to stagger backup server load
+- Test email delivery explicitly before relying on alert notifications from backup scripts
+- Monitor backup freshness separately from the backup job itself — a script that fails silently may stop producing archives
+
+### Related Pages
+
+- [System Backup](./system-backup) — full system backup with tar, rsync, and LVM snapshots
+- [Filesystem Backup](./filesystem-backup) — rsnapshot and directory-level backup strategies
+- [Remote Backup](./remote-backup) — automating backups to remote and cloud destinations
+- [Backup Verification](./backup-verification) — testing and validating backup integrity
+- [Task Scheduling](../task-scheduling/index) — cron and systemd timer fundamentals

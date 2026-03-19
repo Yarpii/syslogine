@@ -1,0 +1,515 @@
+---
+sidebar_position: 4
+title: "Custom Unit Files | AlmaLinux"
+sidebar_label: "Custom Unit Files"
+description: "Create custom systemd unit files, define service dependencies, and write enterprise-grade service definitions on AlmaLinux."
+keywords:
+  - "almalinux custom unit files"
+  - "almalinux systemd unit"
+  - "almalinux service definition"
+  - "almalinux systemd template"
+  - "rhel custom service"
+tags:
+  - almalinux
+  - service-management
+  - systemd
+slug: /linux/almalinux/administration/service-management/custom-unit-files
+---
+
+# Custom Unit Files
+
+When you deploy an application that does not come with a systemd unit file, you write one yourself. A well-written unit file makes your application behave like a first-class system service — it starts at boot, restarts on failure, logs to the journal, runs as an unprivileged user, and integrates cleanly with systemd's dependency system.
+
+## Unit file structure
+
+Every service unit file has three sections.
+
+```ini
+[Unit]
+# Metadata, dependencies, and ordering
+
+[Service]
+# How to start, stop, and manage the process
+
+[Install]
+# When and where to activate the service
+```
+
+Place all custom unit files in `/etc/systemd/system/`:
+
+```bash
+sudo nano /etc/systemd/system/myapp.service
+```
+
+## Minimal working unit file
+
+The simplest unit file that works reliably in production:
+
+```ini
+[Unit]
+Description=My Application
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=myapp
+Group=myapp
+WorkingDirectory=/opt/myapp
+ExecStart=/opt/myapp/bin/myapp
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Enable and start it:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now myapp
+sudo systemctl status myapp
+```
+
+## Full production unit file
+
+A complete unit file suitable for a production web application:
+
+```ini
+[Unit]
+Description=My Production Application
+Documentation=https://docs.example.com/myapp
+After=network-online.target postgresql.service redis.service
+Wants=network-online.target
+Requires=postgresql.service
+
+[Service]
+Type=notify
+User=myapp
+Group=myapp
+WorkingDirectory=/opt/myapp
+
+# Environment
+EnvironmentFile=/etc/myapp/env
+
+# Lifecycle
+ExecStartPre=/opt/myapp/bin/myapp-migrate
+ExecStart=/opt/myapp/bin/myapp --config /etc/myapp/config.yml
+ExecReload=/bin/kill -HUP $MAINPID
+ExecStopPost=/opt/myapp/bin/myapp-cleanup
+
+# Restart policy
+Restart=on-failure
+RestartSec=5
+StartLimitIntervalSec=120
+StartLimitBurst=5
+
+# Timeouts
+TimeoutStartSec=60
+TimeoutStopSec=30
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=myapp
+
+# Resource limits
+MemoryMax=1G
+MemoryHigh=800M
+CPUQuota=200%
+TasksMax=512
+LimitNOFILE=65536
+
+# Security hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+PrivateDevices=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallFilter=@system-service
+ReadWritePaths=/var/lib/myapp /var/log/myapp
+
+# Directories created and managed by systemd
+RuntimeDirectory=myapp
+RuntimeDirectoryMode=0750
+StateDirectory=myapp
+StateDirectoryMode=0750
+LogsDirectory=myapp
+LogsDirectoryMode=0750
+
+[Install]
+WantedBy=multi-user.target
+```
+
+## Service types
+
+Choose the right `Type=` for how your application signals readiness.
+
+### Type=simple — default for modern applications
+
+The process started by `ExecStart` is the main process. systemd considers the service ready as soon as the process starts.
+
+```ini
+[Service]
+Type=simple
+ExecStart=/opt/myapp/bin/myapp
+```
+
+### Type=exec — wait for exec to complete
+
+Like `simple` but systemd waits until the binary has been exec'd successfully before considering it started.
+
+```ini
+[Service]
+Type=exec
+ExecStart=/opt/myapp/bin/myapp
+```
+
+### Type=forking — traditional daemons
+
+For applications that fork and have the parent exit. systemd tracks the child via a PID file.
+
+```ini
+[Service]
+Type=forking
+PIDFile=/run/myapp/myapp.pid
+ExecStart=/opt/myapp/bin/myapp --daemon
+```
+
+### Type=oneshot — run and exit
+
+For tasks that run once and complete. systemd waits for the process to exit before proceeding.
+
+```ini
+[Service]
+Type=oneshot
+ExecStart=/opt/myapp/bin/migrate --run
+RemainAfterExit=yes
+```
+
+### Type=notify — sd_notify ready signal
+
+For applications that call `sd_notify("READY=1")` to signal readiness. systemd waits for the notification.
+
+```ini
+[Service]
+Type=notify
+ExecStart=/opt/myapp/bin/myapp
+WatchdogSec=30
+```
+
+## ExecStart, ExecStartPre, and ExecStartPost
+
+```ini
+[Service]
+# Run before ExecStart — if this fails, the service does not start
+ExecStartPre=/opt/myapp/bin/check-config
+ExecStartPre=/opt/myapp/bin/migrate --check
+
+# The main process
+ExecStart=/opt/myapp/bin/myapp --config /etc/myapp/config.yml
+
+# Run after ExecStart — does not block service activation
+ExecStartPost=/usr/local/bin/register-with-loadbalancer.sh
+```
+
+Prefix `ExecStartPre` with `-` to make it optional — failure is ignored:
+
+```ini
+# Failure of this pre-start command does not abort the service
+ExecStartPre=-/opt/myapp/bin/optional-setup.sh
+```
+
+## ExecReload
+
+Tell systemd how to reload the application's configuration without restarting.
+
+```ini
+[Service]
+# Send SIGHUP to the main process
+ExecReload=/bin/kill -HUP $MAINPID
+
+# Or run a reload command
+ExecReload=/opt/myapp/bin/myapp reload
+```
+
+## Templated unit files
+
+Templated units let you run multiple instances of the same service with different parameters — one unit file, many instances.
+
+The filename must contain `@`:
+
+```bash
+sudo nano /etc/systemd/system/worker@.service
+```
+
+```ini
+[Unit]
+Description=Application Worker — queue %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=myapp
+Group=myapp
+WorkingDirectory=/opt/myapp
+ExecStart=/opt/myapp/bin/worker --queue %i --concurrency 4
+Restart=on-failure
+RestartSec=5
+EnvironmentFile=/etc/myapp/env
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Start named instances:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now worker@emails
+sudo systemctl enable --now worker@images
+sudo systemctl enable --now worker@reports
+
+# Status of all instances
+systemctl status 'worker@*'
+
+# Stop a specific instance
+sudo systemctl stop worker@images
+```
+
+### Template specifiers
+
+| Specifier | Value |
+|-----------|-------|
+| `%i` | Instance name (after `@`) |
+| `%n` | Full unit name |
+| `%p` | Prefix (before `@`) |
+| `%H` | Hostname |
+| `%u` | Username of the service user |
+| `%U` | UID of the service user |
+
+## Oneshot unit for startup tasks
+
+Run a command once at boot — for migrations, initialization, or setup tasks.
+
+```bash
+sudo nano /etc/systemd/system/myapp-migrate.service
+```
+
+```ini
+[Unit]
+Description=Run myapp database migrations
+After=postgresql.service
+Requires=postgresql.service
+Before=myapp.service
+ConditionPathExists=!/var/lib/myapp/migrations-done
+
+[Service]
+Type=oneshot
+User=myapp
+Group=myapp
+ExecStart=/opt/myapp/bin/migrate --run
+ExecStartPost=/bin/touch /var/lib/myapp/migrations-done
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+```
+
+The `ConditionPathExists=!` prefix means the unit only runs if the file does not exist — preventing re-runs.
+
+## Path unit — trigger on file system events
+
+A path unit watches for file system changes and activates another unit when they occur.
+
+```bash
+sudo nano /etc/systemd/system/myapp-reload.path
+```
+
+```ini
+[Unit]
+Description=Watch myapp config for changes
+
+[Path]
+PathModified=/etc/myapp/config.yml
+Unit=myapp-reload.service
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo nano /etc/systemd/system/myapp-reload.service
+```
+
+```ini
+[Unit]
+Description=Reload myapp on config change
+
+[Service]
+Type=oneshot
+ExecStart=/bin/systemctl reload myapp
+```
+
+```bash
+sudo systemctl enable --now myapp-reload.path
+```
+
+## Socket activation
+
+Socket-activated services start on demand when a connection arrives. systemd holds the socket and passes it to the service when it starts.
+
+```bash
+sudo nano /etc/systemd/system/myapp.socket
+```
+
+```ini
+[Unit]
+Description=myapp socket
+
+[Socket]
+ListenStream=8080
+Accept=no
+
+[Install]
+WantedBy=sockets.target
+```
+
+```bash
+sudo nano /etc/systemd/system/myapp.service
+```
+
+```ini
+[Unit]
+Description=myapp (socket activated)
+Requires=myapp.socket
+
+[Service]
+Type=simple
+User=myapp
+ExecStart=/opt/myapp/bin/myapp
+StandardInput=socket
+```
+
+Enable the socket — the service starts automatically when a connection arrives:
+
+```bash
+sudo systemctl enable --now myapp.socket
+```
+
+## Create a service user
+
+Always run custom services as a dedicated unprivileged user:
+
+```bash
+sudo useradd \
+  --system \
+  --no-create-home \
+  --shell /sbin/nologin \
+  --comment "myapp service account" \
+  myapp
+
+# Create required directories
+sudo mkdir -p /opt/myapp /var/lib/myapp /var/log/myapp
+sudo chown myapp:myapp /opt/myapp /var/lib/myapp /var/log/myapp
+```
+
+## Validate and activate
+
+```bash
+# Check for syntax errors
+systemd-analyze verify /etc/systemd/system/myapp.service
+
+# Reload systemd
+sudo systemctl daemon-reload
+
+# Enable and start
+sudo systemctl enable --now myapp
+
+# Verify
+systemctl status myapp
+journalctl -u myapp -f
+```
+
+## Common mistakes
+
+### Using Type=forking for modern applications
+
+Modern applications that do not fork should use `Type=simple` or `Type=exec`. Using `Type=forking` without a PID file causes systemd to lose track of the process.
+
+### Missing daemon-reload after creating a unit file
+
+```bash
+sudo systemctl daemon-reload
+```
+
+### Not setting a User= directive
+
+Running services as root is a security risk. Always specify a dedicated user.
+
+```ini
+[Service]
+User=myapp
+Group=myapp
+```
+
+### Using absolute paths inconsistently
+
+All paths in `ExecStart`, `ExecStartPre`, and similar directives must be absolute.
+
+```ini
+# WRONG
+ExecStart=myapp
+
+# CORRECT
+ExecStart=/opt/myapp/bin/myapp
+```
+
+### Not including security hardening
+
+Every custom service should include at minimum:
+
+```ini
+[Service]
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+```
+
+### Forgetting WantedBy= in [Install]
+
+Without a `WantedBy=` directive, `systemctl enable` has nothing to link the unit to and does nothing.
+
+```ini
+[Install]
+WantedBy=multi-user.target
+```
+
+## Summary
+
+A well-written unit file turns any application into a reliable, manageable system service. Starting with a solid template and adding only what you need keeps unit files readable and maintainable.
+
+Key points:
+
+- place all custom unit files in `/etc/systemd/system/`
+- always set `User=` and `Group=` to run as an unprivileged service account
+- choose the right `Type=` for how your application signals readiness
+- use `ExecStartPre=` for pre-flight checks and migrations
+- use templated units (`@`) for multiple instances of the same service
+- add security hardening directives to every custom service
+- validate with `systemd-analyze verify` before enabling
+- always run `systemctl daemon-reload` after creating or modifying unit files
+
+:::tip Related pages
+- [Service Configuration](./service-configuration)
+- [Service Dependencies](./service-dependencies)
+- [Service Automation](./service-automation)
+- [Systemd Targets](./systemd-targets)
+:::

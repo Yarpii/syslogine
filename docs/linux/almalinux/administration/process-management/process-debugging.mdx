@@ -1,0 +1,550 @@
+---
+sidebar_position: 8
+title: "Process Debugging | AlmaLinux"
+sidebar_label: "Process Debugging"
+description: "Debug processes with strace, gdb, analyze core dumps, and use systemd debugging features on AlmaLinux."
+keywords:
+  - "almalinux process debugging"
+  - "almalinux strace"
+  - "almalinux gdb"
+  - "almalinux core dumps"
+  - "rhel process debugging"
+tags:
+  - almalinux
+  - process-management
+  - debugging
+  - strace
+  - gdb
+slug: /linux/almalinux/administration/process-management/process-debugging
+---
+
+# Process Debugging
+
+When a process misbehaves — crashes, hangs, leaks memory, or produces wrong output — you need tools that let you look inside it. AlmaLinux provides a full debugging toolchain: `strace` for system call tracing, `gdb` for interactive debugging and core dump analysis, `valgrind` for memory error detection, and systemd's built-in debugging features for service-level problems.
+
+## Install debugging tools
+
+```bash
+sudo dnf install -y \
+  strace \
+  ltrace \
+  gdb \
+  valgrind \
+  lsof \
+  procps-ng \
+  systemd-coredump \
+  elfutils \
+  perf
+```
+
+Install debug symbols for system packages:
+
+```bash
+# Enable the debuginfo repo
+sudo dnf install -y dnf-plugins-core
+sudo dnf debuginfo-install glibc
+
+# Install debug symbols for a specific package
+sudo dnf debuginfo-install nginx
+```
+
+## strace — trace system calls
+
+`strace` intercepts every system call a process makes and prints it to the terminal. It is the first tool to reach for when a process is doing something unexpected — reading the wrong files, failing to connect, or hanging on I/O.
+
+```bash
+# Attach to a running process
+sudo strace -p $(pgrep nginx | head -1)
+
+# Trace a new process from start
+strace /usr/sbin/nginx -t
+
+# Show timestamps for each syscall
+sudo strace -t -p $(pgrep nginx | head -1)
+
+# Show time spent in each syscall
+sudo strace -T -p $(pgrep nginx | head -1)
+
+# Summarise syscall counts and time
+sudo strace -c -p $(pgrep nginx | head -1) -- sleep 10
+
+# Trace only specific syscalls
+sudo strace -e trace=open,read,write -p $(pgrep nginx | head -1)
+
+# Trace file-related syscalls only
+sudo strace -e trace=file -p $(pgrep nginx | head -1)
+
+# Trace network syscalls only
+sudo strace -e trace=network -p $(pgrep nginx | head -1)
+
+# Trace all child processes too
+sudo strace -f -p $(pgrep nginx | head -1)
+
+# Save output to a file
+sudo strace -o /tmp/strace-nginx-$(date +%F).txt -p $(pgrep nginx | head -1)
+```
+
+### Common strace patterns
+
+**Process hanging on a file lock:**
+```bash
+sudo strace -e trace=flock,fcntl -p HUNG_PID
+# Look for fcntl calls with F_SETLKW — waiting for a lock
+```
+
+**Process failing to connect to a service:**
+```bash
+sudo strace -e trace=connect,socket -p FAILING_PID
+# Look for connect() returning ECONNREFUSED or ETIMEDOUT
+```
+
+**Process reading wrong config file:**
+```bash
+sudo strace -e trace=openat -p CONFUSED_PID 2>&1 | grep "\.conf"
+# Shows exactly which config files are being opened
+```
+
+:::warning
+`strace` adds significant overhead — typically 2-5x slowdown. Use it for short diagnostic sessions, not as a permanent monitoring tool.
+:::
+
+## ltrace — trace library calls
+
+`ltrace` intercepts calls to shared libraries — useful when you need to see what an application is doing at a higher level than raw syscalls.
+
+```bash
+# Trace library calls of a running process
+sudo ltrace -p $(pgrep myapp | head -1)
+
+# Trace a new process
+ltrace /usr/local/bin/myapp
+
+# Trace only specific library functions
+ltrace -e malloc,free,strcpy /usr/local/bin/myapp
+
+# Summarise call counts
+ltrace -c /usr/local/bin/myapp
+```
+
+## Core dumps — post-mortem debugging
+
+A core dump is a snapshot of a process's memory at the moment it crashed. With debug symbols, `gdb` can read the core dump and show you exactly where and why the crash occurred.
+
+### Configure core dumps with systemd-coredump
+
+AlmaLinux uses `systemd-coredump` to capture and store core dumps automatically.
+
+```bash
+# Check if coredump capture is configured
+cat /proc/sys/kernel/core_pattern
+# Should show: |/usr/lib/systemd/systemd-coredump ...
+
+# List captured core dumps
+coredumpctl list
+
+# Show details of a specific crash
+coredumpctl info PID
+
+# Show the most recent crash
+coredumpctl info
+```
+
+### Enable core dumps if not active
+
+```bash
+sudo nano /etc/systemd/coredump.conf
+```
+
+```ini
+[Coredump]
+# Store core dumps on disk
+Storage=external
+
+# Maximum size per core dump
+ExternalSizeMax=2G
+
+# Maximum total storage for all core dumps
+KeepFree=1G
+
+# Compress core dumps
+Compress=yes
+```
+
+```bash
+sudo systemctl restart systemd-coredump
+```
+
+Enable core dumps for a specific service:
+
+```bash
+sudo systemctl edit myapp
+```
+
+```ini
+[Service]
+# Allow unlimited core dump size
+LimitCORE=infinity
+```
+
+### Configure core dumps via ulimit
+
+For processes not managed by systemd:
+
+```bash
+# Enable core dumps for the current shell session
+ulimit -c unlimited
+
+# Set a specific max size (in 512-byte blocks)
+ulimit -c 1048576
+
+# Make persistent in /etc/security/limits.conf
+echo "* soft core unlimited" | sudo tee -a /etc/security/limits.conf
+echo "* hard core unlimited" | sudo tee -a /etc/security/limits.conf
+```
+
+## gdb — GNU Debugger
+
+`gdb` is the primary tool for both live process debugging and core dump analysis.
+
+### Attach to a running process
+
+```bash
+# Attach to a running process
+sudo gdb -p $(pgrep myapp | head -1)
+
+# Show a backtrace of all threads
+(gdb) thread apply all bt
+
+# Show the current thread's backtrace
+(gdb) bt
+
+# Show local variables at the current frame
+(gdb) info locals
+
+# Show all threads
+(gdb) info threads
+
+# Detach without killing the process
+(gdb) detach
+(gdb) quit
+```
+
+### Analyse a core dump
+
+```bash
+# Open a core dump with the binary that produced it
+coredumpctl gdb
+
+# Or open directly
+gdb /usr/local/bin/myapp /path/to/core
+
+# Once inside gdb, get the full backtrace
+(gdb) bt full
+
+# Backtrace for all threads
+(gdb) thread apply all bt full
+
+# Show the frame that caused the crash
+(gdb) frame 0
+
+# Show the source line that crashed
+(gdb) list
+```
+
+### Set breakpoints and inspect state
+
+```bash
+# Start a program under gdb
+gdb /usr/local/bin/myapp
+
+# Set a breakpoint at a function
+(gdb) break main
+(gdb) break process_request
+
+# Run the program
+(gdb) run --config /etc/myapp/config.yml
+
+# Step through code
+(gdb) next      # next line
+(gdb) step      # step into function
+(gdb) continue  # continue to next breakpoint
+
+# Print a variable
+(gdb) print variable_name
+
+# Watch a variable for changes
+(gdb) watch variable_name
+
+# Show all breakpoints
+(gdb) info breakpoints
+```
+
+## Valgrind — memory error detection
+
+`valgrind` runs a process in an instrumented environment that detects memory errors — leaks, invalid reads/writes, and use-after-free bugs.
+
+```bash
+# Check for memory errors
+valgrind /usr/local/bin/myapp
+
+# Full memory leak check
+valgrind --leak-check=full --show-leak-kinds=all /usr/local/bin/myapp
+
+# Save report to a file
+valgrind --leak-check=full \
+  --log-file=/tmp/valgrind-$(date +%F).txt \
+  /usr/local/bin/myapp
+
+# Check for threading errors with helgrind
+valgrind --tool=helgrind /usr/local/bin/myapp
+
+# Cache and branch prediction analysis
+valgrind --tool=cachegrind /usr/local/bin/myapp
+```
+
+:::warning
+Valgrind slows processes down by 10-50x. Use it in a development or staging environment, not in production.
+:::
+
+## Debugging systemd service failures
+
+When a service fails to start, systemd and journald provide the information you need.
+
+```bash
+# Full status with recent log output
+systemctl status myapp.service
+
+# Complete journal output for the service
+journalctl -u myapp.service -b --no-pager
+
+# Only errors and above
+journalctl -u myapp.service -b -p err
+
+# Follow journal in real time while testing
+journalctl -u myapp.service -f
+
+# Show the exact command systemd is running
+systemctl cat myapp.service
+
+# Verify the unit file for syntax errors
+systemd-analyze verify /etc/systemd/system/myapp.service
+
+# Check all environment variables the service sees
+sudo systemctl show myapp --property=Environment
+sudo cat /proc/$(systemctl show myapp --property=MainPID | cut -d= -f2)/environ | tr '\0' '\n'
+```
+
+### Run a service in debug mode
+
+```bash
+sudo systemctl edit myapp
+```
+
+```ini
+[Service]
+# Add debug flag to the command
+ExecStart=
+ExecStart=/usr/local/bin/myapp --debug --config /etc/myapp/config.yml
+
+# Set log level via environment variable
+Environment=LOG_LEVEL=debug
+Environment=DEBUG=1
+```
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl restart myapp
+journalctl -u myapp -f
+```
+
+### Use systemd-run to test a command in isolation
+
+```bash
+# Run the exact command systemd would run, with the same environment
+sudo systemd-run --unit=myapp-test \
+  --uid=myapp \
+  --gid=myapp \
+  --working-directory=/opt/myapp \
+  /usr/local/bin/myapp --config /etc/myapp/config.yml
+
+journalctl -u myapp-test -f
+```
+
+## Inspect /proc for live process state
+
+The `/proc` filesystem exposes everything about a running process without any external tools.
+
+```bash
+PID=$(pgrep myapp | head -1)
+
+# Full command line
+cat /proc/$PID/cmdline | tr '\0' ' ' && echo
+
+# Environment variables
+cat /proc/$PID/environ | tr '\0' '\n'
+
+# Open file descriptors
+ls -la /proc/$PID/fd
+
+# Memory maps
+cat /proc/$PID/maps
+
+# Process status and memory usage
+cat /proc/$PID/status
+
+# Resource limits
+cat /proc/$PID/limits
+
+# Current working directory
+ls -la /proc/$PID/cwd
+
+# Executable path
+ls -la /proc/$PID/exe
+
+# Stack trace (if readable)
+cat /proc/$PID/wchan
+```
+
+## Diagnose a hanging process
+
+When a process is stuck and not responding:
+
+```bash
+PID=$(pgrep stuck-process | head -1)
+
+# Check process state
+ps -p $PID -o pid,stat,wchan,comm
+
+# What syscall is the process waiting in
+cat /proc/$PID/wchan
+
+# Detailed syscall wait info
+cat /proc/$PID/status | grep -i "state\|wchan"
+
+# Attach strace to see what it's waiting for
+sudo strace -p $PID
+
+# Check for file locks
+sudo lsof -p $PID | grep -i lock
+cat /proc/locks
+
+# Check for held mutexes with gdb
+sudo gdb -p $PID -batch -ex "thread apply all bt"
+```
+
+## Scripted crash detection and reporting
+
+A script to detect recent crashes and generate a summary report:
+
+```bash
+#!/bin/bash
+# crash-report.sh — summarise recent process crashes
+
+REPORT="/tmp/crash-report-$(date +%F).txt"
+HOURS=24
+
+{
+  echo "=== Crash Report: $(date) on $(hostname) ==="
+  echo ""
+
+  echo "--- Core dumps in last ${HOURS} hours ---"
+  coredumpctl list --since "${HOURS}h ago" 2>/dev/null || echo "No core dumps found"
+  echo ""
+
+  echo "--- OOM kills in last ${HOURS} hours ---"
+  journalctl -k --since "${HOURS} hours ago" | grep -i "killed process\|out of memory" || echo "None"
+  echo ""
+
+  echo "--- Segfaults in last ${HOURS} hours ---"
+  journalctl --since "${HOURS} hours ago" | grep -i "segfault\|segmentation fault" || echo "None"
+  echo ""
+
+  echo "--- Failed services since last boot ---"
+  systemctl list-units --state=failed --no-legend || echo "None"
+  echo ""
+
+  echo "--- Services with high restart counts ---"
+  systemctl show '*' --property=Id,NRestarts 2>/dev/null | \
+    paste - - | awk -F= '$4 > 3 {print $2, "restarts:", $4}' | sort -k3 -rn || echo "None"
+
+} | tee "$REPORT"
+
+echo ""
+echo "Report saved to $REPORT"
+```
+
+Schedule daily:
+
+```bash
+sudo crontab -e
+```
+
+```
+0 7 * * * /usr/local/bin/crash-report.sh | mail -s "Daily Crash Report: $(hostname)" ops@example.com
+```
+
+## Common mistakes
+
+### Not installing debug symbols before analysing core dumps
+
+Without debug symbols, `gdb` backtraces show memory addresses instead of function names — almost useless.
+
+```bash
+sudo dnf debuginfo-install myapp
+coredumpctl gdb
+```
+
+### Leaving strace attached in production
+
+`strace` slows the traced process significantly. Always detach after diagnosing.
+
+```bash
+# Detach cleanly
+Ctrl+C  # in the strace terminal
+```
+
+### Not checking /proc/PID/wchan for hung processes
+
+`wchan` shows exactly which kernel function the process is sleeping in — the fastest way to diagnose a hung process without attaching a debugger.
+
+```bash
+cat /proc/$(pgrep hung-process | head -1)/wchan
+```
+
+### Analysing core dumps without the exact binary that produced them
+
+If the binary has been updated since the crash, the core dump analysis will be inaccurate. Keep versioned copies of critical binaries, or use `coredumpctl` which stores the binary alongside the dump.
+
+### Running valgrind in production
+
+Valgrind's overhead is too high for production use. Run it in staging with a realistic workload.
+
+## Summary
+
+Debugging processes on AlmaLinux is a systematic process — start with the highest-level tool that gives you useful information and work down to lower-level tools only when needed.
+
+A practical debugging order:
+
+1. `journalctl -u servicename -b -p err` — check the service log first
+2. `systemctl status servicename` — check current state and recent output
+3. `strace -c -p PID` — summarise what syscalls the process is making
+4. `strace -e trace=file -p PID` — narrow down to file or network access
+5. `cat /proc/PID/wchan` — identify what the process is waiting for if hung
+6. `coredumpctl gdb` — analyse the most recent crash with full backtrace
+7. `valgrind` — check for memory errors in a staging environment
+
+Key points:
+
+- use `strace -c` for a quick syscall summary before diving deeper
+- use `coredumpctl` to manage and analyse core dumps from systemd-coredump
+- always install debug symbols before analysing core dumps with `gdb`
+- use `systemd-run` to test service commands in isolation with the correct user and environment
+- use `/proc/PID/wchan` as the fastest way to diagnose a hung process
+- schedule a daily crash report to catch intermittent failures early
+
+:::tip Related pages
+- [Process Discovery](./process-discovery)
+- [Process Control](./process-control)
+- [Process Monitoring](./process-monitoring)
+- [Service Management](./service-management)
+:::

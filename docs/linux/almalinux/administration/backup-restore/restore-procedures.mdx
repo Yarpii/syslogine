@@ -1,0 +1,518 @@
+---
+sidebar_position: 5
+title: "Restore Procedures | AlmaLinux"
+sidebar_label: "Restore Procedures"
+description: "Restore AlmaLinux systems and files from backups. Covers file-level recovery, full system restore, bootloader recovery, and emergency restoration scenarios."
+keywords:
+  - "almalinux restore"
+  - "almalinux system recovery"
+  - "almalinux bootloader recovery"
+  - "almalinux file restore"
+  - "rhel restore procedures"
+tags:
+  - almalinux
+  - backup-restore
+  - restore
+  - recovery
+  - disaster-recovery
+slug: /linux/almalinux/administration/backup-restore/restore-procedures
+---
+
+# Restore Procedures on AlmaLinux
+
+Creating backups is only half the equation. The other half is knowing how to restore from them quickly and correctly when something goes wrong. Restore procedures range from recovering a single accidentally deleted file to rebuilding a complete system from bare metal after a catastrophic hardware failure. Each scenario requires a different approach, and the time to learn that approach is before the emergency, not during it.
+
+This page covers the full range of restore scenarios on AlmaLinux: file and directory recovery from tar archives and rsync backups, database restoration, bootloader recovery from a rescue environment, and complete system restoration. Each section explains not just the commands but the reasoning behind them, so you can adapt the procedure when conditions in your environment differ from the examples.
+
+---
+
+## Before You Begin: Assess the Situation
+
+The first step in any recovery is to understand exactly what needs to be restored and why. Rushing to run restore commands without this assessment often makes things worse.
+
+Determine the scope of the problem. Is a single file missing, or has an entire filesystem been lost? Is the system still running and accessible, or has it failed to boot? Did data get deleted, overwritten, or corrupted? Is the underlying hardware intact?
+
+Determine when the damage occurred. This tells you which backup to restore from. A backup made after the damage occurred contains the damaged state and is useless for recovery. You need the most recent backup made before the damage. For this reason, good logs and clear backup timestamps are essential — they allow you to identify the right restore point quickly.
+
+Identify what backup you have available. Which backup tool was used? Where is the backup stored? Is the backup destination accessible from the current system state?
+
+With these questions answered, choose the appropriate procedure from the sections below.
+
+---
+
+## Restoring Individual Files and Directories from tar
+
+When a specific file or directory has been lost or corrupted and the system is otherwise healthy, restoring from a tar archive is straightforward.
+
+### Listing Archive Contents
+
+Before extracting, identify the exact path of the file within the archive:
+
+```bash
+tar -tzf /backup/etc-20240601-0300.tar.gz | grep nginx
+```
+
+This lists all archive members whose path contains "nginx". The output might show:
+
+```
+etc/nginx/nginx.conf
+etc/nginx/conf.d/default.conf
+etc/nginx/conf.d/mysite.conf
+```
+
+Note that paths inside tar archives created from `/` do not begin with a slash — the leading slash is stripped during archive creation for safety.
+
+### Extracting a Single File
+
+To restore a single file to its original location:
+
+```bash
+tar -xzpf /backup/etc-20240601-0300.tar.gz -C / etc/nginx/nginx.conf
+```
+
+The `-C /` flag sets the extraction base to the filesystem root, so `etc/nginx/nginx.conf` from inside the archive is extracted to `/etc/nginx/nginx.conf`. The `-p` flag preserves permissions and ownership.
+
+### Extracting to a Temporary Location First
+
+When you are not certain the backup contains the correct version, or when you want to compare before overwriting, extract to a temporary directory first:
+
+```bash
+mkdir -p /tmp/restore-preview
+tar -xzpf /backup/etc-20240601-0300.tar.gz -C /tmp/restore-preview etc/nginx/
+```
+
+Review the extracted files:
+
+```bash
+diff /etc/nginx/nginx.conf /tmp/restore-preview/etc/nginx/nginx.conf
+```
+
+If the content looks correct, move the file into place:
+
+```bash
+cp --preserve=all /tmp/restore-preview/etc/nginx/nginx.conf /etc/nginx/nginx.conf
+```
+
+Clean up the temporary directory when done:
+
+```bash
+rm -rf /tmp/restore-preview
+```
+
+### Extracting an Entire Directory
+
+To restore an entire directory — for example, a web application directory that was accidentally deleted:
+
+```bash
+tar -xzpf /backup/www-20240601.tar.gz -C / var/www/html/myapp/
+```
+
+If the directory already exists with partial or corrupted content, remove it first:
+
+```bash
+rm -rf /var/www/html/myapp/
+tar -xzpf /backup/www-20240601.tar.gz -C / var/www/html/myapp/
+```
+
+### Restoring from a Specific Date
+
+If you maintain multiple dated archives, restoring from a specific point in time means selecting the right archive file. List available archives:
+
+```bash
+ls -lh /backup/etc-*.tar.gz
+```
+
+Choose the most recent archive from before the damage occurred and extract from it as described above.
+
+---
+
+## Restoring Files from rsnapshot
+
+rsnapshot stores each snapshot as a plain directory tree, which makes file recovery exceptionally straightforward — no extraction command is needed. Navigate directly to the snapshot and copy the file.
+
+### Browsing Available Snapshots
+
+Each snapshot interval has numbered directories where `.0` is the most recent:
+
+```bash
+ls /backup/rsnapshot/
+# daily.0  daily.1  daily.2  daily.3  daily.4  daily.5  daily.6
+# weekly.0  weekly.1  weekly.2  weekly.3
+```
+
+To find which snapshot contains the version you need, check file modification times across snapshots:
+
+```bash
+ls -la /backup/rsnapshot/daily.{0,1,2,3}/localhost/etc/nginx/nginx.conf
+```
+
+### Recovering a File
+
+Once you identify the right snapshot, copy the file directly:
+
+```bash
+cp --preserve=all \
+    /backup/rsnapshot/daily.1/localhost/etc/nginx/nginx.conf \
+    /etc/nginx/nginx.conf
+```
+
+Because rsnapshot backups are plain files on a filesystem, you can also open them directly in an editor or diff them against the live file before deciding whether to restore:
+
+```bash
+diff /etc/nginx/nginx.conf /backup/rsnapshot/daily.1/localhost/etc/nginx/nginx.conf
+```
+
+### Recovering a Directory
+
+To recover an entire directory from an rsnapshot backup:
+
+```bash
+rsync -aAX \
+    /backup/rsnapshot/daily.1/localhost/var/www/html/myapp/ \
+    /var/www/html/myapp/
+```
+
+Using `rsync` rather than `cp -r` ensures ACLs and SELinux extended attributes are preserved correctly.
+
+---
+
+## Restoring Home Directories
+
+User home directory restoration follows the same patterns as other directory restores, but a few additional considerations apply.
+
+When restoring a user's home directory, the restored files must be owned by that user. If the user was deleted and recreated — which can happen after an account compromise — the new user may have a different UID than the original, and restored files will show as owned by an unknown UID.
+
+To verify ownership alignment before restoring:
+
+```bash
+# Check the UID of the files in the backup
+ls -ln /backup/rsnapshot/daily.0/localhost/home/alice/ | head -5
+
+# Check the current UID of the user
+id alice
+```
+
+If the UIDs match, proceed with the restore. If they differ, either use `chown` to correct ownership after restoring, or restore the files while the user account has been temporarily set to the original UID.
+
+To restore from an rsnapshot backup with correct ownership:
+
+```bash
+rsync -aAX \
+    /backup/rsnapshot/daily.0/localhost/home/alice/ \
+    /home/alice/
+chown -R alice:alice /home/alice/
+restorecon -Rv /home/alice/
+```
+
+The `restorecon` command resets SELinux file contexts on the restored files to the correct values for their location — important because restored files may carry the context from the backup system rather than the correct context for their current path.
+
+---
+
+## Restoring Databases
+
+Databases require a specific restore procedure that depends on how they were backed up. Never restore a database by simply copying data files from a backup into a running database server — this can result in corruption.
+
+### Restoring MySQL / MariaDB
+
+If the database was backed up with `mysqldump`, restore by feeding the dump file back into MySQL:
+
+```bash
+# Stop applications that use the database first
+systemctl stop myapp
+
+# Restore from the dump
+gunzip -c /backup/mysql-20240601.sql.gz | mysql -u root -p
+
+# Restart the application
+systemctl start myapp
+```
+
+To restore a single database rather than all databases:
+
+```bash
+gunzip -c /backup/mysql-20240601.sql.gz | mysql -u root -p mydatabase
+```
+
+If you need to restore a single table, extract it from the dump first using `grep` or `sed` to isolate the relevant `CREATE TABLE` and `INSERT` statements, then import only those.
+
+### Restoring PostgreSQL
+
+For PostgreSQL dumps created with `pg_dumpall`:
+
+```bash
+systemctl stop myapp
+su - postgres -c "psql -f /backup/pgsql-20240601.sql postgres"
+systemctl start myapp
+```
+
+To restore a single database dump created with `pg_dump`:
+
+```bash
+su - postgres -c "createdb restoreddb"
+su - postgres -c "pg_restore -d restoreddb /backup/mydb-20240601.dump"
+```
+
+:::warning
+Always stop or pause applications that write to the database before beginning a restore. Restoring while an application is actively writing can produce unpredictable results. For critical databases, test the restore procedure on a separate server before performing it in production.
+:::
+
+---
+
+## Recovering the Bootloader
+
+If the system fails to boot but the data on the disk is intact, the bootloader may need to be reinstalled. This is common after a failed kernel update, an accidental overwrite of the MBR or EFI partition, or certain disk replacement scenarios.
+
+### Booting into a Rescue Environment
+
+Boot the system from an AlmaLinux installation ISO. At the boot menu, select **Troubleshooting** and then **Rescue a AlmaLinux system**. The rescue environment mounts the installed system under `/mnt/sysimage` and offers a shell.
+
+To work in the installed system's environment rather than the rescue environment:
+
+```bash
+chroot /mnt/sysimage
+```
+
+### Reinstalling GRUB2 on BIOS Systems
+
+For BIOS-based systems (MBR partitioning), reinstall GRUB2 to the boot disk:
+
+```bash
+grub2-install /dev/sda
+```
+
+Replace `/dev/sda` with the actual boot disk device. Then regenerate the GRUB configuration:
+
+```bash
+grub2-mkconfig -o /boot/grub2/grub.cfg
+```
+
+### Reinstalling GRUB2 on UEFI Systems
+
+For UEFI systems, the EFI System Partition (ESP) must be mounted before reinstalling:
+
+```bash
+# Verify the ESP is mounted (it should be at /boot/efi inside the chroot)
+ls /boot/efi/EFI/
+
+# Reinstall GRUB2 for UEFI
+grub2-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=almalinux
+
+# Regenerate the GRUB configuration
+grub2-mkconfig -o /boot/grub2/grub.cfg
+```
+
+### Fixing a Missing initramfs
+
+If the system boots but panics with a "kernel panic — not syncing: VFS: Unable to mount root fs" error, the initramfs for the running kernel may be missing or corrupt. From within the chroot:
+
+```bash
+# Regenerate initramfs for the current kernel
+dracut --force
+
+# Or for a specific kernel version
+dracut --force /boot/initramfs-$(uname -r).img $(uname -r)
+```
+
+Exit the chroot and reboot:
+
+```bash
+exit
+reboot
+```
+
+---
+
+## Full System Restore from a tar Backup
+
+When the system disk has failed or been replaced and you need to restore the entire system from a tar backup, the process requires booting a rescue environment, preparing the new disk, and extracting the archive.
+
+### Preparing the Target Disk
+
+Boot from an AlmaLinux installation ISO in rescue mode, or use any live Linux environment. The target disk should be the same size as or larger than the original.
+
+Recreate the partition layout. If you recorded the original layout with `sfdisk` before the failure, replay it:
+
+```bash
+sfdisk /dev/sda < /backup/partition-layout-web01.txt
+```
+
+If you do not have a saved layout, recreate it manually using `fdisk` or `parted`, matching the original partition structure as closely as possible.
+
+Format the partitions:
+
+```bash
+mkfs.xfs /dev/sda2        # root filesystem
+mkfs.xfs /dev/sda3        # /home or other data partitions
+mkswap /dev/sda1          # swap
+```
+
+If the original system used LVM, recreate the volume group and logical volumes before formatting:
+
+```bash
+pvcreate /dev/sda2
+vgcreate almalinux /dev/sda2
+lvcreate -L 50G -n root almalinux
+lvcreate -L 100G -n home almalinux
+mkfs.xfs /dev/almalinux/root
+mkfs.xfs /dev/almalinux/home
+```
+
+### Mounting and Extracting
+
+Mount the new root filesystem:
+
+```bash
+mount /dev/almalinux/root /mnt/restore
+mkdir -p /mnt/restore/home
+mount /dev/almalinux/home /mnt/restore/home
+```
+
+Mount the backup source. If the backup is on a network share:
+
+```bash
+mkdir -p /mnt/backup
+mount -t nfs backupserver.example.com:/exports/backup /mnt/backup
+```
+
+Extract the system archive:
+
+```bash
+tar -xzpf /mnt/backup/system-web01-20240601.tar.gz -C /mnt/restore
+```
+
+This will take time proportional to the size of the backup. For a 50 GB system archive, expect 20–40 minutes depending on disk and network speed.
+
+### Reinstalling the Bootloader After Full Restore
+
+After extraction, the bootloader must be reinstalled because extracting a tar archive does not restore the MBR or EFI boot entries:
+
+```bash
+# Mount required pseudo-filesystems for chroot
+mount --bind /dev /mnt/restore/dev
+mount --bind /proc /mnt/restore/proc
+mount --bind /sys /mnt/restore/sys
+mount --bind /run /mnt/restore/run
+
+# Chroot into the restored system
+chroot /mnt/restore
+
+# Mount the EFI partition if UEFI (skip for BIOS)
+mount /dev/sda1 /boot/efi
+
+# Reinstall GRUB2
+grub2-install /dev/sda                                          # BIOS
+# or
+grub2-install --target=x86_64-efi --efi-directory=/boot/efi   # UEFI
+
+# Regenerate GRUB configuration
+grub2-mkconfig -o /boot/grub2/grub.cfg
+
+# Exit chroot and unmount
+exit
+umount /mnt/restore/dev /mnt/restore/proc /mnt/restore/sys /mnt/restore/run
+umount /mnt/restore/home /mnt/restore
+```
+
+Reboot the system and remove the rescue media.
+
+### Restoring SELinux Contexts
+
+After a full system restore, SELinux file contexts may be incorrect on some files — particularly those that were in non-standard locations or were created by applications with custom contexts. To relabel the entire filesystem on next boot, create the autorelabel trigger file:
+
+```bash
+touch /mnt/restore/.autorelabel
+```
+
+Before unmounting, create this file inside the restored filesystem. On the next boot, the system will run a full SELinux relabeling pass before starting services. This adds a few minutes to the first boot but ensures all files have correct contexts.
+
+---
+
+## Full System Restore with ReaR
+
+If the system was backed up with ReaR, the restore procedure is significantly simpler than a manual tar restore because ReaR automates disk partitioning, filesystem creation, archive extraction, and bootloader reinstallation.
+
+Boot the target machine from the ReaR rescue ISO. At the boot menu, select the recovery option for the hostname. ReaR prompts for confirmation, then proceeds automatically:
+
+1. Recreates the disk partition layout from the saved layout scripts
+2. Creates filesystems and LVM volumes
+3. Mounts the new filesystems
+4. Downloads and extracts the backup archive from the configured backup URL
+5. Reinstalls the bootloader
+6. Unmounts and reboots
+
+Monitor the output for any warnings or errors. The most common issues are disk size mismatches (the replacement disk is a different size than the original) and network connectivity problems preventing access to the backup archive.
+
+If the replacement disk is larger than the original, ReaR may not use the extra space automatically. After the restore completes and the system boots, resize the relevant partition and filesystem to use the available space. For an XFS root filesystem on LVM:
+
+```bash
+lvextend -l +100%FREE /dev/almalinux/root
+xfs_growfs /
+```
+
+---
+
+## Post-Restore Checklist
+
+After any significant restore operation, work through the following before returning the system to production:
+
+Verify that critical services start correctly:
+
+```bash
+systemctl status sshd nginx postgresql
+```
+
+Check that filesystems are mounted correctly and disk usage is as expected:
+
+```bash
+df -h
+mount | grep -v "tmpfs\|proc\|sysfs\|devpts"
+```
+
+Verify network connectivity and that the system can reach its dependencies:
+
+```bash
+ip addr show
+ping -c 3 gateway.example.com
+```
+
+Check the system journal for errors that occurred during boot:
+
+```bash
+journalctl -b -p err
+```
+
+Confirm SELinux is enforcing and no critical denials are present:
+
+```bash
+getenforce
+ausearch -m avc -ts boot | grep -v "type=AVC" | head -20
+```
+
+Verify that the restored data matches the expected state by checking key files and testing application functionality. For a web server, confirm that the application responds correctly. For a database server, run a quick integrity check.
+
+Document what was restored, when, from which backup, and by whom. This record is useful for post-incident review and for future auditing purposes.
+
+---
+
+## Summary
+
+Restore procedures on AlmaLinux range from copying a single file from an rsnapshot directory to rebuilding a complete system from bare metal. The common thread across all scenarios is preparation: knowing where backups are stored, understanding which tool created them, and having practiced the restore procedure before an emergency forces you to perform it under pressure.
+
+Key points to remember:
+
+- Always identify when the damage occurred before choosing which backup to restore from
+- Extract tar archives with `-p` to preserve permissions and ownership
+- rsnapshot backups are plain directory trees — copy files directly with `cp --preserve=all` or `rsync -aAX`
+- Use `restorecon -Rv` after restoring files to reset SELinux contexts to correct values
+- Never restore database data files directly — use the database's own restore tools
+- Bootloader reinstallation always requires chrooting into the restored system and running `grub2-install` followed by `grub2-mkconfig`
+- Create `/.autorelabel` in the restored system before the first boot to trigger a full SELinux relabeling pass
+- ReaR automates the entire bare-metal restore process — test it in a VM before you need it
+
+### Related Pages
+
+- [System Backup](./system-backup) — full system backup with tar, rsync, and LVM snapshots
+- [Filesystem Backup](./filesystem-backup) — directory-level and incremental backup strategies
+- [ReaR Backup](./rear-backup) — bare-metal disaster recovery with Relax-and-Recover
+- [Enterprise Backup](./enterprise-backup) — Bacula, Amanda, and Duplicity restore procedures
+- [Backup Verification](./backup-verification) — testing backup integrity before you need it

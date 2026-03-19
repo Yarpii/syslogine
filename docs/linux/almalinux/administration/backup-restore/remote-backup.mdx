@@ -1,0 +1,533 @@
+---
+sidebar_position: 7
+title: "Remote Backup | AlmaLinux"
+sidebar_label: "Remote Backup"
+description: "Configure remote backup destinations on AlmaLinux using rsync over SSH, NFS, and cloud storage providers including AWS S3, Azure Blob Storage, and Google Cloud Storage."
+keywords:
+  - "almalinux remote backup"
+  - "almalinux cloud backup"
+  - "almalinux aws s3 backup"
+  - "almalinux rsync remote"
+  - "rhel remote backup"
+tags:
+  - almalinux
+  - backup-restore
+  - remote-backup
+  - cloud
+  - rsync
+slug: /linux/almalinux/administration/backup-restore/remote-backup
+---
+
+# Remote Backup on AlmaLinux
+
+A backup stored on the same physical machine as the data it protects offers limited disaster recovery value. A fire, flood, hardware failure, or ransomware attack that destroys the primary system will also destroy local backups. Remote backups — copies stored on a separate server, a dedicated backup appliance, or cloud object storage — ensure that a disaster affecting one location does not also destroy the only recovery path.
+
+On AlmaLinux, remote backup destinations fall into three broad categories: dedicated backup servers accessed over SSH or NFS, self-managed object storage, and managed cloud storage services from providers like AWS, Azure, and Google Cloud. This page covers how to configure each, with attention to authentication, encryption in transit, bandwidth management, and the practical considerations of each approach.
+
+---
+
+## Remote Backup over SSH with rsync
+
+rsync over SSH is the most common approach for backing up to a dedicated Linux backup server. It transfers only changed blocks between runs, uses SSH for both authentication and encryption in transit, and requires no additional software beyond what ships with AlmaLinux.
+
+### Setting Up SSH Key Authentication
+
+Automated remote backups must authenticate without a password prompt. SSH key-based authentication is the correct solution. Generate a dedicated key pair for the backup user:
+
+```bash
+ssh-keygen -t ed25519 -f /root/.ssh/backup_key -N "" -C "backup@$(hostname)"
+```
+
+The `-N ""` flag creates the key without a passphrase, which is necessary for unattended operation. The `-C` flag adds a comment identifying the key's purpose. Using a dedicated key (separate from the administrator's personal key) means the backup key can be rotated or revoked independently.
+
+Copy the public key to the backup server:
+
+```bash
+ssh-copy-id -i /root/.ssh/backup_key.pub backupuser@backupserver.example.com
+```
+
+Test that authentication works without a password:
+
+```bash
+ssh -i /root/.ssh/backup_key backupuser@backupserver.example.com "echo Connection OK"
+```
+
+### Configuring SSH for Backup Use
+
+Create an SSH configuration entry so backup scripts can reference a simple host alias rather than specifying the key and user on every command:
+
+```bash
+nano /root/.ssh/config
+```
+
+```
+Host backupserver
+    HostName backupserver.example.com
+    User backupuser
+    IdentityFile /root/.ssh/backup_key
+    StrictHostKeyChecking yes
+    ConnectTimeout 30
+```
+
+`StrictHostKeyChecking yes` ensures that if the backup server's host key changes — which could indicate a man-in-the-middle attack — the connection is refused rather than silently accepted. Accept the server's host key once manually before running automated backups:
+
+```bash
+ssh backupserver "echo Host key accepted"
+```
+
+### Performing an rsync Backup over SSH
+
+With the SSH configuration in place, an rsync backup over SSH is straightforward:
+
+```bash
+rsync -aAXz \
+    --exclude=/proc \
+    --exclude=/sys \
+    --exclude=/dev \
+    --exclude=/run \
+    --exclude=/tmp \
+    --exclude=/var/tmp \
+    --delete \
+    / backupserver:/backup/$(hostname)/current/
+```
+
+The `-z` flag enables compression during transfer. On fast local networks, compression adds CPU overhead without saving much time — in that case, omit `-z`. Over slower WAN links, it reduces transfer time significantly.
+
+The `--delete` flag removes files from the destination that no longer exist on the source, keeping the remote copy synchronized with the current state. Without it, deleted files accumulate on the backup server indefinitely.
+
+### Bandwidth Limiting
+
+On production systems, a backup running at full speed can saturate the network link and impact other services. The `--bwlimit` flag caps rsync's transfer rate:
+
+```bash
+rsync -aAXz --bwlimit=50000 \
+    --exclude=/proc --exclude=/sys --exclude=/dev --exclude=/run \
+    --delete \
+    / backupserver:/backup/$(hostname)/current/
+```
+
+The `--bwlimit` value is in kilobytes per second. `50000` limits the transfer to approximately 50 MB/s — adjust based on available bandwidth and acceptable impact on other traffic.
+
+### Incremental Backups with Hard Links over SSH
+
+The `--link-dest` approach for hard-link incremental backups works with rsync over SSH as well as local backups. The hard links are created on the remote server, so the backup server needs to support them (standard Linux filesystems do):
+
+```bash
+TODAY=$(date +%Y%m%d)
+YESTERDAY=$(date -d yesterday +%Y%m%d)
+
+rsync -aAXz \
+    --exclude=/proc --exclude=/sys --exclude=/dev --exclude=/run \
+    --exclude=/tmp --exclude=/var/tmp \
+    --link-dest=/backup/$(hostname)/${YESTERDAY} \
+    / backupserver:/backup/$(hostname)/${TODAY}/
+```
+
+Each day's backup directory on the server appears as a complete snapshot, but unchanged files share disk blocks with previous snapshots. The backup server only consumes storage proportional to the actual changes, not the full system size multiplied by the number of retention days.
+
+### Restricting the Backup Account with rssh or rrsync
+
+The dedicated backup user account on the server has SSH access, which is a broad permission. To restrict it to rsync operations only, use the `rrsync` wrapper. Install it on the backup server:
+
+```bash
+dnf install rsync
+cp /usr/share/doc/rsync/support/rrsync /usr/local/bin/rrsync
+chmod 755 /usr/local/bin/rrsync
+```
+
+Edit the backup user's `authorized_keys` on the server to force the rrsync command:
+
+```
+command="/usr/local/bin/rrsync /backup",no-agent-forwarding,no-port-forwarding,no-pty,no-user-rc,no-X11-forwarding ssh-ed25519 AAAA... backup@web01
+```
+
+With this in place, the backup key can only run rsync operations against `/backup/` on the server — it cannot be used to open an interactive shell, forward ports, or access other directories.
+
+---
+
+## Remote Backup over NFS
+
+NFS mounts present a remote filesystem as if it were local. Once mounted, any local backup tool — `tar`, `rsnapshot`, or custom scripts — writes directly to the remote storage without needing to know it is remote.
+
+### Mounting an NFS Share for Backup
+
+Install NFS client utilities if not already present:
+
+```bash
+dnf install nfs-utils
+```
+
+Mount the backup server's NFS export:
+
+```bash
+mkdir -p /mnt/backup-nfs
+mount -t nfs backupserver.example.com:/exports/backup /mnt/backup-nfs
+```
+
+Verify the mount is working:
+
+```bash
+df -h /mnt/backup-nfs
+touch /mnt/backup-nfs/testfile && rm /mnt/backup-nfs/testfile && echo "NFS writable"
+```
+
+### Persistent NFS Mount via fstab
+
+For automated backups that run at boot time, add the NFS mount to `/etc/fstab`:
+
+```bash
+nano /etc/fstab
+```
+
+```
+backupserver.example.com:/exports/backup  /mnt/backup-nfs  nfs  defaults,_netdev,soft,timeo=30,retrans=3  0  0
+```
+
+The `_netdev` option tells systemd to wait for network availability before mounting. `soft` and `timeo=30` cause NFS operations to time out and return an error rather than hanging indefinitely if the server is unreachable — important for backup scripts that should fail fast and report an error rather than stalling.
+
+Mount all fstab entries without rebooting to verify:
+
+```bash
+mount -a
+df -h /mnt/backup-nfs
+```
+
+Once mounted, write backups to the NFS path exactly as you would to a local directory:
+
+```bash
+tar --exclude-from=/etc/backup-excludes.txt \
+    -czpf /mnt/backup-nfs/$(hostname)/system-$(date +%Y%m%d).tar.gz \
+    /
+```
+
+:::warning
+NFS does not encrypt data in transit by default. On untrusted networks, use NFS over SSH tunnelling, NFSv4 with Kerberos (`sec=krb5p`), or prefer rsync over SSH instead. On private datacenter networks with controlled access, unencrypted NFS is generally acceptable.
+:::
+
+---
+
+## Backup to AWS S3
+
+AWS S3 (Simple Storage Service) is a widely used cloud object storage platform. It is well-suited for backup destinations because it is highly durable, accessible from anywhere, and priced based on actual usage without upfront commitment. AlmaLinux systems can write to S3 using the AWS CLI or tools like `rclone` and `s3cmd`.
+
+### Installing the AWS CLI
+
+```bash
+dnf install awscli
+```
+
+Verify the installation:
+
+```bash
+aws --version
+```
+
+### Configuring AWS Credentials
+
+For a dedicated backup IAM user, configure credentials:
+
+```bash
+aws configure
+```
+
+Enter the Access Key ID, Secret Access Key, default region, and output format when prompted. Credentials are stored in `/root/.aws/credentials` with permissions `600`.
+
+For production environments, avoid using long-lived IAM user credentials. Instead, attach an IAM role to the EC2 instance (if the AlmaLinux system runs on AWS) — the CLI automatically uses instance role credentials without any configuration file. For on-premises systems, use IAM users with minimal permissions: only `s3:PutObject`, `s3:GetObject`, `s3:ListBucket`, and `s3:DeleteObject` on the specific backup bucket.
+
+### Creating a Backup Bucket
+
+Create a dedicated S3 bucket for backups:
+
+```bash
+aws s3 mb s3://mycompany-almalinux-backups --region eu-west-1
+```
+
+Enable versioning on the bucket so that overwritten or deleted objects can be recovered:
+
+```bash
+aws s3api put-bucket-versioning \
+    --bucket mycompany-almalinux-backups \
+    --versioning-configuration Status=Enabled
+```
+
+Configure a lifecycle policy to automatically transition old versions to cheaper storage classes and delete them after the retention period. Create a lifecycle policy file:
+
+```bash
+nano /tmp/s3-lifecycle.json
+```
+
+```json
+{
+  "Rules": [
+    {
+      "ID": "backup-retention",
+      "Status": "Enabled",
+      "Filter": {},
+      "Transitions": [
+        {
+          "Days": 30,
+          "StorageClass": "STANDARD_IA"
+        },
+        {
+          "Days": 90,
+          "StorageClass": "GLACIER"
+        }
+      ],
+      "NoncurrentVersionExpiration": {
+        "NoncurrentDays": 90
+      },
+      "Expiration": {
+        "Days": 365
+      }
+    }
+  ]
+}
+```
+
+Apply the lifecycle policy:
+
+```bash
+aws s3api put-bucket-lifecycle-configuration \
+    --bucket mycompany-almalinux-backups \
+    --lifecycle-configuration file:///tmp/s3-lifecycle.json
+```
+
+This transitions objects to infrequent access storage after 30 days (significantly cheaper), moves them to Glacier after 90 days (very cheap, but slow to retrieve), and expires them after 365 days. Adjust the thresholds to match your retention requirements.
+
+### Uploading Backups to S3
+
+To upload a backup archive:
+
+```bash
+aws s3 cp /backup/system-web01-20240601.tar.gz \
+    s3://mycompany-almalinux-backups/web01/system-20240601.tar.gz
+```
+
+To synchronize an entire backup directory to S3 (only uploading new or changed files):
+
+```bash
+aws s3 sync /backup/daily/ \
+    s3://mycompany-almalinux-backups/web01/daily/ \
+    --delete
+```
+
+The `--delete` flag removes objects from S3 that no longer exist in the local directory. Combine this with local retention management to keep the S3 bucket synchronized with the local backup window.
+
+### Server-Side Encryption
+
+Enable server-side encryption on all uploads to ensure data is encrypted at rest in S3:
+
+```bash
+aws s3 cp /backup/system-web01-20240601.tar.gz \
+    s3://mycompany-almalinux-backups/web01/system-20240601.tar.gz \
+    --sse aws:kms
+```
+
+Alternatively, enforce encryption at the bucket level with a bucket policy so that unencrypted uploads are rejected automatically — ensuring encryption regardless of how the upload is performed.
+
+---
+
+## Backup to Azure Blob Storage
+
+Azure Blob Storage is Microsoft's cloud object storage, comparable to AWS S3 in capability. The `azcopy` tool is the most efficient way to transfer files to Azure from AlmaLinux.
+
+### Installing azcopy
+
+```bash
+curl -L https://aka.ms/downloadazcopy-v10-linux -o /tmp/azcopy.tar.gz
+tar -xzf /tmp/azcopy.tar.gz -C /tmp/
+cp /tmp/azcopy_linux_amd64_*/azcopy /usr/local/bin/
+chmod +x /usr/local/bin/azcopy
+```
+
+Verify the installation:
+
+```bash
+azcopy --version
+```
+
+### Authenticating with a SAS Token
+
+The recommended authentication method for automated backups is a Shared Access Signature (SAS) token generated in the Azure portal with write-only permissions on the backup container. Store it in a file with restricted permissions:
+
+```bash
+echo "https://mystorageaccount.blob.core.windows.net/backups?sv=...&sig=..." \
+    > /root/.azure-backup-sas
+chmod 600 /root/.azure-backup-sas
+SAS_URL=$(cat /root/.azure-backup-sas)
+```
+
+### Uploading to Azure
+
+```bash
+azcopy copy \
+    /backup/system-web01-20240601.tar.gz \
+    "${SAS_URL}/web01/system-20240601.tar.gz"
+```
+
+To synchronize a directory:
+
+```bash
+azcopy sync \
+    /backup/daily/ \
+    "${SAS_URL}/web01/daily/" \
+    --delete-destination true
+```
+
+---
+
+## Backup to Google Cloud Storage
+
+Google Cloud Storage (GCS) is accessed from AlmaLinux via the `gsutil` tool, part of the Google Cloud SDK.
+
+### Installing Google Cloud SDK
+
+```bash
+dnf install google-cloud-sdk
+```
+
+Authenticate with a service account key file downloaded from the GCP console:
+
+```bash
+gcloud auth activate-service-account --key-file=/root/gcp-backup-sa.json
+```
+
+Store the service account key file with restricted permissions:
+
+```bash
+chmod 600 /root/gcp-backup-sa.json
+```
+
+### Uploading to GCS
+
+```bash
+gsutil cp /backup/system-web01-20240601.tar.gz \
+    gs://mycompany-backups/web01/system-20240601.tar.gz
+```
+
+To synchronize a directory:
+
+```bash
+gsutil -m rsync -r -d /backup/daily/ \
+    gs://mycompany-backups/web01/daily/
+```
+
+The `-m` flag enables parallel uploads, which significantly improves throughput for directories containing many files. The `-d` flag deletes objects in the destination that are not present in the source.
+
+---
+
+## Using rclone for Multiple Cloud Backends
+
+`rclone` is a unified tool that supports over 40 cloud storage backends — including S3, Azure, GCS, Backblaze B2, and many others — through a consistent command interface. It is particularly useful in environments that use multiple cloud providers or may switch providers, because backup scripts written against `rclone` work unchanged across backends.
+
+### Installing rclone
+
+```bash
+dnf install epel-release
+dnf install rclone
+```
+
+### Configuring a Remote
+
+Configure a remote (a named backend destination):
+
+```bash
+rclone config
+```
+
+The interactive configuration walks through selecting a provider, entering credentials, and testing the connection. Configuration is stored in `/root/.config/rclone/rclone.conf` with permissions `600`.
+
+For scripted configuration without the interactive wizard, write the configuration directly:
+
+```bash
+nano /root/.config/rclone/rclone.conf
+```
+
+```ini
+[s3-backups]
+type = s3
+provider = AWS
+access_key_id = AKIAIOSFODNN7EXAMPLE
+secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
+region = eu-west-1
+
+[b2-backups]
+type = b2
+account = your-b2-account-id
+key = your-b2-application-key
+```
+
+### Copying and Syncing with rclone
+
+To copy a file to an rclone remote:
+
+```bash
+rclone copy /backup/system-web01-20240601.tar.gz s3-backups:mycompany-backups/web01/
+```
+
+To synchronize a directory (making the destination match the source):
+
+```bash
+rclone sync /backup/daily/ s3-backups:mycompany-backups/web01/daily/
+```
+
+To limit bandwidth:
+
+```bash
+rclone sync --bwlimit 50M /backup/daily/ s3-backups:mycompany-backups/web01/daily/
+```
+
+rclone supports server-side encryption, transfer checksums, retry on failure, and parallel transfers — making it a capable replacement for provider-specific CLI tools when portability matters.
+
+---
+
+## Encryption Before Transfer
+
+When backing up to cloud storage or any destination where you do not control physical access, encrypting the backup data before it leaves the local system provides protection that is independent of the destination's security controls. Even if the cloud account is compromised, encrypted backups cannot be read without the decryption key.
+
+The simplest approach is to encrypt archives with GnuPG before uploading:
+
+```bash
+# Create the archive
+tar --exclude-from=/etc/backup-excludes.txt \
+    -czpf - / | \
+    gpg --encrypt --recipient YOURKEYID \
+    > /tmp/system-$(hostname)-$(date +%Y%m%d).tar.gz.gpg
+
+# Upload the encrypted archive
+aws s3 cp /tmp/system-$(hostname)-$(date +%Y%m%d).tar.gz.gpg \
+    s3://mycompany-almalinux-backups/$(hostname)/
+
+# Remove the local temporary file
+rm /tmp/system-$(hostname)-$(date +%Y%m%d).tar.gz.gpg
+```
+
+The pipe between `tar` and `gpg` avoids writing an unencrypted archive to disk at any point — the data is encrypted as it streams from tar to gpg. This is important on systems where even a temporary unencrypted archive would be a compliance issue.
+
+:::tip
+Store the GnuPG private key used for backup encryption in a different location from the backups themselves — ideally on a separate system or in a hardware security module. If the private key is stored only on the system being backed up and that system is destroyed or compromised, the encrypted backups become permanently unrecoverable.
+:::
+
+---
+
+## Summary
+
+Remote backups protect against disasters that would destroy local copies. On AlmaLinux, the right remote backup approach depends on what infrastructure you have available: rsync over SSH for dedicated backup servers, NFS for shared storage within a datacenter, and cloud object storage for off-site durability and geographic redundancy.
+
+Key points to remember:
+
+- Use dedicated SSH keys without passphrases for automated remote backups; restrict them further with `rrsync` on the server side
+- `StrictHostKeyChecking yes` in the SSH config prevents silent acceptance of changed host keys
+- The `--bwlimit` flag on rsync prevents backup transfers from saturating production network links
+- NFS mounts for backup should use `soft` and `timeo` options to fail fast rather than hang when the server is unreachable
+- Enable S3 bucket versioning and lifecycle policies to manage retention and cost automatically
+- Use `rclone` when portability across cloud backends matters — it abstracts provider-specific CLI differences
+- Encrypt archives before uploading to cloud storage; store the decryption key separately from the backup destination
+
+### Related Pages
+
+- [System Backup](./system-backup) — full system backup with tar, rsync, and LVM snapshots
+- [Filesystem Backup](./filesystem-backup) — incremental backup strategies with rsnapshot
+- [Automated Backup](./automated-backup) — scheduling remote backup jobs with cron and systemd timers
+- [Backup Verification](./backup-verification) — verifying remote backup integrity
+- [Secure Logging](../log-management/secure-logging) — encryption and integrity principles applied to logs

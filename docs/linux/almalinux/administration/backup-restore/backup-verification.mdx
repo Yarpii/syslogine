@@ -1,0 +1,453 @@
+---
+sidebar_position: 8
+title: "Backup Verification | AlmaLinux"
+sidebar_label: "Backup Verification"
+description: "Verify backup integrity on AlmaLinux using checksums, test restores, and automated validation. Ensure enterprise-grade backup reliability before you need to recover."
+keywords:
+  - "almalinux backup verification"
+  - "almalinux backup integrity"
+  - "almalinux backup testing"
+  - "almalinux backup checksum"
+  - "rhel backup verification"
+tags:
+  - almalinux
+  - backup-restore
+  - backup-verification
+  - integrity
+  - testing
+slug: /linux/almalinux/administration/backup-restore/backup-verification
+---
+
+# Backup Verification on AlmaLinux
+
+A backup that has never been verified is a backup you cannot trust. Storage media develops silent errors. Compression tools occasionally produce corrupt output. Network transfers get interrupted. Backup scripts have bugs that cause exclusions wider than intended. The only way to know that a backup is actually usable for recovery is to verify it — and the only definitive verification is a successful test restore.
+
+Backup verification exists on a spectrum. At the lightweight end, checksums confirm that an archive has not been corrupted in transit or storage. In the middle, archive integrity checks confirm the data can be read back correctly. At the thorough end, a full test restore confirms that the restored system actually boots and operates correctly. A complete verification strategy uses all three, calibrated to the criticality of the data and the frequency with which they can be realistically performed.
+
+This page covers the full spectrum: how to generate and verify checksums, how to test archive integrity, how to perform test restores in virtual machines, and how to automate verification so it runs on a schedule rather than depending on manual effort.
+
+---
+
+## Why Backups Fail Silently
+
+Understanding how backups fail helps you design verification that catches the right problems.
+
+**Bit rot** occurs when storage media develops read errors over time. A backup archive written to disk six months ago may have unreadable blocks today. The file still exists, its size appears correct, but extracting it produces errors or silently corrupted data. This is particularly common with HDDs used for long-term backup storage.
+
+**Incomplete transfers** happen when a network backup is interrupted partway through. The archive file exists at the destination, but is truncated. Without verification, this goes unnoticed until a restore attempt reveals a corrupt or incomplete archive.
+
+**Over-broad exclusions** occur when a backup script excludes more than intended — an exclusion pattern that matches critical directories in addition to the target ones. The backup runs and reports success, but the data that was actually needed was never included.
+
+**Dependency on running services** affects backups of application data. A database backup script that fails to connect to the database may create an empty dump file and exit cleanly, producing a zero-byte or minimal-content archive with a zero exit code.
+
+**Silent key expiry** affects encrypted backups. The encryption key used to create archives six months ago may have expired or been rotated, making those archives undecryptable. Without testing decryption periodically, this goes unnoticed.
+
+Each of these failure modes is detectable — but only if you check.
+
+---
+
+## Checksum Verification
+
+A cryptographic checksum provides a compact fingerprint of an archive's content. If even a single byte changes — due to bit rot, truncation, or intentional modification — the checksum changes. Comparing a stored checksum against the current checksum of an archive is the fastest way to detect corruption.
+
+### Generating Checksums at Backup Time
+
+Generate a checksum immediately after creating each backup archive, while the data is known to be good:
+
+```bash
+sha256sum /backup/daily/web01-20240601-0200.tar.gz \
+    > /backup/daily/web01-20240601-0200.tar.gz.sha256
+```
+
+The `.sha256` file contains a single line with the hash and the filename. Store it alongside the archive it validates.
+
+For a backup directory with multiple archives, generate checksums for all of them at once:
+
+```bash
+sha256sum /backup/daily/*.tar.gz > /backup/daily/SHA256SUMS
+```
+
+The `SHA256SUMS` file contains one line per archive — the hash and the filename. This is the conventional format recognized by `sha256sum --check`.
+
+### Verifying Checksums
+
+To verify a single archive against its checksum file:
+
+```bash
+sha256sum --check /backup/daily/web01-20240601-0200.tar.gz.sha256
+```
+
+Output is either `web01-20240601-0200.tar.gz: OK` or a failure message. The exit code is non-zero on any mismatch, making it suitable for use in scripts.
+
+To verify all archives listed in a `SHA256SUMS` file:
+
+```bash
+sha256sum --check /backup/daily/SHA256SUMS
+```
+
+Any archive whose checksum does not match is reported, and the exit code reflects whether all checks passed.
+
+### Verifying Remote Backups
+
+For backups stored on a remote server or in cloud storage, verify checksums after transfer to confirm the data arrived intact. Generate the checksum before transfer:
+
+```bash
+sha256sum /backup/system-web01-20240601.tar.gz > /backup/system-web01-20240601.tar.gz.sha256
+```
+
+After uploading both the archive and the checksum file, download and verify:
+
+```bash
+aws s3 cp s3://mycompany-backups/web01/system-20240601.tar.gz /tmp/verify-archive.tar.gz
+aws s3 cp s3://mycompany-backups/web01/system-20240601.tar.gz.sha256 /tmp/verify-archive.tar.gz.sha256
+
+# Adjust the filename in the checksum file to match the local path
+sed -i 's|system-20240601.tar.gz|/tmp/verify-archive.tar.gz|' /tmp/verify-archive.tar.gz.sha256
+sha256sum --check /tmp/verify-archive.tar.gz.sha256
+
+rm /tmp/verify-archive.tar.gz /tmp/verify-archive.tar.gz.sha256
+```
+
+---
+
+## Archive Integrity Testing
+
+A checksum confirms that an archive has not changed since it was created. Archive integrity testing goes further: it attempts to read every byte of the archive and reconstruct the file table, confirming that the archive is not just unmodified but actually readable and internally consistent.
+
+### Testing tar Archives
+
+The `-t` flag lists the contents of a tar archive, reading every byte in the process:
+
+```bash
+tar -tzf /backup/daily/web01-20240601-0200.tar.gz > /dev/null
+echo "Exit code: $?"
+```
+
+If tar can read the archive successfully, it exits with code 0 and `/dev/null` discards the listing output. Any corrupt blocks, truncated data, or gzip errors cause tar to exit non-zero and print an error message.
+
+For a more thorough test, redirect the listing to a file and examine it:
+
+```bash
+tar -tzf /backup/daily/web01-20240601-0200.tar.gz > /tmp/archive-listing.txt 2>&1
+```
+
+Then verify that critical paths are present in the listing:
+
+```bash
+grep "^etc/ssh/sshd_config$" /tmp/archive-listing.txt && echo "sshd_config: present"
+grep "^etc/passwd$" /tmp/archive-listing.txt && echo "passwd: present"
+grep "^home/" /tmp/archive-listing.txt | wc -l
+```
+
+Checking that specific known-important files are present in the archive catches over-broad exclusion errors that a checksum alone cannot detect — the archive is internally consistent, but it is missing data that should be there.
+
+### Counting Archived Files Against the Source
+
+A discrepancy between the number of files in a backup and the number of files at the source can indicate an exclusion problem or a partial backup. Compare them:
+
+```bash
+# Count files on the live system (excluding virtual filesystems)
+SOURCE_COUNT=$(find /etc /home /root /var/www /usr/local -type f 2>/dev/null | wc -l)
+
+# Count files in the archive
+ARCHIVE_COUNT=$(tar -tzf /backup/daily/web01-20240601-0200.tar.gz | grep -v '/$' | wc -l)
+
+echo "Source files: ${SOURCE_COUNT}"
+echo "Archive files: ${ARCHIVE_COUNT}"
+echo "Difference: $(( SOURCE_COUNT - ARCHIVE_COUNT ))"
+```
+
+The counts will rarely be identical — files created or deleted between the backup and the count, and files excluded intentionally, all contribute to differences. A small difference (tens of files) is normal. A large difference (hundreds or thousands) warrants investigation.
+
+### Verifying rsnapshot Backups
+
+rsnapshot stores backups as plain directory trees, so integrity checking is simply a matter of comparing the backup to the source:
+
+```bash
+# Compare the most recent rsnapshot to the live system
+rsync -aAXn --delete \
+    /etc/ \
+    /backup/rsnapshot/daily.0/localhost/etc/ \
+    | head -30
+```
+
+The `-n` flag runs rsync in dry-run mode — no files are transferred. The output shows files that differ between the live system and the backup. Some differences are expected (files created or modified since the snapshot was taken). Unexpected absences of entire directories indicate a backup configuration problem.
+
+---
+
+## Test Restores
+
+Checksums and integrity checks verify that backup data is readable. Only a test restore verifies that the data can actually be used to recover a working system. These are fundamentally different things, and both matter.
+
+### File-Level Test Restore
+
+The simplest test restore extracts a selection of files from a backup archive to a temporary location and verifies their content:
+
+```bash
+mkdir -p /tmp/restore-test
+
+# Extract a specific directory to the test location
+tar -xzpf /backup/daily/web01-20240601-0200.tar.gz \
+    -C /tmp/restore-test \
+    etc/nginx/
+
+# Verify key files are present and readable
+ls -la /tmp/restore-test/etc/nginx/
+diff /etc/nginx/nginx.conf /tmp/restore-test/etc/nginx/nginx.conf \
+    && echo "nginx.conf: matches live" \
+    || echo "nginx.conf: differs from live (expected if config changed since backup)"
+
+# Clean up
+rm -rf /tmp/restore-test
+```
+
+This confirms the archive is extractable, that file permissions and ownership are preserved, and that the content of specific files is as expected.
+
+### Database Restore Test
+
+For database backups, test that the dump can be loaded into a test database instance:
+
+```bash
+# Create a test database
+mysql -u root -p -e "CREATE DATABASE restore_test;"
+
+# Load the backup dump into the test database
+gunzip -c /backup/mysql-20240601.sql.gz | mysql -u root -p restore_test
+
+# Verify a known table exists in the restored database
+mysql -u root -p restore_test -e "SHOW TABLES;" | grep expected_table_name
+
+# Clean up
+mysql -u root -p -e "DROP DATABASE restore_test;"
+```
+
+For PostgreSQL:
+
+```bash
+su - postgres -c "createdb restore_test"
+su - postgres -c "pg_restore -d restore_test /backup/mydb-20240601.dump"
+su - postgres -c "psql restore_test -c '\dt'" | grep expected_table
+su - postgres -c "dropdb restore_test"
+```
+
+Running this test confirms that the dump is not corrupted, that it is syntactically valid SQL, and that the restore process completes without errors.
+
+### Full System Test Restore in a Virtual Machine
+
+The most thorough verification is a complete bare-metal restore into a virtual machine. This confirms that the entire restore procedure works — partitioning, filesystem creation, archive extraction, bootloader installation — and that the restored system actually boots.
+
+The procedure varies by backup type:
+
+**For ReaR backups:** boot the rescue ISO in a VM, run the automated recovery, and verify the system boots correctly. This is the most realistic test because it exercises the exact recovery path you would use in a real emergency. Document the time from boot to working system — this is your actual RTO.
+
+**For tar backups:** create a VM with a disk at least as large as the source system, boot from an AlmaLinux rescue ISO, partition and format the disk, extract the archive, reinstall the bootloader, and reboot. The [Restore Procedures](./restore-procedures) page describes this in detail.
+
+**For rsnapshot backups:** mount the most recent snapshot as a source and perform the same process as a tar restore, using rsync to copy the snapshot contents to the target VM disk.
+
+After any full restore test, work through the post-restore checklist: services start, network is functional, application data is intact, SELinux is enforcing, and no unexpected errors appear in the journal.
+
+:::tip
+Schedule full system restore tests quarterly for critical systems. The test confirms the recovery procedure still works, reveals any changes to the system that have made the backup incomplete, and keeps team members practiced in the restore process so that performing it under pressure during an actual incident feels familiar rather than novel.
+:::
+
+---
+
+## Automating Backup Verification
+
+Manual verification is valuable but unreliable as a sole strategy — it depends on someone remembering to do it. Automated verification runs on a schedule and alerts when something is wrong.
+
+### Automated Archive Integrity Check
+
+The following script checks all archives in the backup directory, verifies their checksums, and sends an alert if any fail:
+
+```bash
+nano /usr/local/sbin/verify-backups.sh
+```
+
+```bash
+#!/bin/bash
+# verify-backups.sh
+# Verifies tar archives in BACKUP_DIR against their SHA256 checksums.
+# Sends an alert email if any verification fails.
+
+BACKUP_DIR="/backup/daily"
+LOGFILE="/var/log/backup/verification.log"
+ALERT_EMAIL="admin@example.com"
+HOSTNAME=$(hostname -s)
+FAILURES=0
+
+mkdir -p "$(dirname "${LOGFILE}")"
+
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "${LOGFILE}"
+}
+
+log "Backup verification started"
+
+for ARCHIVE in "${BACKUP_DIR}"/*.tar.gz; do
+    CHECKSUM_FILE="${ARCHIVE}.sha256"
+
+    # Check that a checksum file exists for this archive
+    if [[ ! -f "${CHECKSUM_FILE}" ]]; then
+        log "WARNING: No checksum file found for ${ARCHIVE}"
+        ((FAILURES++))
+        continue
+    fi
+
+    # Verify the checksum
+    if sha256sum --check "${CHECKSUM_FILE}" --quiet 2>/dev/null; then
+        log "OK: $(basename "${ARCHIVE}")"
+    else
+        log "FAILED: $(basename "${ARCHIVE}") — checksum mismatch"
+        ((FAILURES++))
+    fi
+
+    # Test that the archive is readable (integrity check)
+    if ! tar -tzf "${ARCHIVE}" > /dev/null 2>&1; then
+        log "FAILED: $(basename "${ARCHIVE}") — archive is not readable"
+        ((FAILURES++))
+    fi
+done
+
+if [[ "${FAILURES}" -gt 0 ]]; then
+    log "Verification completed with ${FAILURES} failure(s)"
+    {
+        echo "Backup verification failed on ${HOSTNAME} at $(date)."
+        echo "${FAILURES} archive(s) failed integrity checks."
+        echo ""
+        echo "Review the log at ${LOGFILE} for details."
+    } | mail -s "Backup Verification FAILED: ${HOSTNAME}" "${ALERT_EMAIL}"
+    exit 1
+else
+    log "All archives verified successfully"
+    exit 0
+fi
+```
+
+```bash
+chmod 700 /usr/local/sbin/verify-backups.sh
+```
+
+Schedule it to run after the backup and retention cleanup have completed:
+
+```bash
+nano /etc/cron.d/backup-verify
+```
+
+```
+# Verify backup archives daily at 05:00 (after 02:00 backup and 04:00 cleanup)
+0 5 * * *  root  /usr/local/sbin/verify-backups.sh
+```
+
+### Integrating Verification into the Backup Script
+
+For simpler setups, integrate checksum generation and archive verification directly into the backup script rather than running them separately. After creating the archive:
+
+```bash
+# Generate checksum
+sha256sum "${ARCHIVE}" > "${ARCHIVE}.sha256" \
+    || fail "Failed to generate checksum for ${ARCHIVE}"
+
+# Verify the archive is readable
+tar -tzf "${ARCHIVE}" > /dev/null 2>&1 \
+    || fail "Archive integrity check failed: ${ARCHIVE}"
+
+log "Archive verified: $(basename "${ARCHIVE}")"
+```
+
+This makes verification an inseparable part of each backup run — the backup is not considered complete until both the archive and its checksum are confirmed good.
+
+### Verifying Remote Backup Presence
+
+For backups that are copied to a remote location, an additional check confirms that the remote copy exists and matches the local original. This catches transfer failures that are otherwise silent:
+
+```bash
+LOCAL_HASH=$(sha256sum /backup/daily/web01-20240601.tar.gz | awk '{print $1}')
+REMOTE_HASH=$(aws s3api head-object \
+    --bucket mycompany-backups \
+    --key web01/daily/web01-20240601.tar.gz \
+    --query ETag --output text | tr -d '"')
+
+if [[ "${LOCAL_HASH}" == "${REMOTE_HASH}" ]]; then
+    echo "Remote backup matches local: OK"
+else
+    echo "Remote backup mismatch or missing — transfer may have failed"
+fi
+```
+
+Note that S3 ETags for objects uploaded with multipart upload are not simple MD5 or SHA256 hashes of the full object. For single-part uploads (files under 5 GB), the ETag is the MD5 hash, not SHA256. Adjust the comparison accordingly, or use rclone's `check` command which handles this transparently:
+
+```bash
+rclone check /backup/daily/ s3-backups:mycompany-backups/web01/daily/ \
+    --one-way
+```
+
+`rclone check` compares file sizes and checksums between source and destination, reporting any discrepancies without transferring data.
+
+---
+
+## Backup Verification Log and Reporting
+
+Verification results should be logged and reviewed regularly. A verification log that nobody reads provides no value. The most practical approach is to send a daily summary that requires acknowledgement — either a brief success message or a failure alert that demands attention.
+
+Keep verification logs under logrotate management:
+
+```bash
+nano /etc/logrotate.d/backup-verification
+```
+
+```
+/var/log/backup/verification.log {
+    daily
+    rotate 90
+    compress
+    missingok
+    notifempty
+}
+```
+
+Retaining 90 days of verification logs means you can look back and establish when a backup problem first appeared — which is important for determining how far back you need to go to find a good restore point.
+
+---
+
+## Verification Schedule Recommendations
+
+Different types of verification warrant different frequencies, based on their cost in time and resources:
+
+| Verification type | Recommended frequency | Cost |
+|---|---|---|
+| Checksum generation | Every backup run | Negligible |
+| Checksum verification | Daily | Low |
+| Archive integrity test (`tar -t`) | Daily | Low–Medium |
+| File count comparison | Weekly | Low |
+| Database restore test | Weekly | Medium |
+| Full system restore test | Quarterly | High |
+| Remote backup presence check | Daily | Low |
+
+The daily checks are lightweight enough to run automatically without noticeable impact. Weekly and quarterly tests require more planning but are the only verification that confirms end-to-end recoverability.
+
+---
+
+## Summary
+
+Backup verification is not a single action but a layered practice: checksums catch corruption, integrity tests confirm readability, file presence checks catch exclusion errors, and test restores confirm that recovery actually works. No single check is sufficient on its own, and none of them matter if they are only performed manually and occasionally.
+
+Key points to remember:
+
+- Generate SHA256 checksums at backup creation time, not retroactively — the value of a checksum is knowing the data was good when the checksum was created
+- `tar -tzf` reads every byte of a compressed archive; a zero exit code confirms the archive is internally consistent
+- File count comparison between source and archive catches over-broad exclusions that checksums cannot detect
+- Database backups must be tested by loading the dump into a test instance — a dump file that exists is not the same as a dump file that works
+- Full system restore tests in a VM are the only verification that confirms the complete recovery path
+- Automate daily checksum and integrity checks; plan quarterly full restore tests as calendar events
+- Log all verification results with timestamps and retain them for at least 90 days
+- `rclone check` handles remote backup verification consistently across cloud providers
+
+### Related Pages
+
+- [System Backup](./system-backup) — full system backup with tar, rsync, and LVM snapshots
+- [Filesystem Backup](./filesystem-backup) — incremental backup strategies with rsnapshot
+- [ReaR Backup](./rear-backup) — bare-metal disaster recovery and restore testing
+- [Restore Procedures](./restore-procedures) — performing file-level and full system restores
+- [Automated Backup](./automated-backup) — integrating verification into scheduled backup jobs
+- [Remote Backup](./remote-backup) — verifying backups stored on remote and cloud destinations

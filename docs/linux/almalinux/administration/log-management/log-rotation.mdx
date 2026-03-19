@@ -1,0 +1,484 @@
+---
+sidebar_position: 2
+title: "Log Rotation | AlmaLinux"
+sidebar_label: "Log Rotation"
+description: "Configure logrotate and journalctl rotation, manage disk space efficiently, and automate log cleanup on AlmaLinux."
+keywords:
+  - "almalinux log rotation"
+  - "almalinux logrotate"
+  - "almalinux journal rotation"
+  - "almalinux log cleanup"
+  - "rhel log rotation"
+tags:
+  - almalinux
+  - log-management
+  - logrotate
+  - journald
+slug: /linux/almalinux/administration/log-management/log-rotation
+---
+
+# Log Rotation
+
+Without log rotation, log files grow indefinitely until they fill the disk and bring down your services. AlmaLinux manages log rotation through two systems — **logrotate** for traditional text log files under `/var/log/`, and **journald** built-in retention controls for the binary journal. Both need to be configured to keep disk usage predictable and manageable.
+
+## How log rotation works on AlmaLinux
+
+```
+/var/log/messages          logrotate          /var/log/messages.1
+/var/log/messages.1    ──────────────►        /var/log/messages.2
+/var/log/messages.2        (daily)             /var/log/messages.3
+                                               /var/log/messages.4  (deleted)
+```
+
+logrotate runs daily via a systemd timer or cron, renames log files, compresses old ones, and removes files beyond the configured retention count.
+
+## logrotate basics
+
+### View the main configuration
+
+```bash
+# Main config file
+cat /etc/logrotate.conf
+
+# Per-application configs
+ls /etc/logrotate.d/
+
+# View a specific app config
+cat /etc/logrotate.d/nginx
+```
+
+### Main logrotate.conf settings
+
+```bash
+sudo nano /etc/logrotate.conf
+```
+
+```bash
+# Rotate weekly by default
+weekly
+
+# Keep 4 weeks of logs
+rotate 4
+
+# Create new empty log file after rotation
+create
+
+# Compress rotated logs
+compress
+
+# Include per-application configs
+include /etc/logrotate.d
+```
+
+### Test logrotate without making changes
+
+```bash
+# Dry run — shows what would happen
+sudo logrotate -d /etc/logrotate.conf
+
+# Test a specific config
+sudo logrotate -d /etc/logrotate.d/nginx
+```
+
+### Force rotation now
+
+```bash
+# Force rotation even if not due
+sudo logrotate -f /etc/logrotate.conf
+
+# Force rotation for a specific service
+sudo logrotate -f /etc/logrotate.d/nginx
+```
+
+## Write a custom logrotate configuration
+
+Place custom configs in `/etc/logrotate.d/`. Each file can manage one or more log paths.
+
+```bash
+sudo nano /etc/logrotate.d/myapp
+```
+
+```bash
+/var/log/myapp/*.log {
+    # Rotate daily
+    daily
+
+    # Keep 14 days of logs
+    rotate 14
+
+    # Compress rotated files
+    compress
+
+    # Delay compression by one rotation (keeps .1 uncompressed for easy access)
+    delaycompress
+
+    # Do not error if the log file is missing
+    missingok
+
+    # Do not rotate if the file is empty
+    notifempty
+
+    # Create new log file with these permissions after rotation
+    create 0640 myapp myapp
+
+    # Add date to rotated filename instead of a number
+    dateext
+    dateformat -%Y-%m-%d
+
+    # Run this after rotation — tell the app to reopen its log file
+    postrotate
+        systemctl reload myapp > /dev/null 2>&1 || true
+    endscript
+}
+```
+
+### Common logrotate directives
+
+| Directive | Meaning |
+|-----------|---------|
+| `daily` / `weekly` / `monthly` | Rotation frequency |
+| `rotate N` | Keep N rotated files before deleting |
+| `size N` | Rotate when file exceeds size (e.g. `100M`, `1G`) |
+| `compress` | Compress rotated files with gzip |
+| `delaycompress` | Compress on the second rotation — keeps latest uncompressed |
+| `missingok` | Do not error if the log file does not exist |
+| `notifempty` | Skip rotation if the file is empty |
+| `create MODE USER GROUP` | Create a new empty log file after rotation |
+| `dateext` | Use date in rotated filename instead of numbers |
+| `copytruncate` | Copy then truncate — for apps that cannot reopen log files |
+| `sharedscripts` | Run postrotate script once even if multiple files matched |
+| `postrotate` | Script to run after rotation (e.g. signal the app) |
+| `prerotate` | Script to run before rotation |
+| `maxage N` | Delete rotated files older than N days |
+| `minsize N` | Only rotate if file is at least N bytes |
+| `maxsize N` | Rotate if file exceeds N bytes regardless of schedule |
+
+### Rotate by size instead of time
+
+For high-volume logs that can grow rapidly:
+
+```bash
+/var/log/myapp/access.log {
+    # Rotate when the file reaches 500MB
+    size 500M
+
+    # But also rotate daily at minimum
+    daily
+
+    # Keep 10 rotated files
+    rotate 10
+
+    compress
+    delaycompress
+    missingok
+    notifempty
+    sharedscripts
+
+    postrotate
+        systemctl reload nginx > /dev/null 2>&1 || true
+    endscript
+}
+```
+
+### Handle apps that cannot reopen log files
+
+Some applications hold their log file open and continue writing to the renamed file after rotation. Use `copytruncate` to copy the file and truncate the original in place — no signal needed.
+
+```bash
+/var/log/myapp/app.log {
+    daily
+    rotate 7
+    compress
+    missingok
+    notifempty
+    # Copy and truncate instead of rename — no signal required
+    copytruncate
+}
+```
+
+:::warning
+`copytruncate` has a small window where log entries written between the copy and the truncate are lost. Use `postrotate` with a reload signal when possible.
+:::
+
+### Postrotate scripts for common services
+
+```bash
+# nginx
+postrotate
+    /usr/bin/kill -USR1 $(cat /run/nginx.pid 2>/dev/null) 2>/dev/null || true
+endscript
+
+# Apache
+postrotate
+    /usr/bin/systemctl reload httpd > /dev/null 2>&1 || true
+endscript
+
+# rsyslog
+postrotate
+    /usr/bin/systemctl kill -s HUP rsyslog.service 2>/dev/null || true
+endscript
+
+# PostgreSQL
+postrotate
+    /usr/bin/systemctl reload postgresql > /dev/null 2>&1 || true
+endscript
+```
+
+## Journal rotation and retention
+
+journald manages its own rotation independently of logrotate.
+
+### Configure journal retention
+
+```bash
+sudo nano /etc/systemd/journald.conf
+```
+
+```ini
+[Journal]
+# Maximum total disk space for the journal
+SystemMaxUse=2G
+
+# Minimum free disk space to maintain
+SystemKeepFree=1G
+
+# Maximum size of a single journal file before rotation
+SystemMaxFileSize=200M
+
+# Maximum number of journal files to keep
+SystemMaxFiles=20
+
+# Delete journal entries older than this
+MaxRetentionSec=30day
+
+# Compress journal files
+Compress=yes
+```
+
+Restart journald after changes:
+
+```bash
+sudo systemctl restart systemd-journald
+```
+
+### Manually vacuum the journal
+
+```bash
+# Check current disk usage
+journalctl --disk-usage
+
+# Remove entries older than 30 days
+sudo journalctl --vacuum-time=30d
+
+# Reduce total size to 1GB
+sudo journalctl --vacuum-size=1G
+
+# Keep only the last 5 boots
+sudo journalctl --vacuum-files=5
+
+# Verify journal integrity after vacuum
+sudo journalctl --verify
+```
+
+### Schedule automatic journal vacuum
+
+Create a weekly vacuum timer:
+
+```bash
+sudo nano /etc/systemd/system/journal-vacuum.service
+```
+
+```ini
+[Unit]
+Description=Vacuum systemd journal
+
+[Service]
+Type=oneshot
+ExecStart=journalctl --vacuum-time=30d
+ExecStart=journalctl --vacuum-size=2G
+```
+
+```bash
+sudo nano /etc/systemd/system/journal-vacuum.timer
+```
+
+```ini
+[Unit]
+Description=Weekly journal vacuum
+
+[Timer]
+OnCalendar=weekly
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+```
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now journal-vacuum.timer
+```
+
+## Monitor disk usage of log files
+
+```bash
+# Total size of /var/log
+du -sh /var/log
+
+# Size breakdown by directory
+du -h --max-depth=2 /var/log | sort -rh | head -20
+
+# Largest log files
+find /var/log -type f -name "*.log" -exec ls -lh {} \; | sort -k5 -rh | head -10
+
+# Journal disk usage
+journalctl --disk-usage
+
+# Watch log directory growth
+watch -n 5 'du -sh /var/log && journalctl --disk-usage'
+```
+
+## Verify logrotate is running
+
+logrotate runs daily via a systemd timer on AlmaLinux.
+
+```bash
+# Check the logrotate timer
+systemctl status logrotate.timer
+systemctl list-timers logrotate.timer
+
+# Check when logrotate last ran
+systemctl status logrotate.service
+journalctl -u logrotate.service -n 20
+
+# Check the logrotate state file (tracks last rotation dates)
+cat /var/lib/logrotate/logrotate.status
+```
+
+## Scripted log rotation health check
+
+```bash
+#!/bin/bash
+# log-rotation-health.sh — check log rotation is working
+
+DISK_THRESHOLD=80
+ALERTS=()
+
+# Check /var/log disk usage
+LOG_DISK=$(df /var/log | awk 'NR==2 {print $5}' | tr -d '%')
+if [[ "$LOG_DISK" -gt "$DISK_THRESHOLD" ]]; then
+  ALERTS+=("HIGH DISK: /var/log is at ${LOG_DISK}%")
+fi
+
+# Check journal disk usage
+JOURNAL_USAGE=$(journalctl --disk-usage 2>/dev/null | grep -oP '[\d.]+[KMGT]?B(?= taken)' | head -1)
+echo "Journal usage: ${JOURNAL_USAGE:-unknown}"
+
+# Check logrotate timer is active
+if ! systemctl is-active --quiet logrotate.timer; then
+  ALERTS+=("WARNING: logrotate.timer is not active")
+fi
+
+# Check for log files over 500MB that should be rotating
+while IFS= read -r file; do
+  SIZE=$(du -m "$file" | cut -f1)
+  if [[ "$SIZE" -gt 500 ]]; then
+    ALERTS+=("LARGE LOG: $file is ${SIZE}MB — check rotation config")
+  fi
+done < <(find /var/log -type f -name "*.log" 2>/dev/null)
+
+# Check for log files not modified in over 24 hours in active services
+for logfile in /var/log/messages /var/log/secure; do
+  if [[ -f "$logfile" ]]; then
+    AGE=$(( $(date +%s) - $(stat -c %Y "$logfile") ))
+    if [[ "$AGE" -gt 86400 ]]; then
+      ALERTS+=("STALE: $logfile not updated in over 24 hours")
+    fi
+  fi
+done
+
+if [[ "${#ALERTS[@]}" -gt 0 ]]; then
+  echo "Log rotation issues on $(hostname):"
+  printf '%s\n' "${ALERTS[@]}"
+  exit 1
+else
+  echo "Log rotation healthy on $(hostname)"
+  echo "/var/log disk usage: ${LOG_DISK}%"
+fi
+```
+
+```bash
+sudo crontab -e
+```
+
+```
+0 8 * * * /usr/local/bin/log-rotation-health.sh >> /var/log/log-rotation-health.log 2>&1
+```
+
+## Common mistakes
+
+### Not using delaycompress
+
+Without `delaycompress`, the most recently rotated file is compressed immediately. This makes it harder to read recent logs without decompressing.
+
+```bash
+# Use both together
+compress
+delaycompress
+```
+
+### Not signalling the application after rotation
+
+Applications that hold log files open continue writing to the renamed file. Always include a `postrotate` to signal the app to reopen its log file.
+
+```bash
+postrotate
+    systemctl reload myapp > /dev/null 2>&1 || true
+endscript
+```
+
+### Using copytruncate when a reload signal is possible
+
+`copytruncate` has a small data loss window. Use a `postrotate` reload signal instead whenever the application supports it.
+
+### Not testing logrotate config changes
+
+```bash
+sudo logrotate -d /etc/logrotate.d/myapp
+```
+
+### Not setting SystemMaxUse for journald
+
+Without a size limit, the journal can consume all available disk space on a busy system.
+
+```ini
+[Journal]
+SystemMaxUse=2G
+SystemKeepFree=1G
+```
+
+### Rotating too aggressively
+
+Keeping only 3-4 days of logs makes post-incident forensics very difficult. Keep at least 14-30 days for production systems.
+
+## Summary
+
+Log rotation on AlmaLinux requires attention to both logrotate for text files and journald for the binary journal. Getting rotation right protects your disk from filling up while keeping enough history for troubleshooting and compliance.
+
+Key points:
+
+- place custom logrotate configs in `/etc/logrotate.d/` — not in the main config
+- always use `compress` and `delaycompress` together
+- always include a `postrotate` script to signal the app to reopen its log file
+- test logrotate configs with `logrotate -d` before applying
+- set `SystemMaxUse` and `MaxRetentionSec` in `journald.conf` to cap journal size
+- use `journalctl --vacuum-time=30d` for manual cleanup
+- keep at least 14-30 days of logs on production systems
+- monitor `/var/log` disk usage and alert before it fills up
+
+:::tip Related pages
+- [System Logging](./system-logging)
+- [Log Analysis](./log-analysis)
+- [Centralized Logging](./centralized-logging)
+- [Secure Logging](./secure-logging)
+:::

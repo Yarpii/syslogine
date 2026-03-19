@@ -1,0 +1,543 @@
+---
+sidebar_position: 5
+title: "Backup Scheduling | AlmaLinux"
+sidebar_label: "Backup Scheduling"
+description: "Schedule and automate backup tasks on AlmaLinux using cron and systemd timers. Coordinate full, incremental, and database backups with ReaR recovery and offsite transfer."
+keywords:
+  - "almalinux backup scheduling"
+  - "almalinux automated backup"
+  - "almalinux backup cron"
+  - "almalinux backup systemd timer"
+  - "rhel backup scheduling"
+tags:
+  - almalinux
+  - task-scheduling
+  - backup-scheduling
+  - automation
+  - cron
+slug: /linux/almalinux/administration/task-scheduling/backup-scheduling
+---
+
+# Backup Scheduling on AlmaLinux
+
+A backup strategy is only as reliable as its execution. Writing a backup script is the first step; ensuring that script runs consistently, in the right order, at the right times, and with proper monitoring of its success or failure is what makes the strategy operational. On AlmaLinux, cron and systemd timers provide the scheduling infrastructure, but the design of how backup jobs relate to each other — their timing, dependencies, and coordination — is what determines whether the backup strategy holds up in practice.
+
+This page covers how to schedule the full range of backup tasks: filesystem backups, database dumps, ReaR recovery image creation, and offsite transfer. It addresses the timing conflicts that arise when multiple backup jobs run on the same system, how to coordinate dependencies between jobs, and how to monitor the schedule to detect missed or failed runs.
+
+---
+
+## Backup Schedule Design
+
+Before looking at specific scheduling configurations, it is worth thinking through the shape of a backup schedule across a day and a week.
+
+A typical production server might run the following backup tasks:
+
+- **Hourly:** database dump to a local staging directory
+- **Nightly:** filesystem backup of key directories to the local backup partition
+- **Nightly:** transfer of the filesystem backup to the remote backup server
+- **Weekly:** full ReaR system backup including rescue ISO generation
+- **Weekly:** transfer of the ReaR backup to offsite storage
+
+These jobs have dependencies on each other and compete for the same resources — disk I/O, network bandwidth, and CPU for compression. A well-designed schedule staggers them to avoid contention and sequences dependent jobs in the correct order:
+
+```
+00:00  Database dump (hourly, fast, local)
+02:00  Filesystem backup (nightly, I/O intensive)
+03:30  Remote transfer (nightly, after filesystem backup completes)
+01:00  ReaR full backup (Sunday only, slow)
+05:00  ReaR remote transfer (Sunday only, after ReaR completes)
+```
+
+The database dump runs hourly because it is fast and produces a small file. The filesystem backup runs at 02:00 when the system is at low load. Remote transfer runs at 03:30 to ensure the local backup is complete before transfer begins. ReaR runs on Sunday at 01:00 and its transfer follows at 05:00 to allow enough time for the slow full backup to complete before the transfer starts.
+
+---
+
+## Scheduling Filesystem Backups
+
+### Nightly Filesystem Backup with cron
+
+Create a cron entry in `/etc/cron.d/` for the nightly filesystem backup:
+
+```bash
+nano /etc/cron.d/backup-filesystem
+```
+
+```
+# Nightly filesystem backup at 02:00
+0 2 * * *  root  /usr/local/sbin/system-backup.sh >> /var/log/backup/filesystem.log 2>&1
+
+# Weekly full system backup on Sunday at 02:00 (replaces nightly on that day)
+# (handled by the same script with different retention logic)
+```
+
+If the backup script already handles logging internally (as shown in the [Automated Backup](../backup-restore/automated-backup) page), the cron redirect to a log file serves as a secondary capture for any output the script does not handle itself.
+
+### Nightly Filesystem Backup with systemd Timer
+
+The equivalent using systemd timers gives better integration with the journal and handles missed runs:
+
+```bash
+nano /etc/systemd/system/backup-filesystem.service
+```
+
+```ini
+[Unit]
+Description=Nightly filesystem backup
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/system-backup.sh
+StandardOutput=append:/var/log/backup/filesystem.log
+StandardError=append:/var/log/backup/filesystem.log
+TimeoutStartSec=4h
+```
+
+`TimeoutStartSec=4h` gives the backup up to 4 hours to complete before systemd considers it failed. A backup of a large system can take significant time; without a generous timeout, systemd may terminate it prematurely.
+
+```bash
+nano /etc/systemd/system/backup-filesystem.timer
+```
+
+```ini
+[Unit]
+Description=Run nightly filesystem backup at 02:00
+
+[Timer]
+OnCalendar=*-*-* 02:00:00
+RandomizedDelaySec=120
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+```
+
+```bash
+systemctl daemon-reload
+systemctl enable --now backup-filesystem.timer
+```
+
+---
+
+## Scheduling Database Backups
+
+Database backups have different requirements from filesystem backups: they must be application-consistent, they often run more frequently, and the dump files should be cleaned up on a separate retention schedule.
+
+### Hourly Database Dump
+
+For a MySQL or MariaDB database, create a dedicated dump script:
+
+```bash
+nano /usr/local/sbin/backup-mysql.sh
+```
+
+```bash
+#!/bin/bash
+# backup-mysql.sh
+# Creates a consistent MySQL dump and retains the last 48 hours of dumps.
+
+BACKUP_DIR="/backup/mysql"
+TIMESTAMP=$(date +%Y%m%d-%H%M)
+DUMPFILE="${BACKUP_DIR}/mysql-${TIMESTAMP}.sql.gz"
+RETENTION_HOURS=48
+LOGFILE="/var/log/backup/mysql.log"
+
+mkdir -p "${BACKUP_DIR}"
+mkdir -p "$(dirname "${LOGFILE}")"
+
+log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "${LOGFILE}"; }
+fail() { log "ERROR: $*"; exit 1; }
+
+log "MySQL dump started: ${DUMPFILE}"
+
+mysqldump --all-databases \
+          --single-transaction \
+          --routines \
+          --events \
+          --hex-blob \
+    2>> "${LOGFILE}" | gzip > "${DUMPFILE}"
+
+[[ "${PIPESTATUS[0]}" -eq 0 ]] || fail "mysqldump failed"
+[[ -s "${DUMPFILE}" ]] || fail "Dump file is empty: ${DUMPFILE}"
+
+log "Dump created: $(du -sh "${DUMPFILE}" | cut -f1)"
+
+# Prune dumps older than retention period
+find "${BACKUP_DIR}" -name "mysql-*.sql.gz" \
+    -mmin "+$(( RETENTION_HOURS * 60 ))" -delete
+
+log "MySQL dump completed"
+```
+
+```bash
+chmod 700 /usr/local/sbin/backup-mysql.sh
+```
+
+Note the use of `${PIPESTATUS[0]}` rather than `$?` — when a command is piped, `$?` reflects the exit code of the last command in the pipe (`gzip`), not `mysqldump`. `PIPESTATUS` captures the exit codes of all commands in a pipeline in order.
+
+Schedule hourly via cron:
+
+```bash
+nano /etc/cron.d/backup-mysql
+```
+
+```
+# MySQL dump at the top of every hour
+0 * * * *  root  /usr/local/sbin/backup-mysql.sh
+```
+
+For PostgreSQL, the equivalent uses `pg_dumpall`:
+
+```bash
+nano /etc/cron.d/backup-postgresql
+```
+
+```
+# PostgreSQL dump at 15 minutes past each hour (offset from MySQL to spread I/O)
+15 * * * *  postgres  /usr/local/sbin/backup-postgresql.sh
+```
+
+Offsetting the PostgreSQL dump by 15 minutes relative to the MySQL dump avoids both running simultaneously and competing for disk I/O.
+
+---
+
+## Scheduling ReaR Backups
+
+ReaR backups are more resource-intensive than filesystem backups because they combine a complete archive with rescue ISO generation. They run less frequently — typically weekly — and should be scheduled when the system is at its lowest load.
+
+### Weekly ReaR Backup
+
+```bash
+nano /etc/systemd/system/backup-rear.service
+```
+
+```ini
+[Unit]
+Description=Weekly ReaR bare-metal backup
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/rear -v mkbackup
+StandardOutput=append:/var/log/backup/rear.log
+StandardError=append:/var/log/backup/rear.log
+TimeoutStartSec=8h
+```
+
+The `After=network-online.target` dependency ensures the network is available before ReaR attempts to write to its configured NFS or remote backup destination. `TimeoutStartSec=8h` gives the ReaR backup up to 8 hours — appropriate for large systems where a full archive and ISO generation can take several hours.
+
+```bash
+nano /etc/systemd/system/backup-rear.timer
+```
+
+```ini
+[Unit]
+Description=Run ReaR backup every Sunday at 01:00
+
+[Timer]
+OnCalendar=Sun *-*-* 01:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+```
+
+```bash
+systemctl daemon-reload
+systemctl enable --now backup-rear.timer
+```
+
+### Separating mkrescue from mkbackup
+
+For large systems, running `mkbackup` weekly but `mkrescue` nightly keeps the rescue ISO current (particularly after kernel updates) without the overhead of a full backup on non-Sunday nights:
+
+```bash
+nano /etc/systemd/system/backup-rear-rescue.service
+```
+
+```ini
+[Unit]
+Description=Nightly ReaR rescue image refresh
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/rear -v mkrescue
+StandardOutput=append:/var/log/backup/rear-rescue.log
+StandardError=append:/var/log/backup/rear-rescue.log
+TimeoutStartSec=2h
+```
+
+```bash
+nano /etc/systemd/system/backup-rear-rescue.timer
+```
+
+```ini
+[Unit]
+Description=Refresh ReaR rescue image nightly at 04:00 (not Sunday — full backup runs instead)
+
+[Timer]
+OnCalendar=Mon..Sat *-*-* 04:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+```
+
+```bash
+systemctl daemon-reload
+systemctl enable --now backup-rear-rescue.timer
+```
+
+`Mon..Sat` schedules the rescue refresh on weekday and Saturday nights, skipping Sunday because the full `mkbackup` run already updates the rescue image as part of its process.
+
+---
+
+## Scheduling Remote Transfer
+
+Local backups protect against accidental deletion and filesystem corruption. Remote backups protect against hardware failure and site-level disasters. The remote transfer job runs after the local backup is complete, using rsync to push archives to the backup server.
+
+### Post-Backup Remote Transfer
+
+The most reliable way to ensure remote transfer runs after the local backup is to chain them in sequence within the same script or use systemd unit dependencies.
+
+**Option 1: Sequential script.** Add the remote transfer at the end of the backup script itself. If the backup fails, the script exits early (via the `fail()` function) and the transfer never runs:
+
+```bash
+# At the end of system-backup.sh, after archive verification:
+log "Starting remote transfer"
+rsync -aAXz --delete \
+    /backup/daily/ \
+    backupserver:/backup/$(hostname)/daily/ \
+    >> "${LOGFILE}" 2>&1 \
+    || fail "Remote transfer failed"
+log "Remote transfer completed"
+```
+
+**Option 2: Systemd unit dependency.** Create a separate transfer service that declares a dependency on the backup service:
+
+```bash
+nano /etc/systemd/system/backup-remote-transfer.service
+```
+
+```ini
+[Unit]
+Description=Transfer filesystem backup to remote server
+After=backup-filesystem.service
+Requires=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/rsync -aAXz --delete /backup/daily/ backupserver:/backup/myhost/daily/
+StandardOutput=append:/var/log/backup/remote-transfer.log
+StandardError=append:/var/log/backup/remote-transfer.log
+TimeoutStartSec=2h
+```
+
+```bash
+nano /etc/systemd/system/backup-remote-transfer.timer
+```
+
+```ini
+[Unit]
+Description=Transfer backups to remote server after nightly backup
+
+[Timer]
+OnCalendar=*-*-* 03:30:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+```
+
+The `After=backup-filesystem.service` in the service unit ensures that if both services are started simultaneously, the transfer waits for the backup to complete. Combined with the 03:30 start time (90 minutes after the 02:00 backup), this provides both a time buffer and a dependency guarantee.
+
+---
+
+## Coordinating Backup Windows
+
+On servers where multiple databases, applications, and filesystems need to be backed up, coordinating the timing carefully prevents backup jobs from competing for resources at the same time.
+
+The following cron file shows a coordinated schedule for a server running MySQL, a web application, and requiring a ReaR backup:
+
+```bash
+nano /etc/cron.d/backup-schedule
+```
+
+```
+# ── Database backups (fast, run frequently) ───────────────────────────────────
+# MySQL dump at top of every hour
+0 * * * *    root     /usr/local/sbin/backup-mysql.sh
+
+# ── Filesystem backups (I/O intensive, run nightly) ──────────────────────────
+# Web application files at 01:00
+0 1 * * *    root     /usr/local/sbin/backup-webfiles.sh
+
+# Full system backup at 02:00
+0 2 * * *    root     /usr/local/sbin/system-backup.sh
+
+# ── Remote transfer (run after local backups complete) ────────────────────────
+# Push local backups to backup server at 03:30
+30 3 * * *   root     /usr/local/sbin/remote-transfer.sh
+
+# ── Weekly tasks (resource intensive, run Sunday only) ───────────────────────
+# ReaR full backup Sunday at 00:30 (before nightly filesystem backup)
+30 0 * * 0   root     /usr/sbin/rear -v mkbackup >> /var/log/backup/rear.log 2>&1
+
+# ReaR offsite transfer Sunday at 05:00 (after ReaR completes)
+0 5 * * 0    root     /usr/local/sbin/rear-offsite-transfer.sh
+
+# ── Cleanup (run after all backups) ──────────────────────────────────────────
+# Prune old local backups at 06:00
+0 6 * * *    root     /usr/local/sbin/backup-cleanup.sh
+```
+
+Comments within the crontab file explain the purpose and timing rationale for each entry. Without these comments, the schedule is opaque to anyone who did not write it — including the original author six months later.
+
+---
+
+## Monitoring the Backup Schedule
+
+Scheduling backup jobs is not the same as knowing they are running. A backup schedule requires its own monitoring to detect missed or failed runs.
+
+### Checking Timer Status
+
+For backups scheduled as systemd timers, review the timer list to confirm each timer is active and showing recent execution:
+
+```bash
+systemctl list-timers --all | grep backup
+```
+
+A timer that shows `n/a` in the `LAST` column has never run. A timer where `PASSED` is significantly greater than its configured interval has missed a run.
+
+### Backup Freshness Check
+
+Schedule a daily check that verifies backup archives are within the expected age:
+
+```bash
+nano /usr/local/sbin/check-backup-schedule.sh
+```
+
+```bash
+#!/bin/bash
+# check-backup-schedule.sh
+# Verifies that backup jobs have run within expected windows.
+# Alerts if any backup is overdue.
+
+ALERT_EMAIL="admin@example.com"
+LOGFILE="/var/log/backup/schedule-check.log"
+HOSTNAME=$(hostname -s)
+ALERTS=()
+
+log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "${LOGFILE}"; }
+
+mkdir -p "$(dirname "${LOGFILE}")"
+
+check_backup() {
+    local LABEL="$1"
+    local DIR="$2"
+    local PATTERN="$3"
+    local MAX_AGE_HOURS="$4"
+
+    NEWEST=$(find "${DIR}" -name "${PATTERN}" -printf '%T@ %p\n' 2>/dev/null \
+        | sort -rn | head -1 | awk '{print $2}')
+
+    if [[ -z "${NEWEST}" ]]; then
+        MSG="${LABEL}: no backup found in ${DIR}"
+        log "MISSING: ${MSG}"
+        ALERTS+=("${MSG}")
+        return
+    fi
+
+    AGE_HOURS=$(( ( $(date +%s) - $(stat -c %Y "${NEWEST}") ) / 3600 ))
+
+    if [[ "${AGE_HOURS}" -gt "${MAX_AGE_HOURS}" ]]; then
+        MSG="${LABEL}: most recent backup is ${AGE_HOURS}h old (max: ${MAX_AGE_HOURS}h) — ${NEWEST}"
+        log "STALE: ${MSG}"
+        ALERTS+=("${MSG}")
+    else
+        log "OK: ${LABEL} — ${AGE_HOURS}h old (${NEWEST})"
+    fi
+}
+
+# Check each backup type against its expected maximum age
+check_backup "MySQL dump"        "/backup/mysql"         "mysql-*.sql.gz"    2
+check_backup "Filesystem backup" "/backup/daily"         "*.tar.gz"          26
+check_backup "ReaR backup"       "/backup/rear/$(hostname)" "*.tar.gz"       200
+
+if [[ "${#ALERTS[@]}" -gt 0 ]]; then
+    {
+        echo "Backup schedule alerts on ${HOSTNAME} at $(date):"
+        echo ""
+        for ALERT in "${ALERTS[@]}"; do
+            echo "  - ${ALERT}"
+        done
+    } | mail -s "Backup Schedule Alert: ${HOSTNAME}" "${ALERT_EMAIL}"
+fi
+```
+
+```bash
+chmod 700 /usr/local/sbin/check-backup-schedule.sh
+```
+
+Schedule the freshness check daily at a time when all expected backups should have completed:
+
+```bash
+echo "0 8 * * *  root  /usr/local/sbin/check-backup-schedule.sh" \
+    >> /etc/cron.d/backup-schedule
+```
+
+Running at 08:00 gives all nightly and weekly jobs time to complete before the check runs, and the results arrive in the inbox at a time when the team is available to act on them.
+
+---
+
+## Handling Backup Failures Gracefully
+
+When a backup job fails, the response depends on the severity of the failure and which job was affected.
+
+For a failed database dump, the most recent previous dump is still available — the loss is limited to the changes since that dump. The alert should indicate that the dump failed and the retention window is now larger than expected, but the system is not in a critical state.
+
+For a failed filesystem backup, if the previous night's backup is intact, the system can still be recovered to yesterday's state. Again, urgent but not critical.
+
+For a failed ReaR backup, the rescue ISO may be stale — particularly if the kernel has been updated since the last successful run. This is the most serious failure because it affects the ability to perform bare-metal recovery.
+
+Structure alerts to reflect this priority. Database and filesystem failures warrant a warning email. A failed ReaR backup on a production server warrants a more urgent notification and should be investigated and re-run at the earliest opportunity.
+
+To re-run a failed systemd-timer-driven backup immediately without waiting for the next scheduled run:
+
+```bash
+systemctl start backup-rear.service
+```
+
+To see why the last run failed before re-running:
+
+```bash
+journalctl -u backup-rear.service -n 100
+```
+
+---
+
+## Summary
+
+Backup scheduling on AlmaLinux requires more than writing a cron entry. The timing of each job, its dependencies on other jobs, the resources it consumes, and the monitoring that confirms it ran successfully are all part of a reliable backup schedule.
+
+Key points to remember:
+
+- Design the backup schedule on paper first — identify dependencies between jobs and stagger resource-intensive tasks
+- Use `${PIPESTATUS[0]}` when piping `mysqldump` or similar tools to check the producer's exit code, not the compressor's
+- Set generous `TimeoutStartSec=` values for backup services — a prematurely terminated backup is worse than a delayed one
+- Schedule the ReaR `mkrescue` run nightly on non-full-backup nights to keep the rescue ISO current after kernel updates
+- Use `After=network-online.target` in service units that write to remote backup destinations
+- Add comments to cron files explaining the timing rationale — the schedule is harder to maintain without them
+- Run a daily backup freshness check separately from the backup jobs themselves to detect silent failures
+- Re-run failed backup services immediately with `systemctl start <service>` rather than waiting for the next scheduled window
+
+### Related Pages
+
+- [Automated Backup](../backup-restore/automated-backup) — backup script design and error handling
+- [System Backup](../backup-restore/system-backup) — full system backup with tar and rsync
+- [ReaR Backup](../backup-restore/rear-backup) — bare-metal recovery backup setup
+- [Remote Backup](../backup-restore/remote-backup) — offsite and cloud backup destinations
+- [Cron Scheduling](./cron-scheduling) — crontab syntax and crond management
+- [Systemd Timers](./systemd-timers) — timer unit creation and dependencies
+- [Enterprise Scheduling](./enterprise-scheduling) — complex job coordination patterns

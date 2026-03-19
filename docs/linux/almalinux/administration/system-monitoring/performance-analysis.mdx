@@ -1,0 +1,501 @@
+---
+sidebar_position: 8
+title: "Performance Analysis | AlmaLinux"
+sidebar_label: "Performance Analysis"
+description: "Analyze performance with perf, strace, tuned, and enterprise performance optimization tools on AlmaLinux."
+keywords:
+  - "almalinux performance analysis"
+  - "almalinux perf"
+  - "almalinux tuned"
+  - "almalinux strace"
+  - "rhel performance tuning"
+tags:
+  - almalinux
+  - system-monitoring
+  - performance
+  - tuning
+  - perf
+slug: /linux/almalinux/administration/system-monitoring/performance-analysis
+---
+
+# Performance Analysis
+
+Resource monitoring tells you that something is slow. Performance analysis tells you why. AlmaLinux provides a deep toolchain — from `perf` for CPU profiling to `tuned` for system-wide optimization — that lets you diagnose bottlenecks at every layer of the stack and systematically improve throughput, latency, and resource efficiency.
+
+## Install performance tools
+
+```bash
+sudo dnf install -y \
+  perf \
+  strace \
+  ltrace \
+  sysstat \
+  tuned \
+  tuned-utils \
+  tuna \
+  numactl \
+  hwloc \
+  pcp \
+  pcp-system-tools \
+  valgrind \
+  bpftrace
+```
+
+## Establish a baseline first
+
+Before tuning anything, measure the current state. Without a baseline you cannot tell whether a change helped.
+
+```bash
+# Capture a system snapshot to a file
+sar -A 1 60 > /tmp/baseline-$(date +%F-%H%M).txt
+
+# Record key metrics
+echo "=== Baseline: $(date) ===" > /tmp/baseline.txt
+echo "--- CPU ---" >> /tmp/baseline.txt
+mpstat -P ALL 1 5 >> /tmp/baseline.txt
+echo "--- Memory ---" >> /tmp/baseline.txt
+free -h >> /tmp/baseline.txt
+echo "--- Disk I/O ---" >> /tmp/baseline.txt
+iostat -x 1 5 >> /tmp/baseline.txt
+echo "--- Network ---" >> /tmp/baseline.txt
+sar -n DEV 1 5 >> /tmp/baseline.txt
+echo "--- Load ---" >> /tmp/baseline.txt
+uptime >> /tmp/baseline.txt
+```
+
+## CPU performance analysis
+
+### Profile CPU usage with perf
+
+`perf` samples what the CPU is actually executing. It is the most powerful tool for finding CPU hotspots.
+
+```bash
+# Record CPU activity system-wide for 30 seconds
+sudo perf record -a -g -- sleep 30
+
+# Show the report
+sudo perf report
+
+# Quick top-level summary
+sudo perf top
+
+# Record activity for a specific process
+sudo perf record -g -p $(pgrep nginx) -- sleep 30
+sudo perf report
+```
+
+### Generate a flame graph
+
+Flame graphs are the clearest way to visualize where CPU time is being spent.
+
+```bash
+# Install FlameGraph tools
+git clone https://github.com/brendangregg/FlameGraph /opt/FlameGraph
+
+# Record and generate a flame graph
+sudo perf record -F 99 -a -g -- sleep 30
+sudo perf script | /opt/FlameGraph/stackcollapse-perf.pl | \
+  /opt/FlameGraph/flamegraph.pl > /tmp/flamegraph-$(date +%F).svg
+```
+
+Open the SVG in a browser for an interactive view.
+
+### Check CPU frequency scaling
+
+On servers, the CPU governor should be set to `performance` to avoid frequency throttling under load.
+
+```bash
+# View current governor for all cores
+cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+
+# Check available governors
+cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_available_governors
+
+# Set performance governor immediately
+echo performance | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+```
+
+Make it persistent via tuned (see below).
+
+### Check for CPU throttling
+
+```bash
+# Check thermal throttling
+sudo dmesg | grep -i "thermal\|throttl"
+
+# Check CPU frequency
+sudo cpupower frequency-info
+
+# View current frequency per core
+grep MHz /proc/cpuinfo
+```
+
+## Memory performance analysis
+
+### Analyze memory usage in detail
+
+```bash
+# Detailed memory breakdown
+cat /proc/meminfo
+
+# Huge pages status
+cat /proc/meminfo | grep -i huge
+
+# NUMA memory layout
+numactl --hardware
+
+# Memory per NUMA node
+numastat
+```
+
+### Check for memory pressure
+
+```bash
+# Check swap activity — any non-zero si/so means memory pressure
+vmstat 1 10
+
+# Check OOM killer history
+sudo dmesg | grep -i "oom\|killed process"
+sudo journalctl -k | grep -i "out of memory"
+
+# Processes closest to OOM score
+for proc in /proc/[0-9]*/oom_score; do
+  score=$(cat "$proc" 2>/dev/null)
+  pid=$(echo "$proc" | cut -d/ -f3)
+  comm=$(cat "/proc/$pid/comm" 2>/dev/null)
+  echo "$score $pid $comm"
+done | sort -rn | head -10
+```
+
+### Enable huge pages for database workloads
+
+Huge pages reduce TLB pressure for memory-intensive applications like PostgreSQL and Oracle.
+
+```bash
+# Check current huge page configuration
+grep -i hugepage /proc/meminfo
+
+# Set the number of huge pages (2MB each)
+echo 512 | sudo tee /proc/sys/vm/nr_hugepages
+
+# Make persistent
+echo "vm.nr_hugepages = 512" | sudo tee /etc/sysctl.d/99-hugepages.conf
+sudo sysctl --system
+```
+
+## Disk I/O performance analysis
+
+### Benchmark disk throughput with dd
+
+```bash
+# Write throughput test
+dd if=/dev/zero of=/tmp/test-write bs=1M count=1024 oflag=direct
+rm /tmp/test-write
+
+# Read throughput test (drop cache first)
+sudo sh -c 'echo 3 > /proc/sys/vm/drop_caches'
+dd if=/dev/sda of=/dev/null bs=1M count=1024 iflag=direct
+```
+
+### Benchmark with fio
+
+`fio` gives more realistic and configurable I/O benchmarks:
+
+```bash
+sudo dnf install -y fio
+
+# Random read IOPS test
+fio --name=randread \
+  --ioengine=libaio \
+  --iodepth=16 \
+  --rw=randread \
+  --bs=4k \
+  --direct=1 \
+  --size=1G \
+  --numjobs=4 \
+  --runtime=60 \
+  --group_reporting \
+  --filename=/tmp/fio-test
+
+# Sequential write throughput test
+fio --name=seqwrite \
+  --ioengine=libaio \
+  --iodepth=32 \
+  --rw=write \
+  --bs=1M \
+  --direct=1 \
+  --size=4G \
+  --numjobs=1 \
+  --runtime=60 \
+  --group_reporting \
+  --filename=/tmp/fio-test
+
+rm -f /tmp/fio-test
+```
+
+### Check I/O scheduler
+
+The I/O scheduler affects disk performance significantly, especially on SSDs and NVMe.
+
+```bash
+# View current scheduler per device
+cat /sys/block/sda/queue/scheduler
+cat /sys/block/nvme0n1/queue/scheduler
+
+# Set none/mq-deadline for NVMe (best for SSDs)
+echo mq-deadline | sudo tee /sys/block/nvme0n1/queue/scheduler
+
+# Set bfq for HDDs (better for mixed workloads)
+echo bfq | sudo tee /sys/block/sda/queue/scheduler
+```
+
+Make it persistent via udev rule:
+
+```bash
+sudo nano /etc/udev/rules.d/60-ioscheduler.rules
+```
+
+```
+# NVMe — use mq-deadline
+ACTION=="add|change", KERNEL=="nvme[0-9]*", ATTR{queue/scheduler}="mq-deadline"
+
+# SSD — use mq-deadline
+ACTION=="add|change", KERNEL=="sd[a-z]", ATTR{queue/rotational}=="0", ATTR{queue/scheduler}="mq-deadline"
+
+# HDD — use bfq
+ACTION=="add|change", KERNEL=="sd[a-z]", ATTR{queue/rotational}=="1", ATTR{queue/scheduler}="bfq"
+```
+
+## Network performance analysis
+
+### Check network throughput with iperf3
+
+```bash
+sudo dnf install -y iperf3
+
+# On the server
+iperf3 -s
+
+# On the client — test throughput to server
+iperf3 -c server.example.com -t 30
+
+# Test with multiple parallel streams
+iperf3 -c server.example.com -P 4 -t 30
+
+# Test UDP throughput
+iperf3 -c server.example.com -u -b 1G -t 30
+```
+
+### Tune network stack settings
+
+```bash
+sudo nano /etc/sysctl.d/99-network-performance.conf
+```
+
+```ini
+# Increase TCP buffer sizes for high-throughput networks
+net.core.rmem_max = 134217728
+net.core.wmem_max = 134217728
+net.ipv4.tcp_rmem = 4096 87380 134217728
+net.ipv4.tcp_wmem = 4096 65536 134217728
+
+# Enable TCP BBR congestion control (better throughput on WAN links)
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+
+# Increase connection backlog for busy servers
+net.core.somaxconn = 65535
+net.ipv4.tcp_max_syn_backlog = 65535
+
+# Reduce TIME_WAIT connections
+net.ipv4.tcp_tw_reuse = 1
+net.ipv4.tcp_fin_timeout = 15
+```
+
+Apply:
+
+```bash
+sudo sysctl --system
+```
+
+## System-wide tuning with tuned
+
+`tuned` applies tuning profiles that adjust dozens of kernel and hardware parameters in one step. It is the recommended way to tune AlmaLinux for specific workloads.
+
+### View and apply profiles
+
+```bash
+# View available profiles
+tuned-adm list
+
+# View the currently active profile
+tuned-adm active
+
+# Apply a profile
+sudo tuned-adm profile throughput-performance
+
+# Recommend a profile based on hardware
+tuned-adm recommend
+```
+
+### Common tuned profiles
+
+| Profile | Best for |
+|---------|---------|
+| `throughput-performance` | General servers, high throughput workloads |
+| `latency-performance` | Low-latency applications, trading, real-time |
+| `network-throughput` | Network-heavy workloads |
+| `network-latency` | Low-latency networking |
+| `virtual-guest` | AlmaLinux running as a VM |
+| `virtual-host` | AlmaLinux as a hypervisor host |
+| `balanced` | Desktop and mixed workloads |
+| `powersave` | Laptops, low-power environments |
+
+### Create a custom tuned profile
+
+```bash
+sudo mkdir -p /etc/tuned/myprofile
+sudo nano /etc/tuned/myprofile/tuned.conf
+```
+
+```ini
+[main]
+summary=Custom profile for web servers
+include=throughput-performance
+
+[cpu]
+governor=performance
+energy_perf_bias=performance
+
+[vm]
+transparent_hugepages=madvise
+
+[disk]
+elevator=mq-deadline
+readahead=>4096
+
+[net]
+channels=combined 4
+
+[sysctl]
+net.core.somaxconn=65535
+net.ipv4.tcp_max_syn_backlog=65535
+vm.swappiness=10
+```
+
+Apply it:
+
+```bash
+sudo tuned-adm profile myprofile
+```
+
+## Trace application behaviour with strace and ltrace
+
+```bash
+# Trace all system calls of a running process
+sudo strace -p $(pgrep nginx | head -1) -f
+
+# Count and summarise system calls
+sudo strace -c -p $(pgrep nginx | head -1) -- sleep 10
+
+# Trace file access only
+sudo strace -e trace=file -p $(pgrep nginx | head -1)
+
+# Trace library calls
+sudo ltrace -p $(pgrep myapp | head -1)
+
+# Trace a new process from start
+strace -o /tmp/trace.txt mycommand
+```
+
+## Performance Co-Pilot (PCP)
+
+PCP is a toolkit for collecting, archiving, and analysing performance data. It ships with AlmaLinux and integrates with Grafana.
+
+```bash
+sudo systemctl enable --now pmcd pmlogger
+
+# Live performance overview
+pcp atop
+
+# Record metrics for 5 minutes
+pmrep -T 5min -t 10sec kernel.all.cpu.user kernel.all.load mem.util.used
+
+# Query archived metrics
+pmrep -a /var/log/pcp/pmlogger/$(hostname)/$(date +%Y%m%d) kernel.all.cpu.user
+
+# Use pmstat for a sar-like summary
+pmstat -s 10
+```
+
+## Common mistakes
+
+### Tuning without a baseline
+
+Changes that feel like improvements may not be. Always measure before and after with the same workload.
+
+```bash
+# Compare before and after
+diff /tmp/baseline-before.txt /tmp/baseline-after.txt
+```
+
+### Applying tuned profiles without checking the current one first
+
+Switching profiles can reset settings you manually applied.
+
+```bash
+tuned-adm active
+tuned-adm profile throughput-performance
+```
+
+### Using `dd` for serious benchmarking
+
+`dd` is useful for a quick sanity check but not a reliable benchmark. Use `fio` for meaningful I/O measurements.
+
+### Leaving perf record running in production
+
+`perf record` adds CPU overhead. Use it for short targeted sessions, not as a permanent monitoring tool.
+
+### Ignoring NUMA topology on multi-socket systems
+
+On multi-socket servers, mismatched NUMA placement can severely hurt performance.
+
+```bash
+# Check NUMA topology
+numactl --hardware
+
+# Run a process on a specific NUMA node
+numactl --cpunodebind=0 --membind=0 myprocess
+```
+
+### Setting vm.swappiness=0
+
+Setting swappiness to 0 does not disable swap — it just makes the kernel very reluctant to use it, which can cause the OOM killer to trigger earlier than necessary. A value of 10 is a better choice for most servers.
+
+```bash
+echo "vm.swappiness = 10" | sudo tee /etc/sysctl.d/99-swappiness.conf
+sudo sysctl --system
+```
+
+## Summary
+
+Performance analysis on AlmaLinux is a systematic process — measure, identify the bottleneck, tune, and measure again. No single tool tells the whole story, but used together they give you complete visibility from the application layer down to the hardware.
+
+Key points:
+
+- always capture a baseline before making any changes
+- use `perf top` and flame graphs to find CPU hotspots
+- use `fio` for reliable disk I/O benchmarks
+- use `tuned-adm` to apply workload-appropriate system profiles
+- set the CPU governor to `performance` on servers
+- set the I/O scheduler to `mq-deadline` for SSDs and NVMe, `bfq` for HDDs
+- tune network stack parameters for high-throughput or low-latency workloads
+- use `strace -c` to summarise system call overhead in misbehaving processes
+- check NUMA topology on multi-socket systems before tuning CPU or memory affinity
+
+:::tip Related pages
+- [Resource Monitoring](./resource-monitoring)
+- [Process Monitoring](./process-monitoring)
+- [Storage Monitoring](./storage-monitoring)
+- [Metrics Collection](./metrics-collection)
+:::

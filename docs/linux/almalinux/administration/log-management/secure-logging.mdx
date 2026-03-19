@@ -1,0 +1,431 @@
+---
+sidebar_position: 8
+title: "Secure Logging | AlmaLinux"
+sidebar_label: "Secure Logging"
+description: "Harden log integrity and access controls on AlmaLinux by protecting log files, preventing tampering, configuring SELinux for logging, and preserving evidence for forensic use."
+keywords:
+  - "almalinux secure logging"
+  - "almalinux log integrity"
+  - "almalinux log tampering"
+  - "almalinux log permissions"
+  - "rhel secure logging"
+tags:
+  - almalinux
+  - log-management
+  - secure-logging
+  - selinux
+  - security
+slug: /linux/almalinux/administration/log-management/secure-logging
+---
+
+# Secure Logging on AlmaLinux
+
+Logs are only valuable as evidence if they can be trusted. An attacker who gains access to a system will often attempt to modify or delete log files to remove traces of their activity. A misconfigured system may allow unprivileged users or compromised processes to read log files that contain sensitive information. Even well-intentioned administrators can accidentally corrupt or delete logs they needed for an investigation.
+
+Secure logging addresses these risks through a combination of access controls, integrity protections, SELinux policy enforcement, and architectural choices that make tampering difficult. This page covers how to harden log storage and access on AlmaLinux, how to detect unauthorized modifications, and how to preserve log evidence in a way that is useful for forensic analysis.
+
+---
+
+## Understanding the Threat Model
+
+Before hardening log security, it helps to be clear about what you are protecting against and why. The main risks are:
+
+**Log deletion or modification by a compromised process.** If an attacker gains code execution as a privileged user, one of their first actions is often to clear logs. If log files are writable by root and the attacker has root, they can overwrite or truncate any file on the local filesystem.
+
+**Unauthorized reading of sensitive log content.** Logs frequently contain sensitive information: usernames, IP addresses, command arguments, error messages that reveal system internals, and in some cases partial credentials. If log files are readable by non-privileged users, this information is exposed.
+
+**Log injection.** If an attacker can write arbitrary content to a log file — by manipulating log inputs from an application — they may be able to confuse log parsers, hide their activity, or create false evidence.
+
+**Loss of logs during an incident.** If log files are stored only locally, a ransomware attack, disk failure, or system rebuild can destroy the only record of what happened.
+
+The countermeasures for each of these risks are distinct. Local file permissions address unauthorized reading. Immutable file attributes and remote logging address deletion and modification. Input validation and structured logging address injection. Remote log forwarding and off-site storage address loss during an incident.
+
+---
+
+## File Permissions and Ownership
+
+The first line of defense is ensuring that log files are owned and permissioned correctly. On a default AlmaLinux installation, most log files under `/var/log/` are already configured with appropriate permissions, but it is worth understanding and verifying them.
+
+### Checking Current Permissions
+
+To review ownership and permissions of key log files:
+
+```bash
+ls -la /var/log/messages /var/log/secure /var/log/audit/audit.log
+```
+
+Expected output on a default AlmaLinux system:
+
+```
+-rw-------. 1 root root   524288 Jun  1 10:00 /var/log/audit/audit.log
+-rw-------. 1 root root  2097152 Jun  1 10:00 /var/log/messages
+-rw-------. 1 root root   131072 Jun  1 10:00 /var/log/secure
+```
+
+The `-------` permission for group and others means only root can read or write these files. The trailing `.` in the permission string indicates an SELinux context is set on the file.
+
+### Correcting Permissions
+
+If permissions have been changed or a log file has incorrect ownership, restore them:
+
+```bash
+chmod 600 /var/log/messages
+chmod 600 /var/log/secure
+chown root:root /var/log/messages
+chown root:root /var/log/secure
+```
+
+For the audit log, auditd manages ownership itself, but you can verify:
+
+```bash
+chmod 600 /var/log/audit/audit.log
+chown root:root /var/log/audit/audit.log
+```
+
+### Restricting Access to Log Directories
+
+The `/var/log/` directory itself should not be world-readable:
+
+```bash
+ls -ld /var/log/
+```
+
+It should be owned by root with permissions `755` or tighter. The audit subdirectory warrants stricter control:
+
+```bash
+chmod 700 /var/log/audit/
+chown root:root /var/log/audit/
+```
+
+This prevents non-root users from listing the contents of the audit log directory, even if they somehow obtained read access to a file within it.
+
+### Application Log Permissions
+
+Application-specific log directories often have looser permissions because the application runs as a non-root user and needs to write to its own logs. The principle here is that application logs should be owned by the application's dedicated user, not writable by other users, and readable only by root and the application user.
+
+For Apache, for example:
+
+```bash
+ls -ld /var/log/httpd/
+ls -la /var/log/httpd/
+```
+
+The directory should be owned by root with the `apache` group having read access, and log files written by root or the `apache` user but not world-readable.
+
+---
+
+## Using chattr to Protect Log Files
+
+Linux supports immutable file attributes that operate below the filesystem permission layer. Even root cannot modify a file marked immutable without first removing the attribute — which itself is a logged and auditable action.
+
+The `chattr` command sets extended file attributes. The `+i` flag makes a file immutable:
+
+```bash
+chattr +i /var/log/messages
+```
+
+An immutable file cannot be modified, deleted, renamed, or have new data appended to it. This means that once set, the logging daemon cannot write to it either. Immutability is therefore only suitable for log files that have already been archived — not for active log files.
+
+A practical use of immutability is on archived or rotated log files that you want to preserve for forensic or compliance purposes:
+
+```bash
+# After rotation, make the archived file immutable
+chattr +i /var/log/secure-20240601
+```
+
+To verify which files have the immutable attribute set:
+
+```bash
+lsattr /var/log/
+```
+
+The output shows a string of attribute flags for each file. An `i` in the flags means the file is immutable.
+
+To remove the immutable attribute when you need to work with the file:
+
+```bash
+chattr -i /var/log/secure-20240601
+```
+
+:::warning
+The immutable attribute is controlled by the `CAP_LINUX_IMMUTABLE` capability. A process with full root privileges and this capability can still remove it. Immutability provides a strong deterrent and a detectable barrier, but it is not an absolute guarantee against a sufficiently privileged attacker. Its primary value is slowing down automated attack scripts and making any tampering attempt auditable.
+:::
+
+### Using append-only Mode for Active Logs
+
+For active log files, the append-only (`+a`) attribute is more appropriate than immutable. A file with the append-only attribute can only be written to by appending — existing content cannot be modified or deleted, and the file cannot be truncated. The logging daemon can still add new entries, but an attacker cannot erase previous ones:
+
+```bash
+chattr +a /var/log/messages
+chattr +a /var/log/secure
+```
+
+To verify:
+
+```bash
+lsattr /var/log/messages /var/log/secure
+```
+
+The `a` flag should appear in the attribute string.
+
+One important consideration: logrotate needs to truncate or replace log files during rotation. If append-only is set, logrotate's `truncate` method will fail. You must use the `copytruncate` directive in your logrotate configuration for files with the append-only attribute, or temporarily remove the attribute before rotation and re-apply it after:
+
+```bash
+nano /etc/logrotate.d/syslog
+```
+
+```
+/var/log/messages {
+    daily
+    rotate 14
+    compress
+    missingok
+    notifempty
+    copytruncate
+}
+```
+
+The `copytruncate` method copies the log file to the rotated name, then truncates the original in place rather than renaming it. This works with append-only files because truncation is technically an append of zero bytes to position zero — though behavior varies by kernel version and filesystem. Test this on your specific system before relying on it.
+
+---
+
+## SELinux and Log Security
+
+SELinux on AlmaLinux enforces mandatory access control policies on log files, providing a layer of protection that operates independently of standard Unix permissions. Even if file permissions are misconfigured, SELinux policy can prevent unauthorized access.
+
+### Log File SELinux Contexts
+
+Log files have SELinux types that control which processes can read or write them. The standard type for most log files is `var_log_t`. The audit log has its own type, `auditd_log_t`, which is only accessible to the audit daemon.
+
+To check the SELinux context of log files:
+
+```bash
+ls -laZ /var/log/messages /var/log/secure /var/log/audit/audit.log
+```
+
+The context appears as `system_u:object_r:var_log_t:s0` or `system_u:object_r:auditd_log_t:s0`. If a context is wrong — for example, if a file shows `unlabeled_t` — processes that should be able to write to it may be blocked, and processes that should not have access may be permitted more than intended.
+
+To restore the correct SELinux context on log files:
+
+```bash
+restorecon -v /var/log/messages
+restorecon -Rv /var/log/
+```
+
+### Checking for SELinux Denials Related to Logging
+
+If a logging daemon is failing to write to a log file, SELinux denials are a common cause. Check for recent AVC denials:
+
+```bash
+ausearch -m avc -ts recent | grep -E "rsyslog|auditd|journald"
+```
+
+To get a human-readable explanation of a denial and suggested remediation:
+
+```bash
+ausearch -m avc -ts recent | audit2why
+```
+
+`audit2why` reads AVC denial records and explains in plain language why the denial occurred and what policy change would resolve it. This is significantly more useful than trying to interpret raw AVC messages manually.
+
+### Custom Log Directories and SELinux
+
+If you configure logging to write to a non-standard location — for example, a dedicated partition mounted at `/srv/logs/` — you need to assign an appropriate SELinux context to that path before rsyslog or auditd will be permitted to write there:
+
+```bash
+semanage fcontext -a -t var_log_t "/srv/logs(/.*)?"
+restorecon -Rv /srv/logs/
+```
+
+Without this step, files created in the new location will inherit the context of the parent directory, which is unlikely to be `var_log_t`, and the logging daemon will be denied write access.
+
+---
+
+## Remote Logging as an Integrity Control
+
+The most effective protection against log tampering is ensuring that log copies exist somewhere the attacker cannot reach. If logs are forwarded to a remote log server in real time, a local attacker who deletes or modifies local log files cannot erase the copies that have already been transmitted.
+
+The configuration for remote log forwarding is covered fully in the [Centralized Logging](./centralized-logging) page. From a security perspective, the key considerations are:
+
+**Forward logs in real time, not in batches.** The longer the gap between a log event occurring and its forwarding to the remote server, the larger the window of events an attacker can erase by acting quickly. rsyslog forwards synchronously by default when a TCP action is configured.
+
+**Use TLS for transport.** Unencrypted log forwarding exposes log content to network observation and is vulnerable to man-in-the-middle attacks where an adversary injects false log entries into the stream. TLS configuration for rsyslog is covered in the Centralized Logging page.
+
+**Restrict access on the log server.** The remote log server should be accessible only from your own systems and only on the syslog port. No shell access should be granted to users who do not need to administer the server, and log files on the server should have permissions as restrictive as on the clients.
+
+**Consider write-once or append-only storage.** Some organizations write remote logs to object storage or specialized log management systems that do not permit modification of existing records. This provides a tamper-evident audit trail that is resistant even to compromise of the log server itself.
+
+---
+
+## Detecting Log Tampering
+
+Even with preventive controls in place, it is valuable to be able to detect whether log files have been modified. Several approaches exist, ranging from simple to sophisticated.
+
+### File Integrity Monitoring with AIDE
+
+AIDE (Advanced Intrusion Detection Environment) monitors the filesystem for changes to files, including log files. It maintains a database of file attributes — permissions, ownership, size, and cryptographic hashes — and compares the current state of the filesystem against this baseline to detect modifications.
+
+Install AIDE:
+
+```bash
+dnf install aide
+```
+
+Initialize the AIDE database after the system is in a known-good state:
+
+```bash
+aide --init
+```
+
+This creates a new database at `/var/lib/aide/aide.db.new.gz`. Move it into place:
+
+```bash
+mv /var/lib/aide/aide.db.new.gz /var/lib/aide/aide.db.gz
+```
+
+To run a check against the baseline:
+
+```bash
+aide --check
+```
+
+AIDE reports any files that have changed since the database was created, including size, modification time, and hash mismatches. A change to `/var/log/secure` that is not explained by normal log rotation would appear here.
+
+Schedule regular AIDE checks via cron or a systemd timer. A daily check is typical:
+
+```bash
+echo "0 3 * * * root /usr/sbin/aide --check | mail -s 'AIDE Report: $(hostname)' admin@example.com" >> /etc/cron.d/aide
+```
+
+:::tip
+AIDE is most useful when its database is stored separately from the system being monitored — on read-only media, a remote server, or an out-of-band management system. If the database is stored on the same filesystem as the files it monitors and an attacker can modify both, the integrity check is undermined.
+:::
+
+### Monitoring Log File Sizes
+
+A simple but effective indicator of log tampering is an unexpected decrease in log file size. A log file that is being actively written to should only ever grow or be replaced by logrotate on a predictable schedule. A file that shrinks outside of a rotation event has almost certainly been truncated.
+
+A basic check that can be run from cron compares the current size of key log files against a recorded baseline:
+
+```bash
+nano /usr/local/sbin/check-log-sizes.sh
+```
+
+```bash
+#!/bin/bash
+# check-log-sizes.sh
+# Alerts if monitored log files have shrunk since last check.
+
+STATEDIR="/var/lib/log-size-check"
+ALERTMAIL="admin@example.com"
+HOSTNAME=$(hostname)
+LOGFILES="/var/log/messages /var/log/secure /var/log/audit/audit.log"
+
+mkdir -p "$STATEDIR"
+
+for LOGFILE in $LOGFILES; do
+    BASENAME=$(basename "$LOGFILE")
+    STATEFILE="$STATEDIR/$BASENAME.size"
+    CURRENTSIZE=$(stat -c %s "$LOGFILE" 2>/dev/null || echo 0)
+
+    if [[ -f "$STATEFILE" ]]; then
+        LASTSIZE=$(cat "$STATEFILE")
+        if [[ "$CURRENTSIZE" -lt "$LASTSIZE" ]]; then
+            echo "WARNING: $LOGFILE shrank from $LASTSIZE to $CURRENTSIZE bytes on $HOSTNAME at $(date)" \
+                | mail -s "Possible Log Tampering on $HOSTNAME" "$ALERTMAIL"
+        fi
+    fi
+
+    echo "$CURRENTSIZE" > "$STATEFILE"
+done
+```
+
+```bash
+chmod +x /usr/local/sbin/check-log-sizes.sh
+```
+
+Add to cron to run every 15 minutes:
+
+```bash
+echo "*/15 * * * * root /usr/local/sbin/check-log-sizes.sh" >> /etc/cron.d/log-size-check
+```
+
+This is a lightweight heuristic rather than a cryptographic guarantee, but it will catch naive log clearing attempts immediately.
+
+---
+
+## Preserving Logs for Forensic Use
+
+When a security incident occurs, log files become evidence. How they are preserved affects whether they can be used for incident response, legal proceedings, or compliance audits. Several practices make log evidence more reliable and admissible.
+
+### Establishing a Chain of Custody
+
+If logs may be used in legal proceedings, document how they were collected, who had access to them, and how they were stored. Create a written record of:
+
+- The date and time logs were collected
+- Which files were collected and from which systems
+- The MD5 or SHA256 hash of each file at the time of collection
+- Who performed the collection and who had subsequent access
+
+Generate cryptographic hashes of log files at collection time:
+
+```bash
+sha256sum /var/log/secure /var/log/messages /var/log/audit/audit.log > /root/incident-20240601-hashes.txt
+```
+
+Store these hashes somewhere separate from the log files themselves — on a different system or in a version control repository — so that any subsequent modification of the logs can be detected by comparing against the recorded hashes.
+
+### Creating Forensic Copies
+
+When preserving logs as evidence, work from copies rather than originals. Creating a bit-for-bit copy of a log file preserves metadata (timestamps, permissions) that a simple copy may alter:
+
+```bash
+cp --preserve=all /var/log/secure /root/evidence/secure-20240601
+```
+
+The `--preserve=all` flag retains access time, modification time, ownership, permissions, and SELinux context. For a complete disk image of the partition containing logs, `dd` or specialized forensic tools are more appropriate, but for individual log files, `cp --preserve=all` is sufficient.
+
+Compress and hash the preserved copy immediately after collection:
+
+```bash
+gzip /root/evidence/secure-20240601
+sha256sum /root/evidence/secure-20240601.gz >> /root/incident-20240601-hashes.txt
+```
+
+### Log Retention Policy
+
+From both a compliance and a forensic perspective, logs need to be retained for long enough to be useful. Common requirements:
+
+| Framework | Minimum retention |
+|---|---|
+| PCI DSS | 12 months (3 months immediately available) |
+| HIPAA | 6 years |
+| SOC 2 | Typically 1 year |
+| CIS Benchmarks | 90 days minimum |
+
+Configure logrotate and auditd rotation settings to match your retention requirements. For long-term retention beyond what logrotate manages locally, consider archiving older logs to object storage or a dedicated archive server. Compressed logs are much smaller than active logs — a month of `/var/log/messages` typically compresses to 5–15% of its original size with gzip.
+
+---
+
+## Summary
+
+Secure logging on AlmaLinux combines file-level access controls, kernel-level integrity attributes, SELinux policy enforcement, remote log forwarding, and monitoring for tampering. No single measure is sufficient on its own — a comprehensive approach uses several layers so that defeating one control does not eliminate all protection.
+
+Key points to remember:
+
+- Critical log files should be `600` permissions owned by root; verify this regularly
+- Use `chattr +a` (append-only) on active log files to prevent erasure of existing entries; use `chattr +i` on archived logs
+- Verify and restore SELinux contexts on log files and directories with `restorecon`
+- Remote log forwarding is the most effective tamper protection — logs that have left the system cannot be erased locally
+- Use TLS for remote log transport to protect confidentiality and integrity in transit
+- AIDE provides cryptographic baseline monitoring; store its database separately from the monitored system
+- Hash log files at collection time to establish a verifiable chain of custody for incident evidence
+- Set log retention periods to match your compliance framework requirements and configure logrotate and auditd accordingly
+
+### Related Pages
+
+- [System Logging](./system-logging) — rsyslog and the systemd journal fundamentals
+- [Log Rotation](./log-rotation) — managing log file retention with logrotate and journald
+- [Audit Logging](./audit-logging) — kernel-level security event tracking with auditd
+- [Centralized Logging](./centralized-logging) — remote log forwarding with TLS
+- [Log Monitoring](./log-monitoring) — alerting on log patterns and anomalies

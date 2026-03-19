@@ -1,0 +1,416 @@
+---
+sidebar_position: 2
+title: "Filesystem Backup | AlmaLinux"
+sidebar_label: "Filesystem Backup"
+description: "Back up specific directories and filesystems on AlmaLinux using rsnapshot, tar, and rsync. Manage incremental backups, handle RHEL filesystem structures, and optimize storage use."
+keywords:
+  - "almalinux filesystem backup"
+  - "almalinux rsnapshot"
+  - "almalinux incremental backup"
+  - "almalinux directory backup"
+  - "rhel filesystem backup"
+tags:
+  - almalinux
+  - backup-restore
+  - rsnapshot
+  - incremental-backup
+  - filesystem
+slug: /linux/almalinux/administration/backup-restore/filesystem-backup
+---
+
+# Filesystem Backup on AlmaLinux
+
+Not every backup needs to capture an entire system. In many situations, what you need to protect is a specific set of directories — user home directories, a web server's document root, a database dump location, or a configuration directory. Filesystem-level backups focus on this targeted approach: backing up specific parts of the directory tree, managing multiple generations of backups efficiently, and keeping storage consumption under control through incremental strategies.
+
+On AlmaLinux, the primary tools for filesystem backup are `rsnapshot` (which automates the hard-link incremental approach on a schedule), `tar` used selectively on specific directories, and `rsync` for directory synchronization. This page covers all three, with particular attention to `rsnapshot` as the most capable tool for managing multiple backup generations automatically.
+
+---
+
+## Targeted Directory Backups with tar
+
+The simplest form of filesystem backup is creating a compressed archive of a specific directory. This is appropriate for one-off backups before making significant changes, or for directories small enough that a full copy each time is practical.
+
+### Backing Up a Single Directory
+
+To back up the `/etc/` configuration directory:
+
+```bash
+tar -czpf /backup/etc-$(date +%Y%m%d-%H%M).tar.gz /etc/
+```
+
+The timestamp in the filename includes hours and minutes (`%H%M`) which is useful when creating multiple backups of the same directory in a single day. The resulting file is a self-contained archive that can be extracted anywhere.
+
+To back up a web server document root:
+
+```bash
+tar -czpf /backup/www-$(date +%Y%m%d).tar.gz /var/www/html/
+```
+
+To back up all user home directories at once:
+
+```bash
+tar -czpf /backup/home-$(date +%Y%m%d).tar.gz /home/
+```
+
+### Backing Up Multiple Directories in One Archive
+
+Multiple source paths can be specified in a single tar command:
+
+```bash
+tar -czpf /backup/config-$(date +%Y%m%d).tar.gz \
+    /etc/ \
+    /root/ \
+    /usr/local/etc/ \
+    /opt/myapp/config/
+```
+
+This creates one archive containing all four directories. When extracting, the full path structure is preserved, so `/etc/` restores to `/etc/` and `/opt/myapp/config/` restores to `/opt/myapp/config/`.
+
+### Extracting Specific Files from an Archive
+
+One advantage of tar archives over directory synchronization is the ability to extract individual files or subdirectories from a backup without restoring everything:
+
+```bash
+# List the contents of the archive to find the right path
+tar -tzf /backup/etc-20240601-0300.tar.gz | grep nginx
+
+# Extract only the nginx configuration directory
+tar -xzpf /backup/etc-20240601-0300.tar.gz -C / etc/nginx/
+```
+
+The `-C /` flag sets the extraction base directory to the filesystem root, so `etc/nginx/` from inside the archive restores to `/etc/nginx/`. Note that the path inside the archive does not begin with a slash — tar strips the leading slash by default when creating archives for safety reasons.
+
+To extract to a different location for review before overwriting live configuration:
+
+```bash
+mkdir -p /tmp/restore-review
+tar -xzpf /backup/etc-20240601-0300.tar.gz -C /tmp/restore-review etc/nginx/
+```
+
+---
+
+## Incremental Backups with rsnapshot
+
+`rsnapshot` is a filesystem snapshot utility built on top of `rsync`. It maintains multiple backup intervals — hourly, daily, weekly, monthly — each appearing as a complete directory tree, while using hard links to share unchanged files between snapshots. The result is that you can browse any snapshot and see a full picture of the filesystem at that point in time, while the total disk usage reflects only the actual changes between snapshots.
+
+### Installing rsnapshot
+
+```bash
+dnf install rsnapshot
+```
+
+### Configuration
+
+rsnapshot is configured through a single file at `/etc/rsnapshot.conf`. The format is strict: fields must be separated by tabs, not spaces. Open the file in an editor that preserves tabs:
+
+```bash
+nano /etc/rsnapshot.conf
+```
+
+Work through the key configuration sections:
+
+**Snapshot root** — where rsnapshot stores all its backup snapshots:
+
+```
+snapshot_root   /backup/rsnapshot/
+```
+
+This directory must exist and have sufficient space. rsnapshot will create subdirectories within it for each interval.
+
+**Retain intervals** — how many snapshots of each interval to keep:
+
+```
+retain  hourly  6
+retain  daily   7
+retain  weekly  4
+retain  monthly 3
+```
+
+This configuration keeps 6 hourly snapshots, 7 daily snapshots, 4 weekly snapshots, and 3 monthly snapshots. When a new snapshot is created at any interval, the oldest one at that interval is deleted and the others are rotated. The actual rotation uses directory renames rather than copies, making it extremely fast regardless of how much data is in the snapshots.
+
+**rsync options** — flags passed to the underlying rsync calls:
+
+```
+rsync_short_args    -aAX
+rsync_long_args --delete --numeric-ids --relative --delete-excluded
+```
+
+The `-aAX` flags preserve archive attributes, ACLs, and extended attributes (including SELinux contexts). The `--delete` flag removes files from the destination that no longer exist in the source, keeping each snapshot current.
+
+**Backup points** — which directories to include in snapshots:
+
+```
+backup  /etc/   localhost/
+backup  /home/  localhost/
+backup  /root/  localhost/
+backup  /var/www/   localhost/
+backup  /usr/local/ localhost/
+```
+
+Each `backup` line specifies a source path and a destination path relative to the snapshot root. The destination `localhost/` is a conventional prefix for local sources, making it easier to distinguish from remote sources if you later add remote backup points.
+
+**Excluding paths** — directories to skip within backup points:
+
+```
+exclude /home/*/.cache/
+exclude /home/*/Downloads/
+exclude /var/www/*/cache/
+```
+
+Exclusion patterns apply relative to the backup point source. Here, each user's `.cache/` and `Downloads/` directory is excluded from the `/home/` backup, reducing backup size for data that is either transient or easily regenerated.
+
+### Validating the Configuration
+
+Before running rsnapshot for the first time, validate the configuration file:
+
+```bash
+rsnapshot configtest
+```
+
+If the output is `Syntax OK`, the configuration is valid. If there are errors, they will be reported with the relevant line number. The most common error is using spaces instead of tabs between fields.
+
+### Running rsnapshot Manually
+
+To create the first snapshot manually and verify everything works:
+
+```bash
+rsnapshot daily
+```
+
+This creates the first daily snapshot at `/backup/rsnapshot/daily.0/`. Browse it to confirm the expected directories are present:
+
+```bash
+ls /backup/rsnapshot/daily.0/localhost/
+```
+
+Run it a second time to verify rotation:
+
+```bash
+rsnapshot daily
+```
+
+Now `daily.0/` contains the most recent snapshot and `daily.1/` contains the previous one. Both appear as complete directory trees, but unchanged files between them are hard links to the same underlying data.
+
+To verify that hard linking is working — that the two snapshots are not consuming twice the disk space:
+
+```bash
+du -sh /backup/rsnapshot/daily.0/
+du -sh /backup/rsnapshot/daily.1/
+du -sh /backup/rsnapshot/
+```
+
+The total size of the rsnapshot directory should be close to the size of one snapshot, not the sum of both.
+
+### Scheduling rsnapshot with Cron
+
+rsnapshot is designed to be driven by cron. Add entries to `/etc/cron.d/rsnapshot`:
+
+```bash
+nano /etc/cron.d/rsnapshot
+```
+
+```
+# Run hourly snapshots at 0 minutes past each hour
+0 * * * *   root   /usr/bin/rsnapshot hourly
+
+# Run daily snapshots at 03:30, before the weekly/monthly jobs
+30 3 * * *  root   /usr/bin/rsnapshot daily
+
+# Run weekly snapshots on Sunday at 03:00
+0 3 * * 0   root   /usr/bin/rsnapshot weekly
+
+# Run monthly snapshots on the 1st at 02:30
+30 2 1 * *  root   /usr/bin/rsnapshot monthly
+```
+
+The timing matters: the longer intervals must run before the shorter ones at the same time to ensure correct rotation. Daily should run after hourly; weekly should run after daily. In the schedule above, monthly runs earliest (02:30), then weekly (03:00), then daily (03:30), and hourly runs throughout the day.
+
+:::tip
+rsnapshot logs to syslog by default. To verify it is running correctly after setting up cron, check `/var/log/messages` the morning after the first scheduled run:
+
+```bash
+grep rsnapshot /var/log/messages
+```
+
+Each successful run logs a completion message. Errors are also logged here, making it easy to detect problems without reviewing rsnapshot's output directly.
+:::
+
+### Adding Remote Backup Sources
+
+rsnapshot can back up remote hosts over SSH in addition to local directories. Add remote backup points to `rsnapshot.conf`:
+
+```
+backup  root@dbserver.example.com:/etc/ dbserver/
+backup  root@dbserver.example.com:/var/lib/pgsql/   dbserver/
+```
+
+The remote host must have rsync installed and the backup user must be able to connect via SSH key without a password prompt. Test the connection manually before relying on it in scheduled backups:
+
+```bash
+rsync -aAXn root@dbserver.example.com:/etc/ /tmp/test-fetch/
+```
+
+The `-n` flag runs rsync in dry-run mode, showing what would be transferred without actually copying anything.
+
+---
+
+## Backing Up Specific Filesystem Types
+
+AlmaLinux systems often have multiple filesystems mounted at different points, and each may warrant a different backup approach based on its content and change rate.
+
+### /etc/ — Configuration Backups
+
+`/etc/` changes relatively infrequently but contains critical configuration. A dedicated backup of `/etc/` before any significant change — a package update, configuration edit, or service migration — is a safety net that has saved many administrators from difficult recovery situations.
+
+Create a pre-change configuration snapshot:
+
+```bash
+tar -czpf /root/etc-before-$(date +%Y%m%d-%H%M).tar.gz /etc/
+```
+
+Store this in `/root/` rather than `/backup/` for immediate accessibility. This is a manual checkpoint, not a scheduled backup — it should be created deliberately before risky changes.
+
+### /var/lib/ — Application State
+
+`/var/lib/` contains the persistent state for installed services: database files, package manager state, containerruntime storage, and more. Some of these — particularly live database files — should not be backed up directly while the service is running, because the files may be in an inconsistent state mid-transaction.
+
+The correct approach for databases is to use the database's own dump or export mechanism to create a consistent snapshot, then back up the dump file:
+
+```bash
+# Create a consistent PostgreSQL dump
+pg_dumpall -U postgres > /backup/pgsql-$(date +%Y%m%d).sql
+
+# Back up the dump file
+tar -czpf /backup/pgsql-$(date +%Y%m%d).sql.gz /backup/pgsql-$(date +%Y%m%d).sql
+rm /backup/pgsql-$(date +%Y%m%d).sql
+```
+
+For MySQL or MariaDB:
+
+```bash
+mysqldump --all-databases --single-transaction --routines --events \
+    > /backup/mysql-$(date +%Y%m%d).sql
+gzip /backup/mysql-$(date +%Y%m%d).sql
+```
+
+The `--single-transaction` flag creates a consistent dump without locking tables, making it safe to run against a live database.
+
+### /home/ — User Data
+
+`/home/` typically contains the largest volume of user data and changes frequently. rsnapshot's incremental approach is well-suited here because most files in a home directory change infrequently relative to the total size, so each incremental snapshot transfers only a small fraction of the total.
+
+If individual users should be able to restore their own files, consider making the rsnapshot backup directory readable by the relevant users:
+
+```bash
+chmod 750 /backup/rsnapshot/
+chmod 750 /backup/rsnapshot/daily.0/localhost/home/
+chown root:users /backup/rsnapshot/daily.0/localhost/home/
+```
+
+Users in the `users` group can then browse their own backup snapshots directly. This reduces restore requests that would otherwise require administrator involvement for routine file recovery.
+
+### /boot/ — Boot Files
+
+`/boot/` contains the kernel, initramfs images, and GRUB configuration. It changes only when packages are updated or the bootloader is reconfigured. Include it in any full system backup, but also back it up explicitly before kernel updates:
+
+```bash
+tar -czpf /backup/boot-$(date +%Y%m%d).tar.gz /boot/
+```
+
+Note that restoring `/boot/` files alone is not sufficient to recover a broken bootloader — the GRUB binary in the MBR or EFI partition must also be intact. Boot recovery is covered in the [Restore Procedures](./restore-procedures) page.
+
+---
+
+## Managing Backup Generations and Retention
+
+Keeping every backup forever is not practical. A rotation strategy defines how many backups to keep at each time scale and when to discard older ones.
+
+### Manual Rotation with tar Archives
+
+For tar-based backups without rsnapshot, a simple retention approach keeps a fixed number of the most recent archives and deletes the rest. The following removes tar archives older than 30 days from the backup directory:
+
+```bash
+find /backup/ -name "*.tar.gz" -mtime +30 -delete
+```
+
+The `-mtime +30` condition matches files whose modification time is more than 30 days ago. Run this after each new backup is created to keep the directory from growing indefinitely.
+
+For a more structured rotation — keeping daily backups for a week, weekly backups for a month, and monthly backups for a year — the naming convention of backup files matters. Using consistent date-based filenames makes it straightforward to identify which files correspond to which time periods and delete accordingly.
+
+### Monitoring rsnapshot Disk Usage
+
+rsnapshot can grow to consume significant disk space if the source data changes rapidly or retention counts are high. Monitor the backup destination regularly:
+
+```bash
+du -sh /backup/rsnapshot/*/
+```
+
+This shows the apparent size of each snapshot interval directory. Because of hard linking, the apparent sizes do not add up to the total actual disk usage — `du -sh /backup/rsnapshot/` gives the true total.
+
+To see how much each snapshot interval is actually consuming in unique (non-shared) blocks:
+
+```bash
+du -sh --count-links /backup/rsnapshot/daily.*/
+```
+
+The `--count-links` flag counts hard-linked files multiple times, giving the apparent size rather than the shared size. Comparing apparent size to actual size reveals how much deduplication rsnapshot's hard linking is achieving.
+
+---
+
+## Verifying Filesystem Backups
+
+A backup that cannot be restored is not a backup. Regularly verify that your filesystem backups are intact and recoverable.
+
+For tar archives, verify the archive is readable and complete:
+
+```bash
+tar -tzf /backup/etc-20240601-0300.tar.gz > /dev/null && echo "OK" || echo "CORRUPT"
+```
+
+For rsnapshot backups, the backup directory is a live filesystem tree — you can verify it by listing its contents and checking file counts match the source:
+
+```bash
+# Count files in the live source
+find /etc/ -type f | wc -l
+
+# Count files in the most recent snapshot
+find /backup/rsnapshot/daily.0/localhost/etc/ -type f | wc -l
+```
+
+The counts should match (or be very close, accounting for files created or deleted between the snapshot and the count). A significant discrepancy indicates a problem with the backup.
+
+The most thorough verification is a test restore to a temporary location:
+
+```bash
+mkdir -p /tmp/restore-test
+tar -xzpf /backup/etc-20240601-0300.tar.gz -C /tmp/restore-test
+ls /tmp/restore-test/etc/
+diff -rq /etc/ /tmp/restore-test/etc/ 2>/dev/null | head -20
+rm -rf /tmp/restore-test
+```
+
+Running `diff` between the live directory and the restored copy surfaces any files that differ, which may indicate backup issues or simply files that changed between backup time and now. Either way, it confirms the archive is extractable and structured correctly.
+
+---
+
+## Summary
+
+Filesystem backups on AlmaLinux range from simple one-off tar archives of individual directories to automated multi-generation incremental snapshots managed by rsnapshot. The right approach depends on the size of the data, how frequently it changes, and how many historical versions you need to keep.
+
+Key points to remember:
+
+- Use `tar -czpf` for simple, self-contained directory archives; include `-p` to preserve permissions
+- Use `rsync -aAX` to preserve ACLs and SELinux extended attributes — omitting `-X` will lose SELinux contexts
+- rsnapshot automates hard-link incremental backups; configure intervals and retention in `/etc/rsnapshot.conf`
+- Configuration fields in `rsnapshot.conf` must be separated by tabs, not spaces — use `rsnapshot configtest` to validate
+- Never back up live database files directly; use the database's own dump tool to create a consistent export first
+- Use `find /backup/ -name "*.tar.gz" -mtime +30 -delete` to implement simple retention for tar archives
+- Test restores periodically — a backup you have never restored from is an untested backup
+
+### Related Pages
+
+- [System Backup](./system-backup) — full system backup strategies with tar, rsync, and LVM snapshots
+- [Automated Backup](./automated-backup) — scheduling backups with cron and systemd timers
+- [Restore Procedures](./restore-procedures) — recovering files and directories from backups
+- [Backup Verification](./backup-verification) — systematically testing backup integrity
+- [Remote Backup](./remote-backup) — sending backups to remote and cloud destinations

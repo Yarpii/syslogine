@@ -1,0 +1,487 @@
+---
+sidebar_position: 4
+title: "Centralized Logging | AlmaLinux"
+sidebar_label: "Centralized Logging"
+description: "Set up centralized log collection on AlmaLinux using rsyslog, configure log forwarding from clients to a central server, and manage aggregated logs efficiently."
+keywords:
+  - "almalinux centralized logging"
+  - "almalinux rsyslog server"
+  - "almalinux log forwarding"
+  - "almalinux remote logging"
+  - "rhel centralized logging"
+tags:
+  - almalinux
+  - log-management
+  - rsyslog
+  - centralized-logging
+slug: /linux/almalinux/administration/log-management/centralized-logging
+---
+
+# Centralized Logging on AlmaLinux
+
+When you manage more than a handful of servers, checking logs individually on each machine becomes impractical. A centralized logging setup solves this by forwarding log entries from all your servers to a single location — a log server — where they can be stored, searched, and monitored together. This gives you a unified view of your infrastructure and makes it far easier to correlate events across systems.
+
+On AlmaLinux, `rsyslog` is the default logging daemon and supports both sending and receiving logs over the network. This page explains how to configure a central log server that receives logs from multiple clients, how to configure client systems to forward their logs, and how to keep the resulting data organized and manageable.
+
+---
+
+## Architecture Overview
+
+A centralized logging setup has two roles: the **log server** (sometimes called the log aggregator or collector) and the **log clients** (the systems whose logs are being forwarded).
+
+The log server runs rsyslog in listening mode, accepting incoming log messages on a network port. The clients run rsyslog configured to forward their logs to the server's address, either in addition to or instead of writing them locally.
+
+```
+[ Client A ]  ──┐
+[ Client B ]  ──┼──▶  [ Log Server ]  ──▶  /var/log/remote/<hostname>/
+[ Client C ]  ──┘
+```
+
+Logs are typically forwarded over UDP (port 514) or TCP (port 514). UDP is simpler and lower overhead but provides no delivery guarantee — messages can be lost under network congestion. TCP is more reliable and is the preferred choice for production environments. For encrypted transport, rsyslog also supports TLS over TCP, which is covered later on this page.
+
+---
+
+## Configuring the Log Server
+
+### Installing and Enabling rsyslog
+
+rsyslog is installed by default on AlmaLinux. Verify it is present and running:
+
+```bash
+rpm -q rsyslog
+systemctl status rsyslog
+```
+
+If it is not installed:
+
+```bash
+dnf install rsyslog
+systemctl enable --now rsyslog
+```
+
+### Configuring rsyslog to Listen for Incoming Connections
+
+The main rsyslog configuration file is `/etc/rsyslog.conf`. The listening configuration is controlled by input modules. Open the file in your editor:
+
+```bash
+nano /etc/rsyslog.conf
+```
+
+To enable TCP reception, find and uncomment (or add) the following lines:
+
+```
+module(load="imtcp")
+input(type="imtcp" port="514")
+```
+
+To enable UDP reception alongside TCP:
+
+```
+module(load="imudp")
+input(type="imudp" port="514")
+```
+
+In most setups you will use TCP only, or both. UDP can be enabled for legacy clients that only support it.
+
+### Organizing Incoming Logs by Hostname
+
+Without explicit configuration, all incoming log messages would be written to the same files as local logs, making it impossible to distinguish which client a message came from. The standard approach is to write incoming logs into per-host subdirectories under `/var/log/remote/`.
+
+Add the following template and ruleset to `/etc/rsyslog.conf`, or create a dedicated drop-in file at `/etc/rsyslog.d/remote.conf`:
+
+```bash
+nano /etc/rsyslog.d/remote.conf
+```
+
+```
+# Create a template that stores logs per client hostname
+template(name="RemoteHostLogs" type="string"
+  string="/var/log/remote/%HOSTNAME%/%PROGRAMNAME%.log")
+
+# Apply this template to all messages received over the network
+ruleset(name="remote") {
+    action(type="omfile" dynaFile="RemoteHostLogs")
+}
+
+# Bind the TCP input to this ruleset
+module(load="imtcp")
+input(type="imtcp" port="514" ruleset="remote")
+```
+
+This configuration routes all TCP-received messages through the `remote` ruleset, which writes each message to a file named after the sending program, inside a directory named after the sending hostname. For example, SSH messages from a host named `web01` would be written to `/var/log/remote/web01/sshd.log`.
+
+Create the base directory for remote logs:
+
+```bash
+mkdir -p /var/log/remote
+```
+
+rsyslog will create per-host subdirectories automatically when the first message from each host arrives.
+
+### Restarting rsyslog
+
+After any configuration change, restart rsyslog and check for errors:
+
+```bash
+systemctl restart rsyslog
+systemctl status rsyslog
+```
+
+If the configuration contains syntax errors, rsyslog will report them here. You can also validate the configuration without restarting:
+
+```bash
+rsyslogd -N1
+```
+
+The `-N1` flag runs a configuration check and exits without starting the daemon. Any errors are printed to stderr.
+
+### Opening the Firewall
+
+The log server needs to accept connections on port 514. Add the appropriate firewall rules:
+
+```bash
+# For TCP
+firewall-cmd --permanent --add-port=514/tcp
+# For UDP (if needed)
+firewall-cmd --permanent --add-port=514/udp
+firewall-cmd --reload
+```
+
+Verify the rules are in place:
+
+```bash
+firewall-cmd --list-ports
+```
+
+---
+
+## Configuring Log Clients
+
+On each client system that should forward logs to the server, you configure rsyslog to send its messages to the server's address. The client still writes logs locally by default — forwarding is additive unless you explicitly suppress local writes.
+
+### Forwarding All Logs to the Server
+
+Create a drop-in configuration file on the client:
+
+```bash
+nano /etc/rsyslog.d/forward.conf
+```
+
+To forward all messages to the log server over TCP:
+
+```
+*.* action(type="omfwd"
+           target="logserver.example.com"
+           port="514"
+           protocol="tcp")
+```
+
+Replace `logserver.example.com` with the hostname or IP address of your log server. The `*.*` selector means all facilities and all severities.
+
+After saving, restart rsyslog on the client:
+
+```bash
+systemctl restart rsyslog
+```
+
+### Forwarding Only Specific Facilities or Severities
+
+You do not always need to forward every log message. Forwarding only relevant messages reduces bandwidth and storage requirements on the server. The facility and severity selectors work the same way as in standard rsyslog rules.
+
+To forward only authentication-related messages:
+
+```
+auth,authpriv.* action(type="omfwd"
+                        target="logserver.example.com"
+                        port="514"
+                        protocol="tcp")
+```
+
+To forward warnings and above from all facilities:
+
+```
+*.warning action(type="omfwd"
+                  target="logserver.example.com"
+                  port="514"
+                  protocol="tcp")
+```
+
+To forward everything except debug messages:
+
+```
+*.!debug action(type="omfwd"
+                 target="logserver.example.com"
+                 port="514"
+                 protocol="tcp")
+```
+
+### Queuing for Reliability
+
+By default, if the log server is unreachable, the client will drop messages that cannot be delivered. For production environments, configuring a disk-based queue ensures that messages are buffered locally and forwarded once the server becomes available again.
+
+Add queue parameters to the forwarding action:
+
+```
+*.* action(type="omfwd"
+           target="logserver.example.com"
+           port="514"
+           protocol="tcp"
+           action.resumeRetryCount="-1"
+           queue.type="LinkedList"
+           queue.filename="fwdqueue"
+           queue.saveOnShutdown="on"
+           queue.maxDiskSpace="100m")
+```
+
+Each parameter serves a specific purpose:
+
+- `action.resumeRetryCount="-1"` — retry indefinitely rather than giving up after a fixed number of attempts
+- `queue.type="LinkedList"` — use an in-memory linked list queue (backed by disk when the file parameters are set)
+- `queue.filename="fwdqueue"` — the name used for queue files on disk (stored under rsyslog's working directory, `/var/lib/rsyslog/` by default)
+- `queue.saveOnShutdown="on"` — flush the queue to disk when rsyslog stops, so messages are not lost on reboot
+- `queue.maxDiskSpace="100m"` — cap the disk space used by the queue at 100 MB
+
+:::tip
+Disk-backed queues are strongly recommended for any client in a production environment. Without them, a log server restart or brief network interruption will silently discard log messages from all forwarding clients.
+:::
+
+---
+
+## Verifying the Setup
+
+After configuring both the server and at least one client, verify that logs are arriving on the server.
+
+On the client, generate a test log message using `logger`:
+
+```bash
+logger -p auth.info "Test message from $(hostname) to log server"
+```
+
+On the server, check whether the message arrived:
+
+```bash
+ls /var/log/remote/
+```
+
+You should see a directory named after the client's hostname. Inside it:
+
+```bash
+ls /var/log/remote/web01/
+cat /var/log/remote/web01/logger.log
+```
+
+The test message should appear there. If the directory is empty or missing, check:
+
+1. That the firewall on the server allows port 514
+2. That rsyslog is running on both systems (`systemctl status rsyslog`)
+3. That the client's `/etc/rsyslog.d/forward.conf` contains the correct server address
+4. Whether SELinux is blocking the connection (see below)
+
+### Checking SELinux
+
+SELinux on AlmaLinux may block rsyslog from binding to port 514 or from accepting remote connections if the policy is not configured correctly. Check for AVC denials:
+
+```bash
+ausearch -m avc -ts recent | grep rsyslog
+```
+
+If you see denials related to rsyslog and port 514, the `syslogd_can_network` boolean may need to be enabled:
+
+```bash
+setsebool -P syslogd_can_network on
+```
+
+To allow rsyslog to write to custom directories under `/var/log/remote/`, you may also need to set the correct SELinux context on that directory:
+
+```bash
+semanage fcontext -a -t var_log_t "/var/log/remote(/.*)?"
+restorecon -Rv /var/log/remote/
+```
+
+---
+
+## Encrypting Log Transport with TLS
+
+Logs frequently contain sensitive information: authentication events, error messages with usernames, application stack traces. Sending this data over a network in plaintext exposes it to anyone who can observe the traffic. For environments where this matters, rsyslog supports TLS-encrypted transport.
+
+TLS requires certificates. The simplest setup uses a self-signed CA that you control — the log server acts as the CA and signs certificates for itself and for each client. For larger environments, you would use your organization's existing PKI infrastructure.
+
+### Generating Certificates
+
+Install the required tool:
+
+```bash
+dnf install gnutls-utils
+```
+
+Generate a CA key and self-signed certificate:
+
+```bash
+certtool --generate-privkey --outfile /etc/rsyslog-ca-key.pem
+certtool --generate-self-signed --load-privkey /etc/rsyslog-ca-key.pem --outfile /etc/rsyslog-ca.pem
+```
+
+When prompted, provide values appropriate to your environment. The key fields are the CA flag (set to yes) and the signing authority flag.
+
+Generate a key and certificate for the log server:
+
+```bash
+certtool --generate-privkey --outfile /etc/rsyslog-server-key.pem
+certtool --generate-certificate \
+         --load-privkey /etc/rsyslog-server-key.pem \
+         --load-ca-certificate /etc/rsyslog-ca.pem \
+         --load-ca-privkey /etc/rsyslog-ca-key.pem \
+         --outfile /etc/rsyslog-server-cert.pem
+```
+
+Repeat the certificate generation process for each client, replacing `server` with the client hostname in the filenames. Distribute the CA certificate and the client's key/cert to each client, and the CA certificate and server key/cert to the server.
+
+### Configuring TLS on the Server
+
+Install the rsyslog TLS module:
+
+```bash
+dnf install rsyslog-gnutls
+```
+
+Update the server's `/etc/rsyslog.d/remote.conf` to use TLS:
+
+```
+module(load="imtcp"
+       StreamDriver.Name="gtls"
+       StreamDriver.Mode="1"
+       StreamDriver.Authmode="x509/name")
+
+global(
+  DefaultNetstreamDriver="gtls"
+  DefaultNetstreamDriverCAFile="/etc/rsyslog-ca.pem"
+  DefaultNetstreamDriverCertFile="/etc/rsyslog-server-cert.pem"
+  DefaultNetstreamDriverKeyFile="/etc/rsyslog-server-key.pem"
+)
+
+input(type="imtcp" port="6514" ruleset="remote")
+```
+
+Note the port change to 6514 — this is the conventional port for syslog-over-TLS (RFC 5425), which avoids conflicts with plaintext syslog on port 514. Update the firewall accordingly:
+
+```bash
+firewall-cmd --permanent --add-port=6514/tcp
+firewall-cmd --reload
+```
+
+### Configuring TLS on the Client
+
+Install the TLS module on the client as well:
+
+```bash
+dnf install rsyslog-gnutls
+```
+
+Update the client's forward configuration:
+
+```
+global(
+  DefaultNetstreamDriver="gtls"
+  DefaultNetstreamDriverCAFile="/etc/rsyslog-ca.pem"
+  DefaultNetstreamDriverCertFile="/etc/rsyslog-client-cert.pem"
+  DefaultNetstreamDriverKeyFile="/etc/rsyslog-client-key.pem"
+)
+
+*.* action(type="omfwd"
+           target="logserver.example.com"
+           port="6514"
+           protocol="tcp"
+           StreamDriver="gtls"
+           StreamDriverMode="1"
+           StreamDriverAuthMode="x509/name")
+```
+
+Restart rsyslog on both the server and client after applying TLS configuration.
+
+:::warning
+Keep CA private keys (`-ca-key.pem` files) secure and off the network. If the CA key is compromised, an attacker can issue certificates that your log server will trust. Store it on a dedicated offline system or in a secrets manager if your environment supports it.
+:::
+
+---
+
+## Managing Log Volume on the Server
+
+A central log server receiving logs from many clients can accumulate significant data quickly. The same logrotate tooling used for local logs applies to the files in `/var/log/remote/`, but requires configuration that accounts for the dynamic per-host directory structure.
+
+Create a logrotate configuration for remote logs:
+
+```bash
+nano /etc/logrotate.d/remote-logs
+```
+
+```
+/var/log/remote/*/*.log {
+    daily
+    rotate 30
+    compress
+    missingok
+    notifempty
+    sharedscripts
+    postrotate
+        /usr/bin/systemctl kill -s HUP rsyslog.service >/dev/null 2>&1 || true
+    endscript
+}
+```
+
+The glob pattern `/var/log/remote/*/*.log` matches all log files in all per-host subdirectories. The `postrotate` script sends a HUP signal to rsyslog, causing it to close and reopen its output files — essential for logrotate to work correctly with a running logging daemon.
+
+Test the configuration:
+
+```bash
+logrotate --debug /etc/logrotate.d/remote-logs
+```
+
+The `--debug` flag runs logrotate in dry-run mode, showing what it would do without actually rotating anything.
+
+---
+
+## Monitoring the Log Server
+
+The log server itself should be monitored to ensure it is functioning correctly. A few key things to watch:
+
+Disk usage on the partition holding `/var/log/remote/` should be checked regularly. As more clients are added or log volume increases, it is easy to run out of space:
+
+```bash
+df -h /var/log/remote/
+```
+
+To see the largest per-host directories:
+
+```bash
+du -sh /var/log/remote/* | sort -rh | head -20
+```
+
+rsyslog's own logs appear in `/var/log/messages` on the server. Watch for errors related to queue overflows, connection failures, or write errors:
+
+```bash
+journalctl -u rsyslog -p warning --since "1 hour ago"
+```
+
+---
+
+## Summary
+
+Centralized logging on AlmaLinux is built on rsyslog's ability to both send and receive log messages over the network. The server is configured with an input module and a per-hostname template to keep incoming logs organized. Clients forward their logs using the `omfwd` output module, with disk-backed queues for reliability. TLS encrypts the transport for environments where log confidentiality matters.
+
+Key points to remember:
+
+- Use TCP rather than UDP for reliable log forwarding in production
+- Configure disk-backed queues on clients to buffer logs during server downtime
+- Organize incoming logs by hostname using rsyslog's dynamic file templates
+- Open port 514/tcp (or 6514/tcp for TLS) in the firewall on the log server
+- Check SELinux policies if rsyslog cannot bind to ports or write to custom directories
+- Apply logrotate to `/var/log/remote/` to prevent the log server from filling its disk
+- Keep CA private keys offline and secure when using TLS
+
+### Related Pages
+
+- [System Logging](./system-logging) — rsyslog configuration fundamentals
+- [Log Rotation](./log-rotation) — managing retention with logrotate and journald
+- [Log Analysis](./log-analysis) — querying and parsing logs with journalctl and grep
+- [Audit Logging](./audit-logging) — security-focused event tracking with auditd
+- [Secure Logging](./secure-logging) — hardening log integrity and access controls

@@ -1,0 +1,511 @@
+---
+sidebar_position: 6
+title: "Enterprise Alerting | AlmaLinux"
+sidebar_label: "Enterprise Alerting"
+description: "Configure SNMP, email alerts, and integrate with Nagios, Zabbix, and enterprise notification systems on AlmaLinux."
+keywords:
+  - "almalinux enterprise alerting"
+  - "almalinux snmp"
+  - "almalinux nagios"
+  - "almalinux zabbix"
+  - "rhel monitoring alerting"
+tags:
+  - almalinux
+  - system-monitoring
+  - alerting
+  - snmp
+  - nagios
+  - zabbix
+slug: /linux/almalinux/administration/system-monitoring/enterprise-alerting
+---
+
+# Enterprise Alerting
+
+Monitoring without alerting is just data collection. Enterprise alerting ensures that when something goes wrong — a service goes down, disk fills up, or CPU spikes — the right people are notified through the right channels before users are impacted. AlmaLinux supports a full range of alerting methods, from simple email notifications to deep integration with Nagios, Zabbix, and SNMP-based monitoring platforms.
+
+## Email alerting with postfix and mailx
+
+The simplest alerting method is email. Most monitoring scripts can send alerts via a local mail relay.
+
+### Install and configure a local mail relay
+
+```bash
+sudo dnf install -y postfix mailx
+
+sudo systemctl enable --now postfix
+```
+
+Configure postfix to relay through an external SMTP server:
+
+```bash
+sudo nano /etc/postfix/main.cf
+```
+
+```ini
+# Set the hostname
+myhostname = server.example.com
+
+# Relay all mail through an external SMTP server
+relayhost = [smtp.example.com]:587
+
+# SASL authentication
+smtp_sasl_auth_enable = yes
+smtp_sasl_password_maps = hash:/etc/postfix/sasl_passwd
+smtp_sasl_security_options = noanonymous
+
+# TLS encryption
+smtp_tls_security_level = encrypt
+smtp_tls_CAfile = /etc/pki/tls/certs/ca-bundle.crt
+```
+
+Create the SASL password file:
+
+```bash
+sudo nano /etc/postfix/sasl_passwd
+```
+
+```
+[smtp.example.com]:587  username@example.com:password
+```
+
+Secure and apply it:
+
+```bash
+sudo chmod 600 /etc/postfix/sasl_passwd
+sudo postmap /etc/postfix/sasl_passwd
+sudo systemctl restart postfix
+```
+
+Test email delivery:
+
+```bash
+echo "Test alert from $(hostname)" | mail -s "Test Alert" ops@example.com
+```
+
+## SNMP configuration
+
+SNMP (Simple Network Management Protocol) allows network management systems to query your server for health metrics and receive traps when problems occur.
+
+### Install and configure SNMP
+
+```bash
+sudo dnf install -y net-snmp net-snmp-utils
+```
+
+```bash
+sudo nano /etc/snmp/snmpd.conf
+```
+
+```ini
+# SNMPv3 user (recommended over v1/v2c)
+createUser monitoring SHA "AuthPassword123" AES "PrivPassword123"
+rouser monitoring priv
+
+# Allow access from the monitoring server only
+rocommunity public 192.168.1.0/24
+
+# System information
+syslocation "Server Room A, Rack 3"
+syscontact ops@example.com
+
+# Extend with custom checks
+extend .1.3.6.1.4.1.2021.13.15.1.1.2 disk-root /bin/df -h /
+```
+
+Enable and start:
+
+```bash
+sudo systemctl enable --now snmpd
+
+# Open firewall for SNMP
+sudo firewall-cmd --permanent --add-service=snmp
+sudo firewall-cmd --reload
+```
+
+Test SNMP from a remote host:
+
+```bash
+# SNMPv2c walk
+snmpwalk -v2c -c public server.example.com system
+
+# SNMPv3 query
+snmpget -v3 -u monitoring -l authPriv \
+  -a SHA -A "AuthPassword123" \
+  -x AES -X "PrivPassword123" \
+  server.example.com sysUpTime.0
+```
+
+### Configure SNMP traps
+
+SNMP traps push notifications to a monitoring server when events occur.
+
+```bash
+sudo nano /etc/snmp/snmpd.conf
+```
+
+Add:
+
+```ini
+# Send traps to the monitoring server
+trap2sink 192.168.1.10 public
+
+# Send traps for disk, memory, and load threshold breaches
+disk / 85%
+load 12 10 8
+```
+
+Restart snmpd:
+
+```bash
+sudo systemctl restart snmpd
+```
+
+## Nagios / Nagios Core integration
+
+Nagios monitors hosts and services and alerts when checks fail.
+
+### Install the NRPE agent
+
+NRPE (Nagios Remote Plugin Executor) allows the Nagios server to run checks on remote hosts.
+
+```bash
+sudo dnf install -y epel-release
+sudo dnf install -y nrpe nagios-plugins-all
+```
+
+Configure NRPE:
+
+```bash
+sudo nano /etc/nagios/nrpe.cfg
+```
+
+```ini
+# Allow connections from the Nagios server
+allowed_hosts=127.0.0.1,192.168.1.10
+
+# Define local checks
+command[check_disk]=/usr/lib64/nagios/plugins/check_disk -w 20% -c 10% -p /
+command[check_load]=/usr/lib64/nagios/plugins/check_load -w 5,4,3 -c 10,8,6
+command[check_mem]=/usr/lib64/nagios/plugins/check_mem -w 80 -c 90
+command[check_ssh]=/usr/lib64/nagios/plugins/check_ssh -H localhost
+command[check_procs]=/usr/lib64/nagios/plugins/check_procs -w 250 -c 400
+```
+
+Enable and start NRPE:
+
+```bash
+sudo systemctl enable --now nrpe
+
+# Open firewall for NRPE
+sudo firewall-cmd --permanent --add-port=5666/tcp
+sudo firewall-cmd --reload
+```
+
+Test from the Nagios server:
+
+```bash
+/usr/lib64/nagios/plugins/check_nrpe -H server.example.com -c check_disk
+/usr/lib64/nagios/plugins/check_nrpe -H server.example.com -c check_load
+```
+
+### Write a custom Nagios check
+
+```bash
+sudo nano /usr/lib64/nagios/plugins/check_custom_service
+```
+
+```bash
+#!/bin/bash
+# Custom Nagios check — returns 0=OK, 1=WARNING, 2=CRITICAL, 3=UNKNOWN
+
+SERVICE="nginx"
+
+if systemctl is-active --quiet "$SERVICE"; then
+  echo "OK: $SERVICE is running"
+  exit 0
+else
+  echo "CRITICAL: $SERVICE is not running"
+  exit 2
+fi
+```
+
+```bash
+sudo chmod +x /usr/lib64/nagios/plugins/check_custom_service
+```
+
+Add to `nrpe.cfg`:
+
+```ini
+command[check_nginx]=/usr/lib64/nagios/plugins/check_custom_service
+```
+
+## Zabbix agent integration
+
+Zabbix is a full enterprise monitoring platform. The Zabbix agent runs on each monitored host and sends data to the Zabbix server.
+
+### Install the Zabbix agent
+
+```bash
+sudo dnf install -y https://repo.zabbix.com/zabbix/6.4/rhel/9/x86_64/zabbix-release-6.4-1.el9.noarch.rpm
+sudo dnf install -y zabbix-agent2
+```
+
+Configure the agent:
+
+```bash
+sudo nano /etc/zabbix/zabbix_agent2.conf
+```
+
+```ini
+# Zabbix server address
+Server=192.168.1.10
+ServerActive=192.168.1.10
+
+# This host's hostname as it appears in Zabbix
+Hostname=server.example.com
+
+# Allow remote commands from the Zabbix server
+AllowKey=system.run[*]
+
+# Custom user parameters
+UserParameter=custom.disk.usage,df / | awk 'NR==2 {print $5}' | tr -d '%'
+UserParameter=custom.service.nginx,systemctl is-active nginx | grep -c active
+```
+
+Enable and start:
+
+```bash
+sudo systemctl enable --now zabbix-agent2
+
+# Open firewall for Zabbix agent
+sudo firewall-cmd --permanent --add-port=10050/tcp
+sudo firewall-cmd --reload
+```
+
+Test connectivity from the Zabbix server:
+
+```bash
+zabbix_get -s server.example.com -p 10050 -k system.uptime
+zabbix_get -s server.example.com -p 10050 -k custom.disk.usage
+```
+
+## Alertmanager with Prometheus
+
+If you use Prometheus for metrics collection, Alertmanager handles routing and deduplication of alerts.
+
+### Basic Alertmanager configuration
+
+```bash
+sudo nano /etc/alertmanager/alertmanager.yml
+```
+
+```yaml
+global:
+  smtp_smarthost: 'smtp.example.com:587'
+  smtp_from: 'alertmanager@example.com'
+  smtp_auth_username: 'alertmanager@example.com'
+  smtp_auth_password: 'password'
+  smtp_require_tls: true
+
+route:
+  group_by: ['alertname', 'instance']
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+  receiver: 'ops-email'
+
+  routes:
+    - match:
+        severity: critical
+      receiver: 'ops-pagerduty'
+
+receivers:
+  - name: 'ops-email'
+    email_configs:
+      - to: 'ops@example.com'
+
+  - name: 'ops-pagerduty'
+    pagerduty_configs:
+      - service_key: 'your-pagerduty-key'
+
+inhibit_rules:
+  - source_match:
+      severity: 'critical'
+    target_match:
+      severity: 'warning'
+    equal: ['alertname', 'instance']
+```
+
+### Example Prometheus alert rules
+
+```bash
+sudo nano /etc/prometheus/rules/almalinux.yml
+```
+
+```yaml
+groups:
+  - name: almalinux
+    rules:
+      - alert: HighCPULoad
+        expr: 100 - (avg by(instance) (rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100) > 85
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High CPU load on {{ $labels.instance }}"
+          description: "CPU usage is above 85% for 5 minutes."
+
+      - alert: DiskSpaceLow
+        expr: (node_filesystem_avail_bytes / node_filesystem_size_bytes) * 100 < 15
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Low disk space on {{ $labels.instance }}"
+          description: "Filesystem {{ $labels.mountpoint }} has less than 15% free."
+
+      - alert: ServiceDown
+        expr: node_systemd_unit_state{state="active"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Service down on {{ $labels.instance }}"
+          description: "Systemd unit {{ $labels.name }} is not active."
+
+      - alert: HighMemoryUsage
+        expr: (1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)) * 100 > 90
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High memory usage on {{ $labels.instance }}"
+          description: "Memory usage is above 90% for 5 minutes."
+```
+
+## Slack and webhook notifications
+
+Many teams prefer chat-based alerting. Most monitoring tools support webhooks.
+
+### Send alerts to Slack from a script
+
+```bash
+#!/bin/bash
+# slack-alert.sh — send an alert message to a Slack channel
+
+WEBHOOK_URL="https://hooks.slack.com/services/YOUR/WEBHOOK/URL"
+MESSAGE="$1"
+HOSTNAME=$(hostname)
+
+curl -s -X POST "$WEBHOOK_URL" \
+  -H 'Content-type: application/json' \
+  --data "{
+    \"text\": \":rotating_light: *Alert from ${HOSTNAME}*\",
+    \"attachments\": [{
+      \"color\": \"danger\",
+      \"text\": \"${MESSAGE}\",
+      \"footer\": \"$(date '+%F %T')\"
+    }]
+  }"
+```
+
+Use it in any monitoring script:
+
+```bash
+bash /usr/local/bin/slack-alert.sh "Disk /var at 92% on $(hostname)"
+```
+
+## Systemd service failure alerts
+
+systemd can run a script whenever a service fails, enabling instant alerting without a separate monitoring agent.
+
+```bash
+sudo nano /etc/systemd/system/service-failure-alert@.service
+```
+
+```ini
+[Unit]
+Description=Alert on failure of %i
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/slack-alert.sh "Service %i has FAILED on %H"
+```
+
+Attach it to any service you want to monitor:
+
+```bash
+sudo systemctl edit nginx
+```
+
+```ini
+[Unit]
+OnFailure=service-failure-alert@nginx.service
+```
+
+Reload systemd:
+
+```bash
+sudo systemctl daemon-reload
+```
+
+Now whenever nginx fails, the alert script fires automatically.
+
+## Common mistakes
+
+### Using SNMPv1 or v2c without network restrictions
+
+SNMPv1 and v2c community strings are sent in plaintext. Restrict access to trusted monitoring hosts or use SNMPv3 with authentication and encryption.
+
+```ini
+# Restrict community access to monitoring server only
+rocommunity public 192.168.1.10/32
+```
+
+### Not testing alert delivery
+
+An alerting system that has never been tested may silently fail when it is needed most. Test regularly.
+
+```bash
+echo "Test alert" | mail -s "Test" ops@example.com
+bash /usr/local/bin/slack-alert.sh "Test alert from $(hostname)"
+```
+
+### Alert fatigue from too many low-priority alerts
+
+If every minor event generates an alert, on-call teams start ignoring them. Tune thresholds carefully and use severity levels to route alerts appropriately.
+
+### No alert deduplication
+
+Without deduplication, a single event can trigger hundreds of identical alerts. Tools like Alertmanager handle this automatically — use them.
+
+### NRPE not firewalled
+
+The NRPE port (5666) should only be accessible from the Nagios server. Never expose it to the internet.
+
+```bash
+sudo firewall-cmd --permanent --add-rich-rule='rule family="ipv4" source address="192.168.1.10/32" port port="5666" protocol="tcp" accept'
+sudo firewall-cmd --reload
+```
+
+## Summary
+
+Enterprise alerting on AlmaLinux ranges from simple email notifications to deep integration with Nagios, Zabbix, and Prometheus Alertmanager. The right approach depends on your environment — but the principles are the same everywhere.
+
+Key points:
+
+- configure a local postfix relay so all monitoring scripts can send email
+- use SNMPv3 with authentication and encryption for SNMP-based monitoring
+- deploy NRPE for Nagios integration and restrict port 5666 to the Nagios server
+- deploy the Zabbix agent2 for full Zabbix integration with custom user parameters
+- use Prometheus alert rules and Alertmanager for metric-based alerting with deduplication
+- use systemd `OnFailure` to get instant alerts when services crash
+- test alert delivery regularly — a silent alerting system is worse than none
+
+:::tip Related pages
+- [Log Monitoring](./log-monitoring)
+- [Metrics Collection](./metrics-collection)
+- [Resource Monitoring](./resource-monitoring)
+- [Network Monitoring](./network-monitoring)
+:::

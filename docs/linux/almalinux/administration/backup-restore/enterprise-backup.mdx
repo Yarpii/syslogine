@@ -1,0 +1,594 @@
+---
+sidebar_position: 4
+title: "Enterprise Backup | AlmaLinux"
+sidebar_label: "Enterprise Backup"
+description: "Implement enterprise backup solutions on AlmaLinux using Bacula, Amanda, and Duplicity for large-scale deployments, centralized management, and reliable data protection."
+keywords:
+  - "almalinux enterprise backup"
+  - "almalinux bacula"
+  - "almalinux amanda backup"
+  - "almalinux duplicity"
+  - "rhel enterprise backup"
+tags:
+  - almalinux
+  - backup-restore
+  - bacula
+  - amanda
+  - duplicity
+  - enterprise
+slug: /linux/almalinux/administration/backup-restore/enterprise-backup
+---
+
+# Enterprise Backup on AlmaLinux
+
+When a backup strategy needs to scale beyond a handful of servers, the limitations of simple `tar` and `rsync` scripts become apparent quickly. Scheduling coordination across dozens of machines, managing tape libraries or large backup pools, tracking what was backed up when, handling failures and retries, and providing a searchable catalogue of backup contents all require more structure than shell scripts can reasonably provide. Enterprise backup solutions address these problems by centralizing control, providing proper job scheduling, maintaining a backup catalogue database, and separating the concerns of policy management from data movement.
+
+On AlmaLinux, three mature open-source enterprise backup solutions are available: **Bacula**, a client-server backup system widely used in enterprise Linux environments; **Amanda** (Advanced Maryland Automatic Network Disk Archiver), the oldest open-source network backup system with a strong track record on RHEL-compatible systems; and **Duplicity**, which provides encrypted incremental backups suitable for smaller enterprise deployments and cloud destinations. This page covers the architecture, installation, and core configuration of each.
+
+---
+
+## Bacula
+
+Bacula is a client-server backup system with a clear separation of components. A central director manages all backup jobs and maintains the catalogue. Separate daemons handle storage device access and client-side data collection. This architecture scales from a single server backing up a few clients to large environments with hundreds of clients, multiple storage servers, and tape libraries.
+
+### Architecture
+
+Bacula consists of four components:
+
+**Bacula Director** (`bacula-dir`) runs on the backup management server and orchestrates everything: scheduling jobs, instructing clients to send data, directing storage daemons to write it, and maintaining the catalogue database.
+
+**Bacula Storage Daemon** (`bacula-sd`) runs on systems that have access to backup storage — disk volumes, tape drives, or tape libraries. It receives data from clients and writes it to the storage medium.
+
+**Bacula File Daemon** (`bacula-fd`) runs on every client that needs to be backed up. It communicates with the director, reads files from the local filesystem, and sends them to the storage daemon.
+
+**Bacula Catalog** is a relational database (MySQL, MariaDB, or PostgreSQL) that records metadata about every backup job: which files were backed up, when, to which volume, and at which file position. The catalogue is what makes it possible to find and restore individual files without reading through entire backup volumes.
+
+In a simple single-server deployment, all components except the file daemon run on the same machine. The file daemon also runs on that machine to back up the server itself, and additional file daemons run on client systems.
+
+### Installing Bacula
+
+On the backup server, install the director and storage daemon:
+
+```bash
+dnf install bacula-director bacula-storage bacula-console
+```
+
+Install and configure MariaDB for the catalogue database:
+
+```bash
+dnf install mariadb-server
+systemctl enable --now mariadb
+mysql_secure_installation
+```
+
+Create the Bacula catalogue database using the provided script:
+
+```bash
+/usr/libexec/bacula/grant_mysql_privileges
+/usr/libexec/bacula/create_mysql_database
+/usr/libexec/bacula/make_mysql_tables
+```
+
+On each client system, install only the file daemon:
+
+```bash
+dnf install bacula-client
+```
+
+### Configuring the Director
+
+The director configuration lives in `/etc/bacula/bacula-dir.conf`. This file defines jobs, schedules, filesets, pools, and client connections. The structure is verbose but logical — each resource type has its own block, and resources reference each other by name.
+
+The key resource types are:
+
+**Director** — the director itself, defining its name and password:
+
+```
+Director {
+  Name = backup-dir
+  DIRport = 9101
+  QueryFile = "/usr/libexec/bacula/query.sql"
+  WorkingDirectory = "/var/spool/bacula"
+  PidDirectory = "/var/run"
+  Maximum Concurrent Jobs = 10
+  Password = "director-password-change-this"
+  Messages = Daemon
+}
+```
+
+**Client** — a system to be backed up:
+
+```
+Client {
+  Name = web01-fd
+  Address = web01.example.com
+  FDPort = 9102
+  Catalog = MyCatalog
+  Password = "client-password-change-this"
+  File Retention = 60 days
+  Job Retention = 6 months
+  AutoPrune = yes
+}
+```
+
+**FileSet** — which files to include and exclude in a backup:
+
+```
+FileSet {
+  Name = "Linux System"
+  Include {
+    Options {
+      Signature = MD5
+      Compression = GZIP
+    }
+    File = /etc
+    File = /home
+    File = /root
+    File = /var/www
+    File = /usr/local
+  }
+  Exclude {
+    File = /proc
+    File = /sys
+    File = /dev
+    File = /run
+    File = /tmp
+    File = /var/tmp
+    File = /var/cache/dnf
+  }
+}
+```
+
+**Schedule** — when jobs run:
+
+```
+Schedule {
+  Name = "WeeklyCycle"
+  Run = Full 1st sun at 23:05
+  Run = Differential 2nd-5th sun at 23:05
+  Run = Incremental mon-sat at 23:05
+}
+```
+
+This schedule runs a full backup on the first Sunday of each month, a differential backup on other Sundays, and incremental backups on weekdays. Full backups capture everything. Differential backups capture everything changed since the last full. Incremental backups capture everything changed since the last backup of any type. This progression significantly reduces daily backup time and storage while still enabling point-in-time recovery.
+
+**Job** — a backup or restore task:
+
+```
+Job {
+  Name = "Backup-web01"
+  Type = Backup
+  Level = Incremental
+  Client = web01-fd
+  FileSet = "Linux System"
+  Schedule = "WeeklyCycle"
+  Storage = File1
+  Messages = Standard
+  Pool = File
+  Priority = 10
+  Write Bootstrap = "/var/spool/bacula/web01.bsr"
+}
+```
+
+**Storage** — where backup data is written:
+
+```
+Storage {
+  Name = File1
+  Address = backup-server.example.com
+  SDPort = 9103
+  Password = "storage-password-change-this"
+  Device = FileStorage
+  Media Type = File
+  Maximum Concurrent Jobs = 10
+}
+```
+
+**Pool** — a collection of volumes with retention and recycling policy:
+
+```
+Pool {
+  Name = File
+  Pool Type = Backup
+  Recycle = yes
+  AutoPrune = yes
+  Volume Retention = 365 days
+  Maximum Volume Bytes = 50G
+  Maximum Volumes = 100
+  Label Format = "Vol-"
+}
+```
+
+### Configuring the File Daemon on Clients
+
+On each client, edit `/etc/bacula/bacula-fd.conf`:
+
+```
+FileDaemon {
+  Name = web01-fd
+  FDport = 9102
+  WorkingDirectory = /var/spool/bacula
+  Pid Directory = /var/run
+  Maximum Concurrent Jobs = 20
+}
+
+Director {
+  Name = backup-dir
+  Password = "client-password-change-this"
+}
+```
+
+The password in the client's `Director` block must match the password in the director's `Client` block for that client. Start and enable the file daemon:
+
+```bash
+systemctl enable --now bacula-fd
+```
+
+Open the firewall on clients to allow the director to connect:
+
+```bash
+firewall-cmd --permanent --add-port=9102/tcp
+firewall-cmd --reload
+```
+
+### Using the Bacula Console
+
+The `bconsole` command provides an interactive interface to the director. Use it to label volumes, run jobs, check status, and initiate restores:
+
+```bash
+bconsole
+```
+
+To label a new backup volume before it can be used:
+
+```
+*label
+Storage resource (Store) to use: File1
+Enter new Volume name: Vol-0001
+Pool for new Volume: File
+```
+
+To run a backup job immediately:
+
+```
+*run job=Backup-web01
+```
+
+To check the status of all running jobs:
+
+```
+*status director
+```
+
+To list completed jobs:
+
+```
+*list jobs
+```
+
+The console is the primary operational interface for Bacula. Familiarity with its commands is essential for day-to-day management and for initiating restores. The full command reference is extensive — `help` within `bconsole` lists all available commands.
+
+:::tip
+The Bacula configuration file syntax is strict and errors can prevent the director from starting. After any change to `bacula-dir.conf`, test it before restarting:
+
+```bash
+bacula-dir -tc /etc/bacula/bacula-dir.conf
+```
+
+If the output is silent, the configuration is valid. Any errors are reported with the relevant line number.
+:::
+
+---
+
+## Amanda
+
+Amanda (Advanced Maryland Automatic Network Disk Archiver) takes a different philosophical approach from Bacula. Where Bacula gives administrators fine-grained control over every aspect of backup scheduling and storage, Amanda automates much of this through its own scheduling algorithm. Given a pool of backup media and a set of clients, Amanda determines how to distribute full and incremental backups across the available media to meet retention goals efficiently — without requiring administrators to define explicit schedules for each client.
+
+### Architecture
+
+Amanda uses a simpler component model than Bacula. The **Amanda server** runs the backup software, initiates connections to clients, and writes to the backup medium. **Amanda clients** run `amandad` and respond to backup requests from the server. A **holding disk** on the server acts as a staging area — data is first written there, then flushed to the final backup medium (tape or disk). The holding disk allows Amanda to back up multiple clients in parallel without I/O contention on the final medium.
+
+### Installing Amanda
+
+On the backup server:
+
+```bash
+dnf install amanda amanda-server
+```
+
+On each client:
+
+```bash
+dnf install amanda amanda-client
+```
+
+Amanda uses a dedicated user (`amandabackup`) for all operations. This user is created automatically during installation.
+
+### Configuring Amanda
+
+Amanda configurations live in `/etc/amanda/<config-name>/`. Create a configuration directory for your backup set:
+
+```bash
+mkdir -p /etc/amanda/DailySet
+```
+
+The main configuration file is `amanda.conf`:
+
+```bash
+nano /etc/amanda/DailySet/amanda.conf
+```
+
+```
+org "MyOrg"
+mailto "admin@example.com"
+dumpcycle 1 week
+runspercycle 5
+tapecycle 10 tapes
+tapedev "file:/backup/amanda/DailySet"
+tapetype HARDDISK
+define tapetype HARDDISK {
+    length 100 gbytes
+    filemark 4 kbytes
+}
+holdingdisk hd1 {
+    directory "/backup/amanda/holding"
+    use 20 gbytes
+    chunksize 1 gbytes
+}
+infofile "/var/lib/amanda/DailySet/curinfo"
+logdir "/var/log/amanda/DailySet"
+indexdir "/var/lib/amanda/DailySet/index"
+```
+
+The `dumpcycle` and `runspercycle` settings tell Amanda's scheduler how frequently to run full dumps and how many backup runs to plan across that cycle. Amanda uses this to automatically schedule full and incremental dumps across clients to spread the load.
+
+The disk list file (`disklist`) defines which clients and directories to back up:
+
+```bash
+nano /etc/amanda/DailySet/disklist
+```
+
+```
+web01.example.com  /etc       comp-best
+web01.example.com  /home      comp-best
+web01.example.com  /var/www   comp-best
+db01.example.com   /var/lib/pgsql  comp-best
+```
+
+Each line specifies a hostname, a directory, and a dump type (compression level). Amanda connects to each listed host and backs up the specified directory.
+
+### Client Authentication
+
+Amanda authenticates clients using `.amandahosts` files. On the Amanda server, `/var/lib/amanda/.amandahosts` lists which client hosts are trusted:
+
+```
+web01.example.com amandabackup
+db01.example.com amandabackup
+```
+
+On each client, `/var/lib/amanda/.amandahosts` lists the backup server as trusted:
+
+```
+backupserver.example.com amandabackup
+```
+
+The `amandabackup` user must exist on both server and clients. The `.amandahosts` files must be owned by `amandabackup` with permissions `600`.
+
+### Running Amanda
+
+To check the configuration and see what Amanda would do on the next run without actually running it:
+
+```bash
+su - amandabackup -c "amcheck -c DailySet"
+```
+
+`amcheck` verifies that the configuration is valid, clients are reachable, and the backup medium has sufficient space.
+
+To run a backup:
+
+```bash
+su - amandabackup -c "amdump DailySet"
+```
+
+Amanda runs all scheduled dumps, writes them through the holding disk to the final medium, and sends a report by email to the configured `mailto` address.
+
+To see the backup report for the last run:
+
+```bash
+su - amandabackup -c "amreport DailySet"
+```
+
+Amanda's strength is that once configured, it manages the scheduling automatically. You define the retention goals, and Amanda figures out which clients need full vs. incremental dumps on any given day.
+
+---
+
+## Duplicity
+
+Duplicity takes a different approach from both Bacula and Amanda. Rather than a client-server architecture, Duplicity is a single-host tool that creates encrypted, signed backup archives and transfers them to a destination. The destination can be a local directory, an SSH/SFTP server, an NFS share, or a cloud storage service like AWS S3, Google Cloud Storage, or Azure Blob Storage. Duplicity uses `librsync` for bandwidth-efficient incremental transfers and GnuPG for encryption.
+
+Duplicity is well-suited for scenarios where backups need to go to untrusted storage (such as a public cloud provider) because the data is encrypted before it leaves the local system. It is also simpler to set up than Bacula or Amanda for environments with a moderate number of systems, since there is no separate server component to manage.
+
+### Installing Duplicity
+
+```bash
+dnf install epel-release
+dnf install duplicity
+```
+
+For cloud backends, additional Python packages may be needed depending on the destination. For AWS S3:
+
+```bash
+dnf install python3-boto3
+```
+
+### GnuPG Key Setup
+
+Duplicity uses GnuPG for encryption. Generate a key pair for the backup user if one does not already exist:
+
+```bash
+gpg --gen-key
+```
+
+Follow the prompts to create a key. Note the key ID — it is needed for all Duplicity commands. List available keys to find it:
+
+```bash
+gpg --list-keys
+```
+
+The key ID is the long hex string shown after `pub`. Export and securely store the public and private keys separately from the backup destination — if the key is lost, the encrypted backups cannot be decrypted:
+
+```bash
+gpg --export-secret-keys --armor YOURKEYID > /root/backup-key-private.asc
+gpg --export --armor YOURKEYID > /root/backup-key-public.asc
+```
+
+Store these exports in a secure, off-system location.
+
+### Creating Encrypted Backups
+
+To create a full backup of `/etc/` encrypted with the GnuPG key and stored on an SSH server:
+
+```bash
+duplicity full \
+    --encrypt-key YOURKEYID \
+    /etc/ \
+    sftp://backupuser@backupserver.example.com/backups/myhost/etc/
+```
+
+To create an incremental backup (only files changed since the last backup):
+
+```bash
+duplicity incremental \
+    --encrypt-key YOURKEYID \
+    /etc/ \
+    sftp://backupuser@backupserver.example.com/backups/myhost/etc/
+```
+
+Rather than specifying `full` or `incremental` explicitly, Duplicity can decide automatically. If no prior backup exists at the destination, a full backup is created. If a full backup exists and is newer than the specified threshold, an incremental backup is created. If the full backup is older than the threshold, a new full backup is initiated:
+
+```bash
+duplicity \
+    --encrypt-key YOURKEYID \
+    --full-if-older-than 30D \
+    /etc/ \
+    sftp://backupuser@backupserver.example.com/backups/myhost/etc/
+```
+
+The `--full-if-older-than 30D` flag causes Duplicity to create a new full backup if the existing full backup is more than 30 days old.
+
+### Backing Up to AWS S3
+
+To back up to an S3 bucket, configure AWS credentials first:
+
+```bash
+export AWS_ACCESS_KEY_ID=your-access-key-id
+export AWS_SECRET_ACCESS_KEY=your-secret-access-key
+```
+
+Then run Duplicity with an S3 URL:
+
+```bash
+duplicity \
+    --encrypt-key YOURKEYID \
+    --full-if-older-than 30D \
+    /home/ \
+    s3://s3.amazonaws.com/your-bucket-name/myhost/home/
+```
+
+For production use, store the AWS credentials in a file with restricted permissions rather than environment variables, and source the file in the backup script.
+
+### Listing and Restoring Files
+
+To list the files in a Duplicity backup:
+
+```bash
+duplicity list-current-files \
+    --encrypt-key YOURKEYID \
+    sftp://backupuser@backupserver.example.com/backups/myhost/etc/
+```
+
+To restore the entire backup to a directory:
+
+```bash
+duplicity restore \
+    --encrypt-key YOURKEYID \
+    sftp://backupuser@backupserver.example.com/backups/myhost/etc/ \
+    /tmp/restore/
+```
+
+To restore a single file from the backup:
+
+```bash
+duplicity restore \
+    --encrypt-key YOURKEYID \
+    --file-to-restore nginx/nginx.conf \
+    sftp://backupuser@backupserver.example.com/backups/myhost/etc/ \
+    /tmp/nginx.conf.restored
+```
+
+To restore from a specific point in time:
+
+```bash
+duplicity restore \
+    --encrypt-key YOURKEYID \
+    --time 2024-06-01T09:00:00 \
+    sftp://backupuser@backupserver.example.com/backups/myhost/etc/ \
+    /tmp/restore/
+```
+
+### Managing Retention
+
+Old backup chains can be removed with the `remove-all-but-n-full` command, which keeps the most recent N full backup chains (and all incrementals associated with them) and deletes everything older:
+
+```bash
+duplicity remove-all-but-n-full 3 \
+    --force \
+    --encrypt-key YOURKEYID \
+    sftp://backupuser@backupserver.example.com/backups/myhost/etc/
+```
+
+The `--force` flag is required because without it, Duplicity only prints what it would delete without actually deleting it. Run without `--force` first to review the intended deletions.
+
+---
+
+## Choosing Between Solutions
+
+The right tool depends on the scale, complexity, and requirements of your environment:
+
+| Factor | Bacula | Amanda | Duplicity |
+|---|---|---|---|
+| Deployment complexity | High | Medium | Low |
+| Client scale | Hundreds | Dozens | Single host per instance |
+| Tape library support | Yes | Yes | No |
+| Encrypted backups | With plugins | With plugins | Native |
+| Cloud storage | Via plugins | No | Native |
+| Catalogue database | Yes (SQL) | Yes (text) | No |
+| Scheduling | Explicit per-job | Automatic | External (cron) |
+| Best fit | Large enterprise, tape | Medium enterprise, disk/tape | Cloud destinations, encryption requirements |
+
+Bacula is the right choice when you need centralized management of many clients, tape library integration, or fine-grained scheduling control. Amanda suits environments that want automatic scheduling management without the configuration overhead of Bacula. Duplicity is the best fit when encryption to untrusted storage is a requirement, or when cloud backup destinations are primary.
+
+---
+
+## Summary
+
+Enterprise backup on AlmaLinux is served by three mature open-source solutions, each with a distinct architecture and strength. Bacula provides centralized control and catalogue management for large environments. Amanda automates backup scheduling decisions across a client pool. Duplicity delivers encrypted incremental backups suitable for cloud destinations and environments where data confidentiality in transit and at rest is a hard requirement.
+
+Key points to remember:
+
+- Bacula separates the director, storage daemon, and file daemon — each can run on separate hardware as environments scale
+- Validate Bacula director configuration with `bacula-dir -tc` before restarting the service
+- Amanda's scheduling algorithm automates full vs. incremental decisions — configure retention goals, not explicit schedules
+- Amanda requires careful `.amandahosts` setup on both server and clients for authentication
+- Duplicity encrypts data before transfer — store the GnuPG private key off-system and separately from the backups
+- Run `duplicity remove-all-but-n-full` without `--force` first to preview deletions before committing
+- All three tools benefit from periodic recovery testing — catalogue integrity and encryption key availability must be verified before a real emergency
+
+### Related Pages
+
+- [System Backup](./system-backup) — full system backup with tar, rsync, and LVM snapshots
+- [ReaR Backup](./rear-backup) — bare-metal disaster recovery with Relax-and-Recover
+- [Remote Backup](./remote-backup) — offsite and cloud backup destinations
+- [Automated Backup](./automated-backup) — scheduling backups with cron and systemd timers
+- [Restore Procedures](./restore-procedures) — recovering systems and files from backups
+- [Backup Verification](./backup-verification) — testing and validating backup integrity

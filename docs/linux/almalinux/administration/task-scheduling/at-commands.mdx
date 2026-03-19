@@ -1,0 +1,435 @@
+---
+sidebar_position: 7
+title: "At Commands | AlmaLinux"
+sidebar_label: "At Commands"
+description: "Use at and batch commands on AlmaLinux for one-time and deferred job scheduling. Manage job queues, control access, and handle ad-hoc tasks without modifying crontabs."
+keywords:
+  - "almalinux at command"
+  - "almalinux batch command"
+  - "almalinux one-time scheduling"
+  - "almalinux atd"
+  - "rhel at command"
+tags:
+  - almalinux
+  - task-scheduling
+  - at
+  - batch
+  - one-time-jobs
+slug: /linux/almalinux/administration/task-scheduling/at-commands
+---
+
+# At Commands on AlmaLinux
+
+Cron and systemd timers handle recurring tasks that run on a predictable schedule. The `at` command handles the opposite case: running a command or script once at a specific future time without creating a permanent scheduled job. This is useful for deferred tasks that are inherently one-off — running a report after a long data import completes, sending a reminder, executing a maintenance task during a scheduled change window, or triggering a restart at a specific time during the night.
+
+The `batch` command is closely related to `at` but adds load-aware scheduling: rather than running at a specific time, it runs the job when the system load drops below a threshold. This makes it well-suited for resource-intensive tasks that should not compete with interactive or production workloads but do not need to run at an exact time.
+
+---
+
+## Installing and Enabling atd
+
+The `at` and `batch` commands are served by the `atd` daemon. Install it if not already present:
+
+```bash
+dnf install at
+```
+
+Enable and start the daemon:
+
+```bash
+systemctl enable --now atd
+```
+
+Verify it is running:
+
+```bash
+systemctl status atd
+```
+
+---
+
+## Scheduling One-Time Jobs with at
+
+The `at` command reads commands from standard input or a file and schedules them to run at the specified time. The scheduled commands run in a shell environment that captures the current environment at the time `at` is invoked, which means environment variables, the current directory, and shell settings are preserved — a significant practical difference from cron, which runs in a minimal environment.
+
+### Basic Usage
+
+The simplest form reads a command from standard input using a here-document or pipe. To run a script at 22:00 tonight:
+
+```bash
+echo "/usr/local/sbin/nightly-report.sh" | at 22:00
+```
+
+To schedule an interactive session where you type multiple commands:
+
+```bash
+at 22:00
+```
+
+After pressing Enter, `at` waits for input. Type commands on separate lines, then press `Ctrl+D` to submit:
+
+```
+at> /usr/local/sbin/nightly-report.sh
+at> echo "Report job completed" >> /var/log/reports.log
+at> <EOT>
+job 5 at Thu Jun  1 22:00:00 2024
+```
+
+`at` confirms the job number and scheduled time. The `<EOT>` marker appears when you press `Ctrl+D`.
+
+### Time Specification
+
+The `at` command accepts time in a wide variety of formats, making it flexible for different scheduling needs.
+
+**Absolute times:**
+
+```bash
+# Run at a specific time today (24-hour format)
+at 14:30
+
+# Run at a specific time today (12-hour format with AM/PM)
+at 2:30 PM
+
+# Run at midnight
+at midnight
+
+# Run at noon
+at noon
+
+# Run at teatime (16:00)
+at teatime
+```
+
+**Relative times:**
+
+```bash
+# Run in 30 minutes from now
+at now + 30 minutes
+
+# Run in 2 hours from now
+at now + 2 hours
+
+# Run in 3 days from now
+at now + 3 days
+
+# Run in 1 week from now
+at now + 1 week
+```
+
+**Specific dates and times:**
+
+```bash
+# Run at 03:00 on a specific date
+at 03:00 2024-06-15
+
+# Run at 09:00 next Monday
+at 9:00 AM Mon
+
+# Run at midnight on the first of July
+at midnight Jul 1
+
+# Run at noon next month (same day)
+at noon + 1 month
+```
+
+**Combining date and time:**
+
+```bash
+# Run at 22:30 on June 15th
+at 10:30 PM Jun 15
+
+# Run at 01:00 on the 20th of next month
+at 1:00 AM + 1 month
+```
+
+The flexibility of the time specification means `at` can express almost any one-time scheduling need without calculating exact timestamps manually.
+
+### Scheduling from a Script File
+
+To schedule a script file rather than typing commands interactively:
+
+```bash
+at 03:00 -f /usr/local/sbin/maintenance-task.sh
+```
+
+The `-f` flag reads commands from the specified file. This is the cleanest approach when the task involves multiple commands or complex logic that would be cumbersome to type interactively.
+
+### Redirecting at Output
+
+Like cron, `at` emails job output to the user's local mailbox by default. To redirect output to a log file instead, include the redirection in the command itself:
+
+```bash
+echo "/usr/local/sbin/nightly-report.sh >> /var/log/reports/nightly.log 2>&1" | at 22:00
+```
+
+Or within an `at` session:
+
+```bash
+at 22:00 << 'EOF'
+/usr/local/sbin/nightly-report.sh >> /var/log/reports/nightly.log 2>&1
+EOF
+```
+
+The `<< 'EOF'` here-document form (with quoted `'EOF'`) prevents the shell from expanding variables before passing the content to `at`, which is important if the script itself uses variables that should be evaluated at run time rather than now.
+
+---
+
+## Managing Queued Jobs
+
+### Listing Pending Jobs
+
+To see all jobs currently queued for the current user:
+
+```bash
+atq
+```
+
+For root, `atq` shows all users' queued jobs. The output format is:
+
+```
+5    Thu Jun  1 22:00:00 2024 a root
+6    Fri Jun  2 03:00:00 2024 a alice
+```
+
+Each line shows the job number, scheduled time, queue name (letter), and the user who owns the job. The queue letter is significant — more on queues below.
+
+To display queued jobs for a specific user (as root):
+
+```bash
+atq -l | grep alice
+```
+
+### Viewing a Job's Contents
+
+To see what commands a queued job will run:
+
+```bash
+at -c 5
+```
+
+Replace `5` with the job number from `atq`. The output shows the full job environment — the environment variables captured at submission time, a `cd` to the submission directory, and then the commands themselves. This is useful for verifying a job before it runs or for understanding what an unfamiliar queued job will do.
+
+### Removing a Queued Job
+
+To remove a job before it runs:
+
+```bash
+atrm 5
+```
+
+Or equivalently:
+
+```bash
+at -r 5
+```
+
+To remove multiple jobs at once:
+
+```bash
+atrm 5 6 7
+```
+
+There is no confirmation prompt — the job is removed immediately. To cancel all your pending jobs at once (use with care):
+
+```bash
+atq | awk '{print $1}' | xargs atrm
+```
+
+---
+
+## Job Queues
+
+`at` supports multiple job queues, designated by letters a through z and A through Z. Queue `a` is the default. Different queues have different scheduling behaviors:
+
+- Queues **a** through **z** are the standard queues, where jobs run at the specified time
+- Queue **b** is the default queue for `batch` jobs (load-limited)
+- Higher-letter queues have progressively lower scheduling priority (higher `nice` value), meaning they yield CPU to other processes more readily
+
+To submit a job to a specific queue, use the `-q` flag:
+
+```bash
+echo "/usr/local/sbin/heavy-computation.sh" | at -q c now + 1 hour
+```
+
+This submits the job to queue `c`, which has a lower scheduling priority than the default queue `a`. This is useful for resource-intensive jobs where you want the system to prioritize other work but still run the job promptly.
+
+---
+
+## Load-Aware Scheduling with batch
+
+The `batch` command is identical to `at` in syntax but does not run jobs at a fixed time. Instead, it holds jobs until the system's load average drops below 1.5 (by default). Once the load is low enough, `batch` runs the next job in the queue.
+
+This makes `batch` useful for CPU-intensive tasks that you want to run as soon as the system is not busy, without specifying an exact time:
+
+```bash
+echo "/usr/local/sbin/generate-large-report.sh" | batch
+```
+
+Or from a file:
+
+```bash
+batch -f /usr/local/sbin/generate-large-report.sh
+```
+
+`batch` jobs appear in `atq` with queue letter `b`.
+
+### Changing the Load Threshold
+
+The default load threshold of 1.5 is conservative — on multi-core systems, a load average of 1.5 means the system is quite lightly loaded. Change the threshold by modifying the `atd` startup options.
+
+On AlmaLinux, edit the atd service override:
+
+```bash
+systemctl edit atd
+```
+
+```ini
+[Service]
+ExecStart=
+ExecStart=/usr/sbin/atd -l 4.0 -b 60
+```
+
+The `-l 4.0` flag sets the load threshold to 4.0. The `-b 60` flag sets the minimum interval between batch jobs to 60 seconds, preventing multiple batch jobs from starting simultaneously when load drops. Apply the change:
+
+```bash
+systemctl daemon-reload
+systemctl restart atd
+```
+
+---
+
+## Controlling Access to at and batch
+
+Like cron, `atd` respects access control files that determine which users can submit jobs:
+
+- `/etc/at.allow` — if this file exists, only users listed in it can use `at` and `batch`
+- `/etc/at.deny` — if this file exists (and `at.allow` does not), users listed in it are denied access
+
+If neither file exists, only root can use `at` on AlmaLinux by default. To allow all users:
+
+```bash
+# Create an empty at.deny, which allows everyone not explicitly denied
+touch /etc/at.deny
+```
+
+To restrict to specific users:
+
+```bash
+nano /etc/at.allow
+```
+
+```
+root
+alice
+bob
+```
+
+With `at.allow` present, only the listed users can submit jobs — everyone else is denied, regardless of `at.deny`.
+
+---
+
+## Practical Use Cases
+
+### Scheduling a Restart During a Maintenance Window
+
+During a maintenance window that starts at 02:00, schedule a service restart for the beginning of the window rather than doing it interactively at 02:00:
+
+```bash
+echo "systemctl restart postgresql" | at 02:00
+```
+
+This allows the administrator to set up the restart in advance and go to sleep, with confidence the restart will happen at the right time.
+
+### Delaying a Task Until After a Long Operation
+
+When a long-running operation (a database migration, a large file transfer) is running and another task must follow it, use `at` with a relative time:
+
+```bash
+# The migration is expected to take about 3 hours
+echo "/usr/local/sbin/post-migration-checks.sh" | at now + 3 hours
+```
+
+If the migration completes earlier, the post-migration checks still run at the scheduled time — which is fine as long as the migration has completed. For a truly dependency-driven execution (run only when the migration script exits), a script with a loop or `wait` is more appropriate than `at`.
+
+### Sending a Scheduled Reminder
+
+To send an email reminder to the team at a specific time before a planned maintenance window:
+
+```bash
+at 20:00 << 'EOF'
+echo "Reminder: Maintenance window begins at 22:00 tonight. Affected services: nginx, postgresql." \
+    | mail -s "Maintenance Window Reminder" team@example.com
+EOF
+```
+
+### Running a Deferred Backup Before a Major Change
+
+Before a major configuration change, schedule a backup of the affected files so there is a pre-change snapshot, even if the backup job normally runs at a different time:
+
+```bash
+echo "tar -czpf /backup/pre-change-$(date +%Y%m%d-%H%M).tar.gz /etc/nginx/" | at now + 5 minutes
+```
+
+The 5-minute delay gives time to confirm the command before it runs.
+
+### Scheduling System Shutdown
+
+To shut down a system at a specific time for hardware maintenance:
+
+```bash
+echo "shutdown -h now" | at 03:00
+```
+
+Or use the `shutdown` command's built-in scheduling, which is implemented using `at`:
+
+```bash
+shutdown -h 03:00
+```
+
+To cancel a scheduled shutdown:
+
+```bash
+shutdown -c
+```
+
+---
+
+## at vs. systemd-run for One-Time Jobs
+
+Both `at` and `systemd-run` can schedule one-time future jobs. The choice between them depends on what you need:
+
+| Feature | at | systemd-run |
+|---|---|---|
+| Scheduling syntax | Flexible natural language | `--on-calendar` or `--on-active` |
+| Environment | Captures current environment | Clean systemd environment |
+| Output | Email or redirect | Journal |
+| Job listing | `atq` | `systemctl list-timers` |
+| Cancel | `atrm` | `systemctl stop <unit>` |
+| Persistent across reboot | No | Yes, if started before reboot |
+| Load-aware scheduling | Yes (batch) | No |
+
+`at` is the better choice when you want to preserve the current environment (including custom `PATH`, working directory, and shell variables), when you need natural language time specification, or when load-aware execution with `batch` is useful. `systemd-run` is the better choice when you want job output in the journal, when the job should integrate with systemd dependencies, or when you need the job to be visible in `systemctl list-timers` alongside other timer units.
+
+---
+
+## Summary
+
+The `at` and `batch` commands fill the scheduling gap between cron (recurring jobs) and manual execution (immediate one-off commands). `at` runs a job once at a specified future time; `batch` runs it when the system load is low enough. Both preserve the submitter's current environment, which makes them more predictable than cron for ad-hoc tasks.
+
+Key points to remember:
+
+- `atd` must be installed and running — verify with `systemctl status atd`
+- `at` preserves the environment at submission time, unlike cron's minimal environment
+- Use `at -f <script>` to schedule a script file rather than typing commands interactively
+- Use a quoted here-document (`<< 'EOF'`) to prevent variable expansion before submission
+- `atq` lists pending jobs; `at -c <job>` shows a job's contents; `atrm <job>` cancels it
+- `batch` runs when system load drops below the threshold — useful for resource-intensive ad-hoc tasks
+- Adjust the `batch` load threshold with `-l` in the `atd` systemd service override
+- Access control follows the same `allow`/`deny` file pattern as cron
+
+### Related Pages
+
+- [Cron Scheduling](./cron-scheduling) — recurring task scheduling with crond
+- [Systemd Timers](./systemd-timers) — modern scheduling with systemd, including `systemd-run` for one-time jobs
+- [Enterprise Scheduling](./enterprise-scheduling) — complex job dependencies and coordination patterns
+- [Maintenance Automation](./maintenance-automation) — scheduling recurring system maintenance

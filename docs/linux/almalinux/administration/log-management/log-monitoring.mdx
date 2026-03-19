@@ -1,0 +1,512 @@
+---
+sidebar_position: 7
+title: "Log Monitoring | AlmaLinux"
+sidebar_label: "Log Monitoring"
+description: "Set up automated log monitoring on AlmaLinux using logwatch, fail2ban, and systemd to detect patterns, trigger alerts, and respond to events in real time."
+keywords:
+  - "almalinux log monitoring"
+  - "almalinux logwatch"
+  - "almalinux fail2ban"
+  - "almalinux log alerts"
+  - "rhel log monitoring"
+tags:
+  - almalinux
+  - log-management
+  - log-monitoring
+  - fail2ban
+  - logwatch
+slug: /linux/almalinux/administration/log-management/log-monitoring
+---
+
+# Log Monitoring on AlmaLinux
+
+Reading logs manually is useful for troubleshooting specific incidents, but it is not a sustainable strategy for ongoing system oversight. Log monitoring automates the process of watching for significant events — errors, security incidents, threshold breaches — and either alerting you or taking action when they occur. On AlmaLinux, several tools cover different aspects of this problem: `logwatch` generates scheduled summary reports, `fail2ban` watches for attack patterns and blocks offending IP addresses, and systemd's own facilities can notify you of service failures.
+
+This page explains how to configure each of these tools and how to build simple custom monitors using standard shell utilities and cron.
+
+---
+
+## The Two Modes of Log Monitoring
+
+Log monitoring generally works in one of two ways: **periodic summarization** and **real-time pattern matching**.
+
+Periodic summarization tools like `logwatch` process log files on a schedule — typically daily — and produce a digest of significant events from the past period. This is useful for maintaining awareness of routine activity, catching problems that built up gradually, and fulfilling compliance reporting requirements. The tradeoff is latency: an event that happened at 2 AM may not come to your attention until the morning report arrives.
+
+Real-time pattern matching tools like `fail2ban` watch log files continuously and react immediately when a pattern is matched. This is suited to time-sensitive responses — blocking a brute-force attack, for example — where a multi-hour delay in notification would allow the attack to continue unchecked.
+
+Most production environments benefit from both approaches. Periodic reports give you a complete picture of what happened; real-time monitors handle situations where speed of response matters.
+
+---
+
+## logwatch — Scheduled Log Summaries
+
+`logwatch` is a log analysis and reporting tool that parses log files, extracts meaningful information, and sends a formatted summary by email or to standard output. It ships with parsers for common services (SSH, cron, httpd, sudo, kernel, etc.) and is designed to highlight significant events while suppressing routine noise.
+
+### Installing logwatch
+
+```bash
+dnf install logwatch
+```
+
+logwatch depends on `perl` and a mail transfer agent to send reports by email. If you intend to send reports to an external address, ensure a mail server (such as Postfix) is configured on the system.
+
+### Running logwatch Manually
+
+Before configuring scheduled reports, it is worth running logwatch manually to see what it produces for your system:
+
+```bash
+logwatch --output stdout --format text --range today
+```
+
+This prints the report to the terminal rather than sending an email. The `--range` flag accepts `today`, `yesterday`, `all`, or an explicit date range. The report is divided by service, with each section summarizing what logwatch found in that service's logs.
+
+To generate a more detailed report:
+
+```bash
+logwatch --output stdout --format text --range today --detail high
+```
+
+The `--detail` flag accepts `low`, `medium`, `high`, or a number from 0 to 10. Higher detail levels include more events that would otherwise be considered routine.
+
+### Configuring logwatch
+
+The main logwatch configuration file is `/etc/logwatch/conf/logwatch.conf`. This file is initially empty — logwatch falls back to its default configuration at `/usr/share/logwatch/default.conf/logwatch.conf` for any settings not explicitly overridden. Edit only `/etc/logwatch/conf/logwatch.conf` to avoid your changes being overwritten by package updates.
+
+Open the local configuration file:
+
+```bash
+nano /etc/logwatch/conf/logwatch.conf
+```
+
+Common settings to configure:
+
+```
+# Send reports to this email address
+MailTo = admin@example.com
+
+# From address for email reports
+MailFrom = logwatch@yourhostname.example.com
+
+# Default detail level (0-10)
+Detail = Med
+
+# Default range to analyze
+Range = yesterday
+
+# Output format (mail or stdout)
+Output = mail
+
+# Format (text or html)
+Format = text
+```
+
+After setting `MailTo` and `Output = mail`, logwatch will send its report by email when invoked. The email is sent via the system's local mail transfer agent, so ensure that Postfix or another MTA is configured to relay mail to your address.
+
+### Scheduling logwatch with Cron
+
+logwatch installs a cron job at `/etc/cron.daily/0logwatch` during installation on AlmaLinux. This runs logwatch once per day, typically in the early morning, and sends the report to root's local mailbox by default. Verify it is present:
+
+```bash
+ls -l /etc/cron.daily/0logwatch
+```
+
+If you have configured an external `MailTo` address in `logwatch.conf`, the daily report will be sent there automatically. To test the cron job runs correctly without waiting for midnight:
+
+```bash
+run-parts --test /etc/cron.daily
+/etc/cron.daily/0logwatch
+```
+
+### Excluding Noise from logwatch Reports
+
+If certain services generate large amounts of routine output that clutters the report, you can reduce their detail level or exclude them entirely. Service-specific configurations live in `/etc/logwatch/conf/services/`. Create a file named after the service to override its settings:
+
+```bash
+nano /etc/logwatch/conf/services/sshd.conf
+```
+
+```
+# Reduce detail for SSH to hide routine connection messages
+Detail = 3
+```
+
+To disable reporting for a service entirely:
+
+```bash
+nano /etc/logwatch/conf/services/postfix.conf
+```
+
+```
+# Do not include postfix in logwatch reports
+$postfix_ignore_all = yes
+```
+
+The available per-service configuration options vary by service. The service definition files at `/usr/share/logwatch/default.conf/services/` document what each service supports.
+
+---
+
+## fail2ban — Real-Time Intrusion Prevention
+
+`fail2ban` monitors log files for patterns indicating malicious activity — most commonly repeated authentication failures — and responds by adding firewall rules to block the offending IP address for a configurable period. It is particularly effective against SSH brute-force attacks, which are a constant background noise on any internet-facing server.
+
+### Installing fail2ban
+
+```bash
+dnf install epel-release
+dnf install fail2ban
+systemctl enable --now fail2ban
+```
+
+fail2ban is available from the EPEL repository, which the first command enables.
+
+### How fail2ban Works
+
+fail2ban operates on the concept of **jails**. A jail defines:
+
+- Which log file to watch
+- Which pattern (filter) to match against
+- How many matches within a time window constitute a ban
+- How long to ban the offending IP
+- Which action to take when banning (typically adding a firewalld or iptables rule)
+
+The filter is a regular expression that matches a failure event in the log. fail2ban ships with filters for many common services, and you rarely need to write your own for standard software.
+
+### Basic Configuration
+
+The main configuration file is `/etc/fail2ban/jail.conf`. As with logwatch, you should not edit this file directly — it may be overwritten by package updates. Instead, create a local override file:
+
+```bash
+nano /etc/fail2ban/jail.local
+```
+
+Start with global defaults that apply to all jails:
+
+```ini
+[DEFAULT]
+# Ban duration in seconds (3600 = 1 hour)
+bantime = 3600
+
+# Time window in which failures are counted
+findtime = 600
+
+# Number of failures before a ban is applied
+maxretry = 5
+
+# Use firewalld for ban actions (appropriate for AlmaLinux)
+banaction = firewallcmd-rich-rules
+banaction_allports = firewallcmd-allports
+
+# Send email alerts when banning (optional; requires a working MTA)
+# destemail = admin@example.com
+# sender = fail2ban@yourhostname.example.com
+# action = %(action_mwl)s
+```
+
+With these defaults, fail2ban will ban any IP that fails authentication 5 times within 10 minutes, blocking it for 1 hour.
+
+### Enabling the SSH Jail
+
+Add a section for SSH below the `[DEFAULT]` block in `jail.local`:
+
+```ini
+[sshd]
+enabled = true
+port = ssh
+logpath = %(sshd_log)s
+backend = %(syslog_backend)s
+maxretry = 3
+```
+
+The `%(sshd_log)s` and `%(syslog_backend)s` variables expand to the correct values for AlmaLinux automatically. Setting `maxretry = 3` for SSH is more conservative than the global default — legitimate users rarely need more than three attempts.
+
+After editing `jail.local`, restart fail2ban:
+
+```bash
+systemctl restart fail2ban
+```
+
+### Checking fail2ban Status
+
+To see the status of all active jails:
+
+```bash
+fail2ban-client status
+```
+
+To see the status of a specific jail, including the list of currently banned IPs and recent activity:
+
+```bash
+fail2ban-client status sshd
+```
+
+The output shows the number of currently banned IPs, the total number of bans since fail2ban started, and the list of currently banned addresses.
+
+### Managing Bans Manually
+
+To unban an IP address that was incorrectly blocked — for example, your own address after a mistyped password:
+
+```bash
+fail2ban-client set sshd unbanip 192.168.1.10
+```
+
+To manually ban an IP address:
+
+```bash
+fail2ban-client set sshd banip 203.0.113.50
+```
+
+To see what rules fail2ban has added to firewalld:
+
+```bash
+firewall-cmd --list-rich-rules
+```
+
+### Adding Jails for Other Services
+
+fail2ban ships with filter definitions for many services. The available filters are in `/etc/fail2ban/filter.d/`. To see what is available:
+
+```bash
+ls /etc/fail2ban/filter.d/
+```
+
+To add a jail for Apache authentication failures, add to `jail.local`:
+
+```ini
+[apache-auth]
+enabled = true
+port = http,https
+logpath = /var/log/httpd/error_log
+maxretry = 6
+```
+
+To add a jail for Postfix SMTP authentication failures:
+
+```ini
+[postfix-sasl]
+enabled = true
+port = smtp,submission,imap,imaps,pop3,pop3s
+logpath = /var/log/maillog
+maxretry = 5
+```
+
+After adding any new jail, restart fail2ban:
+
+```bash
+systemctl restart fail2ban
+```
+
+### Testing a Filter
+
+Before enabling a new jail, it is worth testing whether its filter correctly matches the log entries you expect. The `fail2ban-regex` tool tests a filter against a log file and reports how many lines matched:
+
+```bash
+fail2ban-regex /var/log/httpd/error_log /etc/fail2ban/filter.d/apache-auth.conf
+```
+
+The output shows the number of matched lines, the matched content, and any lines the filter could not parse. A good filter should match your actual failure log entries without generating false positives.
+
+:::tip
+When first enabling a new jail, set `bantime` to a short value (e.g., 60 seconds) in that jail's configuration so you can verify it is working correctly without risk of locking out legitimate users for an extended period. Once confirmed, raise it to your preferred duration.
+:::
+
+---
+
+## Monitoring with systemd
+
+systemd can be configured to send email notifications when a service enters a failed state. This is a lightweight alternative to a full alerting system for environments where you want to know immediately when a critical service goes down.
+
+### Configuring a Failure Notification Unit
+
+The approach involves creating a oneshot systemd service that sends an email, and then referencing it from the target service's unit file using an `OnFailure` directive.
+
+First, create the notification service. This example uses `mail` to send the alert, but any mail client or notification tool can be substituted:
+
+```bash
+nano /etc/systemd/system/notify-failure@.service
+```
+
+```ini
+[Unit]
+Description=Send failure notification for %i
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/bash -c 'echo "Service %i failed on $(hostname) at $(date)" | mail -s "Service Failure: %i" admin@example.com'
+```
+
+The `@` in the filename makes this a template unit — `%i` is replaced with the name of the failing service when the unit is instantiated.
+
+Next, add `OnFailure` to the service you want to monitor. Rather than editing the package-provided unit file directly, use a drop-in override:
+
+```bash
+systemctl edit nginx
+```
+
+This opens an editor for a drop-in file. Add:
+
+```ini
+[Unit]
+OnFailure=notify-failure@%n.service
+```
+
+Save and close the editor. systemd will automatically reload the unit. Now, whenever `nginx` enters a failed state, systemd will instantiate `notify-failure@nginx.service` and run the notification command.
+
+Verify the override is in place:
+
+```bash
+systemctl cat nginx | grep OnFailure
+```
+
+---
+
+## Custom Log Monitoring with Shell and Cron
+
+For situations where logwatch's built-in parsers are insufficient and fail2ban's pattern-ban model does not apply, a simple shell script scheduled via cron can monitor for specific patterns and send alerts.
+
+The following example watches `/var/log/messages` for disk error patterns and sends an email if any are found since the last check. The key design is using a state file to track where the last check left off, so each run only examines new lines rather than re-reading the entire file.
+
+```bash
+nano /usr/local/sbin/check-disk-errors.sh
+```
+
+```bash
+#!/bin/bash
+# check-disk-errors.sh
+# Searches for disk I/O errors in /var/log/messages since last run
+# and sends an alert email if any are found.
+
+LOGFILE="/var/log/messages"
+STATEFILE="/var/lib/check-disk-errors/last-position"
+ALERTMAIL="admin@example.com"
+HOSTNAME=$(hostname)
+
+# Create state directory if it doesn't exist
+mkdir -p "$(dirname "$STATEFILE")"
+
+# Read the last file position checked; default to 0
+LASTPOS=0
+if [[ -f "$STATEFILE" ]]; then
+    LASTPOS=$(cat "$STATEFILE")
+fi
+
+# Get the current size of the log file
+CURRENTSIZE=$(wc -c < "$LOGFILE")
+
+# If the file is smaller than last time, it was rotated — start from 0
+if [[ "$CURRENTSIZE" -lt "$LASTPOS" ]]; then
+    LASTPOS=0
+fi
+
+# Extract new lines since last position and search for disk errors
+MATCHES=$(tail -c +"$((LASTPOS + 1))" "$LOGFILE" | grep -i "I/O error\|blk_update_request\|Buffer I/O error")
+
+# Save the current position for next run
+echo "$CURRENTSIZE" > "$STATEFILE"
+
+# If matches were found, send an alert
+if [[ -n "$MATCHES" ]]; then
+    echo "$MATCHES" | mail -s "Disk I/O Errors Detected on $HOSTNAME" "$ALERTMAIL"
+fi
+```
+
+Make the script executable:
+
+```bash
+chmod +x /usr/local/sbin/check-disk-errors.sh
+```
+
+Schedule it to run every 15 minutes via cron:
+
+```bash
+crontab -e
+```
+
+```
+*/15 * * * * /usr/local/sbin/check-disk-errors.sh
+```
+
+The state file approach ensures that each run only examines the lines written since the previous run, making it efficient even on busy systems with large log files.
+
+:::warning
+Scripts like this require a working local mail transfer agent to send alerts. Test the mail path first with a direct `echo "test" | mail -s "test" admin@example.com` before relying on the script for alerts. A script that silently fails to send email is worse than no monitoring at all.
+:::
+
+---
+
+## Watching the Journal with systemd-cat and OnCalendar
+
+For monitoring the journal rather than text files, a simple approach is a systemd timer that runs a check script on a schedule. This is more robust than a raw cron job because systemd handles missed runs, logging, and dependency management.
+
+Create a service that checks for recent journal errors:
+
+```bash
+nano /etc/systemd/system/journal-error-check.service
+```
+
+```ini
+[Unit]
+Description=Check journal for recent errors and alert
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/journal-error-check.sh
+```
+
+Create the accompanying timer:
+
+```bash
+nano /etc/systemd/system/journal-error-check.timer
+```
+
+```ini
+[Unit]
+Description=Run journal error check every 30 minutes
+
+[Timer]
+OnCalendar=*:0/30
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+```
+
+Enable and start the timer:
+
+```bash
+systemctl daemon-reload
+systemctl enable --now journal-error-check.timer
+```
+
+Verify the timer is active and see when it will next run:
+
+```bash
+systemctl list-timers journal-error-check.timer
+```
+
+The `Persistent=true` setting ensures that if the system was off when a scheduled run was due, it will execute the job at the next boot rather than skipping it.
+
+---
+
+## Summary
+
+Log monitoring on AlmaLinux is built from complementary layers: periodic summaries from `logwatch`, real-time pattern response from `fail2ban`, service failure notifications from systemd, and custom scripts for application-specific requirements. No single tool covers every scenario, and a practical setup typically uses several of them together.
+
+Key points to remember:
+
+- Configure logwatch in `/etc/logwatch/conf/logwatch.conf` only — never edit the default config files directly
+- fail2ban jails are configured in `/etc/fail2ban/jail.local` to survive package updates
+- Use `fail2ban-regex` to verify a filter matches your actual log entries before enabling a jail
+- The `banaction = firewallcmd-rich-rules` setting is the correct choice for AlmaLinux with firewalld
+- Use `fail2ban-client set <jail> unbanip <address>` to release incorrectly blocked IPs immediately
+- systemd `OnFailure` with a template notification unit is a lightweight way to alert on service crashes
+- State-file-based shell scripts avoid re-reading entire log files on every check run
+- Always verify the mail delivery path before depending on email alerts from any monitoring tool
+
+### Related Pages
+
+- [System Logging](./system-logging) — rsyslog and the systemd journal fundamentals
+- [Log Analysis](./log-analysis) — querying and parsing logs with journalctl and grep
+- [Error Logging](./error-logging) — locating and interpreting error messages
+- [Secure Logging](./secure-logging) — hardening log integrity and access controls
+- [Centralized Logging](./centralized-logging) — forwarding logs to a central server

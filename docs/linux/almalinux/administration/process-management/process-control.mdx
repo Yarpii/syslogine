@@ -1,0 +1,392 @@
+---
+sidebar_position: 2
+title: "Process Control | AlmaLinux"
+sidebar_label: "Process Control"
+description: "Control processes on AlmaLinux with systemctl, kill, killall, and manage systemd services and units effectively."
+keywords:
+  - "almalinux process control"
+  - "almalinux kill"
+  - "almalinux systemctl"
+  - "almalinux killall"
+  - "rhel process management"
+tags:
+  - almalinux
+  - process-management
+  - system-administration
+  - systemd
+slug: /linux/almalinux/administration/process-management/process-control
+---
+
+# Process Control
+
+Finding a process is only the first step. Controlling it — starting, stopping, reloading, pausing, or terminating it safely — is where process management gets practical. AlmaLinux gives you two layers of control: systemd for managed services, and direct signal-based control for individual processes.
+
+## Signals overview
+
+Linux process control is built on signals. Every `kill`, `stop`, and `reload` operation sends a signal to the target process.
+
+| Signal | Number | Meaning |
+|--------|--------|---------|
+| `SIGHUP` | 1 | Reload configuration |
+| `SIGINT` | 2 | Interrupt (same as Ctrl+C) |
+| `SIGQUIT` | 3 | Quit with core dump |
+| `SIGKILL` | 9 | Force kill — cannot be caught or ignored |
+| `SIGTERM` | 15 | Graceful termination request (default) |
+| `SIGSTOP` | 19 | Pause process — cannot be caught or ignored |
+| `SIGCONT` | 18 | Resume a paused process |
+| `SIGUSR1` | 10 | User-defined signal 1 (often used for log rotation) |
+| `SIGUSR2` | 12 | User-defined signal 2 |
+
+```bash
+# List all available signals
+kill -l
+```
+
+## Control services with systemctl
+
+For services managed by systemd, always use `systemctl` rather than sending signals directly. systemd handles dependencies, restart policies, and logging automatically.
+
+```bash
+# Start a service
+sudo systemctl start nginx
+
+# Stop a service
+sudo systemctl stop nginx
+
+# Restart a service (stop then start)
+sudo systemctl restart nginx
+
+# Reload configuration without restarting
+sudo systemctl reload nginx
+
+# Reload if supported, restart if not
+sudo systemctl reload-or-restart nginx
+
+# Enable a service to start at boot
+sudo systemctl enable nginx
+
+# Disable a service from starting at boot
+sudo systemctl disable nginx
+
+# Enable and start in one step
+sudo systemctl enable --now nginx
+
+# Disable and stop in one step
+sudo systemctl disable --now nginx
+```
+
+### Check service status
+
+```bash
+# Current status and recent log output
+systemctl status nginx
+
+# Just the active/inactive state
+systemctl is-active nginx
+
+# Just the enabled/disabled state
+systemctl is-enabled nginx
+
+# Just the failed state
+systemctl is-failed nginx
+```
+
+### Reload systemd after unit file changes
+
+```bash
+# Always reload after editing unit files
+sudo systemctl daemon-reload
+```
+
+## Send signals with kill
+
+`kill` sends a signal to a process by PID. Despite the name, it is not limited to termination — it can send any signal.
+
+```bash
+# Graceful termination (SIGTERM) — default
+kill 1234
+
+# Force kill (SIGKILL) — use when SIGTERM fails
+kill -9 1234
+
+# Reload configuration (SIGHUP)
+kill -1 1234
+
+# Pause a process (SIGSTOP)
+kill -19 1234
+
+# Resume a paused process (SIGCONT)
+kill -18 1234
+
+# Using signal names instead of numbers
+kill -SIGTERM 1234
+kill -SIGKILL 1234
+kill -SIGHUP 1234
+```
+
+:::tip
+Always try `SIGTERM` first. It gives the process a chance to clean up, flush buffers, and close connections gracefully. Only escalate to `SIGKILL` if the process does not respond.
+:::
+
+## Send signals with pkill and killall
+
+`pkill` and `killall` let you target processes by name instead of PID.
+
+```bash
+# Graceful termination by name
+pkill nginx
+
+# Force kill by name
+pkill -9 nginx
+
+# Send SIGHUP (reload) by name
+pkill -HUP nginx
+
+# Kill all processes owned by a user
+sudo pkill -u jdoe
+
+# Kill processes matching a pattern
+pkill -f "php-fpm: worker"
+
+# killall — similar to pkill but matches exact names
+killall nginx
+killall -9 nginx
+```
+
+:::warning
+`pkill` and `killall` affect all matching processes. Double-check the process name before using them on a production system.
+
+```bash
+# Preview what would be killed
+pgrep -a nginx
+```
+:::
+
+## Graceful shutdown sequence
+
+For critical services, follow a deliberate shutdown sequence:
+
+```bash
+#!/bin/bash
+# graceful-stop.sh — stop a service gracefully with fallback
+
+SERVICE="$1"
+TIMEOUT=30
+
+if [[ -z "$SERVICE" ]]; then
+  echo "Usage: $0 servicename"
+  exit 1
+fi
+
+echo "Stopping $SERVICE gracefully..."
+systemctl stop "$SERVICE"
+
+# Wait up to TIMEOUT seconds
+for i in $(seq 1 $TIMEOUT); do
+  if ! systemctl is-active --quiet "$SERVICE"; then
+    echo "$SERVICE stopped cleanly after ${i}s"
+    exit 0
+  fi
+  sleep 1
+done
+
+echo "$SERVICE did not stop within ${TIMEOUT}s — sending SIGKILL"
+PID=$(systemctl show "$SERVICE" --property=MainPID | cut -d= -f2)
+[[ -n "$PID" && "$PID" -gt 0 ]] && kill -9 "$PID"
+sleep 2
+systemctl kill "$SERVICE"
+echo "Done"
+```
+
+## Pause and resume processes
+
+Pausing a process suspends its execution without terminating it. Useful for temporarily freeing CPU without losing process state.
+
+```bash
+# Pause a process
+kill -STOP $(pgrep backup-job)
+
+# Resume it
+kill -CONT $(pgrep backup-job)
+
+# Or by name
+pkill -STOP backup-job
+pkill -CONT backup-job
+```
+
+## Control process groups
+
+Signals can be sent to an entire process group — the parent and all its children — by prefixing the PGID with a minus sign.
+
+```bash
+# Find the process group ID
+ps -o pgid= -p 1234
+
+# Send SIGTERM to the entire process group
+kill -- -PGID
+
+# Example
+PGID=$(ps -o pgid= -p $(pgrep nginx | head -1) | tr -d ' ')
+kill -TERM -$PGID
+```
+
+## Manage jobs in the shell
+
+```bash
+# Run a command in the background
+long-running-command &
+
+# List background jobs
+jobs
+
+# Bring a background job to the foreground
+fg %1
+
+# Send a foreground job to the background
+# Press Ctrl+Z to pause, then:
+bg %1
+
+# Disown a job so it survives shell exit
+disown %1
+
+# Run a command immune to hangup
+nohup long-running-command &
+```
+
+## Run processes with timeout
+
+`timeout` terminates a process automatically if it runs too long — useful in scripts and cron jobs.
+
+```bash
+# Kill the command after 30 seconds
+timeout 30 long-running-command
+
+# Send SIGKILL if SIGTERM does not work within 5 seconds
+timeout --kill-after=5 30 long-running-command
+
+# Use in a script
+if ! timeout 60 /usr/local/bin/backup.sh; then
+  echo "Backup timed out or failed"
+fi
+```
+
+## Force kill stuck processes
+
+When a process ignores SIGTERM, escalate:
+
+```bash
+# Step 1 — try graceful termination
+kill -TERM $(pgrep stuck-process)
+sleep 5
+
+# Step 2 — check if still running
+if pgrep -x stuck-process > /dev/null; then
+  echo "Process still running — sending SIGKILL"
+  kill -KILL $(pgrep stuck-process)
+fi
+
+# For systemd services
+sudo systemctl kill --signal=SIGKILL nginx
+```
+
+## Terminate all processes for a user
+
+Useful during user deprovisioning or emergency response:
+
+```bash
+# Graceful termination first
+sudo pkill -TERM -u jdoe
+sleep 5
+
+# Force kill anything remaining
+sudo pkill -KILL -u jdoe
+
+# Verify
+pgrep -u jdoe || echo "No processes remaining for jdoe"
+```
+
+## systemctl kill — signal a service cleanly
+
+`systemctl kill` sends a signal to all processes in a service's cgroup — not just the main PID.
+
+```bash
+# Send SIGTERM to all processes in the nginx service
+sudo systemctl kill nginx
+
+# Send SIGKILL to all processes in the service
+sudo systemctl kill --signal=SIGKILL nginx
+
+# Send SIGHUP only to the main process
+sudo systemctl kill --kill-who=main --signal=SIGHUP nginx
+
+# Send to all processes in the service
+sudo systemctl kill --kill-who=all --signal=SIGTERM nginx
+```
+
+## Common mistakes
+
+### Using SIGKILL as the first option
+
+SIGKILL does not give a process time to clean up. Open files may not be flushed, database transactions may be left incomplete, and temporary files may remain.
+
+```bash
+# WRONG — skips cleanup
+kill -9 1234
+
+# CORRECT — give the process a chance to exit cleanly
+kill -TERM 1234
+sleep 5
+kill -KILL 1234  # only if still running
+```
+
+### Using pkill without verifying what matches
+
+```bash
+# Always check first
+pgrep -a php
+
+# Then kill
+pkill php
+```
+
+### Killing the parent without handling children
+
+Killing a parent process does not always kill its children. They may be reparented to PID 1 and continue running.
+
+```bash
+# Use systemctl kill to target the whole cgroup
+sudo systemctl kill --signal=SIGTERM myservice
+
+# Or kill the process group
+kill -TERM -$(ps -o pgid= -p PARENT_PID | tr -d ' ')
+```
+
+### Forgetting daemon-reload after editing unit files
+
+Edited unit files are not picked up until systemd is reloaded.
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl restart myservice
+```
+
+## Summary
+
+Process control on AlmaLinux is cleanest through systemd for managed services, and through signals for everything else. The key is to be deliberate — always try graceful termination before forcing it.
+
+Key points:
+
+- use `systemctl start/stop/restart/reload` for systemd-managed services
+- use `kill -TERM` first, escalate to `kill -KILL` only when necessary
+- use `pkill -a` to preview what will be affected before sending signals
+- use `systemctl kill` to signal all processes in a service cgroup at once
+- use `timeout` in scripts to prevent runaway processes
+- use `nohup` and `disown` to keep background jobs running after shell exit
+- always run `systemctl daemon-reload` after editing unit files
+
+:::tip Related pages
+- [Process Discovery](./process-discovery)
+- [Process Priority](./process-priority)
+- [Service Management](./service-management)
+- [Resource Controls](./resource-controls)
+:::

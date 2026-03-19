@@ -1,0 +1,388 @@
+---
+sidebar_position: 2
+title: "Stopping Services | AlmaLinux"
+sidebar_label: "Stopping Services"
+description: "Gracefully stop services with systemctl stop, handle service shutdown, and manage service termination on AlmaLinux."
+keywords:
+  - "almalinux stop service"
+  - "almalinux systemctl stop"
+  - "almalinux service shutdown"
+  - "almalinux disable service"
+  - "rhel stop service"
+tags:
+  - almalinux
+  - service-management
+  - systemd
+slug: /linux/almalinux/administration/service-management/stopping-services
+---
+
+# Stopping Services
+
+Stopping a service correctly matters as much as starting it. A clean shutdown flushes buffers, closes connections gracefully, and leaves the system in a consistent state. A forced stop can corrupt data, leave stale lock files, or break dependent services. AlmaLinux gives you the tools to stop services safely at every level — from graceful shutdown to emergency termination.
+
+## The difference between stop and disable
+
+| Command | Effect |
+|---------|--------|
+| `systemctl stop` | Stops the service **now** — it will still start at next boot |
+| `systemctl disable` | Removes it from **boot startup** — does not stop it now |
+| `systemctl disable --now` | Does both — stops now and removes from boot |
+
+```bash
+# Stop a service right now
+sudo systemctl stop nginx
+
+# Disable at boot only (does not stop it now)
+sudo systemctl disable nginx
+
+# Stop now AND disable at boot — the most common operation
+sudo systemctl disable --now nginx
+```
+
+## Verify a service stopped cleanly
+
+```bash
+# Full status
+systemctl status nginx
+
+# Just check the state
+systemctl is-active nginx
+# Output: inactive
+
+# Confirm no processes remain
+pgrep -a nginx
+```
+
+## Stop multiple services at once
+
+```bash
+sudo systemctl stop nginx php-fpm redis
+```
+
+## Graceful stop vs force kill
+
+systemd sends `SIGTERM` to a service when you run `systemctl stop`. The service has a configurable timeout to finish its work before systemd escalates to `SIGKILL`.
+
+```bash
+# Default graceful stop
+sudo systemctl stop nginx
+
+# Check the default timeout
+systemctl show nginx --property=TimeoutStopSec
+```
+
+The default `TimeoutStopSec` is 90 seconds. After that, systemd sends `SIGKILL` automatically.
+
+### Adjust the stop timeout
+
+```bash
+sudo systemctl edit nginx
+```
+
+```ini
+[Service]
+# Give the service more time to stop gracefully
+TimeoutStopSec=120
+
+# Stop immediately with SIGKILL (no graceful shutdown)
+TimeoutStopSec=0
+```
+
+### Force kill a service immediately
+
+When a service is unresponsive and you cannot wait:
+
+```bash
+# Send SIGKILL to all processes in the service cgroup
+sudo systemctl kill --signal=SIGKILL nginx
+
+# Or kill just the main process
+sudo systemctl kill --kill-who=main --signal=SIGKILL nginx
+```
+
+## Stop a service and check its exit status
+
+```bash
+sudo systemctl stop myapp
+
+# Check how it exited
+systemctl show myapp --property=ExecMainStatus
+systemctl show myapp --property=Result
+
+# View the shutdown log
+journalctl -u myapp -b | tail -20
+```
+
+A clean exit shows `Result=success`. Anything else — `Result=timeout`, `Result=signal`, `Result=exit-code` — warrants investigation.
+
+## Stop a service before maintenance
+
+A safe maintenance stop sequence:
+
+```bash
+#!/bin/bash
+# maintenance-stop.sh — stop a service safely before maintenance
+
+SERVICE="$1"
+TIMEOUT=60
+
+if [[ -z "$SERVICE" ]]; then
+  echo "Usage: $0 servicename"
+  exit 1
+fi
+
+# Check the service is actually running
+if ! systemctl is-active --quiet "$SERVICE"; then
+  echo "$SERVICE is not running"
+  exit 0
+fi
+
+echo "Stopping $SERVICE gracefully..."
+sudo systemctl stop "$SERVICE"
+
+# Wait for clean stop
+for i in $(seq 1 $TIMEOUT); do
+  if ! systemctl is-active --quiet "$SERVICE"; then
+    echo "$SERVICE stopped cleanly after ${i}s"
+
+    # Check exit status
+    RESULT=$(systemctl show "$SERVICE" --property=Result | cut -d= -f2)
+    if [[ "$RESULT" != "success" ]]; then
+      echo "WARNING: $SERVICE exited with result: $RESULT"
+    fi
+    exit 0
+  fi
+  sleep 1
+done
+
+echo "WARNING: $SERVICE did not stop within ${TIMEOUT}s — forcing kill"
+sudo systemctl kill --signal=SIGKILL "$SERVICE"
+sleep 2
+
+if systemctl is-active --quiet "$SERVICE"; then
+  echo "ERROR: $SERVICE is still running after SIGKILL"
+  exit 1
+fi
+
+echo "$SERVICE force-killed"
+```
+
+```bash
+sudo bash maintenance-stop.sh nginx
+```
+
+## Stop dependent services first
+
+When stopping a service that others depend on, stop the dependents first to avoid cascading failures.
+
+```bash
+# View what depends on postgresql
+systemctl list-dependencies postgresql --reverse
+
+# Stop dependents before the primary service
+sudo systemctl stop myapp myapp-worker
+sudo systemctl stop postgresql
+```
+
+Alternatively, use `PropagatesStopTo=` in the unit file to make this automatic:
+
+```ini
+# In postgresql.service override
+[Unit]
+# Stop these units when postgresql stops
+StopPropagatedFrom=myapp.service
+```
+
+## Disable a service permanently
+
+Disabling a service removes it from all targets so it no longer starts at boot.
+
+```bash
+# Disable and stop
+sudo systemctl disable --now nginx
+
+# Verify it is disabled
+systemctl is-enabled nginx
+# Output: disabled
+
+# Verify it is stopped
+systemctl is-active nginx
+# Output: inactive
+```
+
+### Mask a service — prevent it from ever starting
+
+Masking is stronger than disabling. A masked service cannot be started manually or as a dependency.
+
+```bash
+# Mask a service
+sudo systemctl mask nginx
+
+# Verify
+systemctl is-enabled nginx
+# Output: masked
+
+# Attempting to start a masked service fails
+sudo systemctl start nginx
+# Failed to start nginx.service: Unit nginx.service is masked.
+
+# Unmask when needed
+sudo systemctl unmask nginx
+```
+
+Use masking for services that should never run on a particular host — for example, disabling a GUI display manager on a headless server.
+
+## Stop a service after a delay
+
+Use `systemd-run` with `--on-active` to schedule a stop after a defined period:
+
+```bash
+# Stop nginx in 30 minutes
+sudo systemd-run --on-active=30m systemctl stop nginx
+```
+
+Or use `at` for a specific time:
+
+```bash
+echo "systemctl stop nginx" | sudo at 02:00
+```
+
+## Handle services that ignore SIGTERM
+
+Some poorly written services ignore `SIGTERM`. You can configure systemd to send a different signal for graceful stop.
+
+```bash
+sudo systemctl edit myapp
+```
+
+```ini
+[Service]
+# Send SIGINT instead of SIGTERM for graceful stop
+KillSignal=SIGINT
+
+# Send SIGQUIT as the final signal instead of SIGKILL
+FinalKillSignal=SIGQUIT
+
+# How long to wait between KillSignal and FinalKillSignal
+TimeoutStopSec=30
+```
+
+## Clean up after a stopped service
+
+Some services leave behind PID files, sockets, or lock files. systemd can clean these up automatically.
+
+```bash
+sudo systemctl edit myapp
+```
+
+```ini
+[Service]
+# Remove the PID file after the service stops
+PIDFile=/run/myapp/myapp.pid
+
+# Clean up the runtime directory on stop
+RuntimeDirectory=myapp
+RuntimeDirectoryMode=0755
+```
+
+For manual cleanup:
+
+```bash
+# Remove stale PID file
+sudo rm -f /run/myapp/myapp.pid
+
+# Remove stale socket
+sudo rm -f /run/myapp/myapp.sock
+
+# Verify no processes remain
+pgrep -a myapp || echo "No processes remaining"
+```
+
+## Stop all services in a slice
+
+To stop all services in a custom slice at once:
+
+```bash
+# Stop all services in the webstack slice
+sudo systemctl stop webstack.slice
+
+# Stop all services in the system slice (use with extreme care)
+# sudo systemctl stop system.slice
+```
+
+## Emergency stop — when the system is unresponsive
+
+If a runaway service is making the system unresponsive:
+
+```bash
+# Kill everything in the service cgroup
+sudo systemctl kill --signal=SIGKILL servicename
+
+# If systemctl itself is unresponsive, use the cgroup filesystem directly
+CGROUP="/sys/fs/cgroup/system.slice/servicename.service"
+cat "${CGROUP}/cgroup.procs" | xargs sudo kill -9
+```
+
+## Common mistakes
+
+### Stopping without disabling — service restarts at next boot
+
+```bash
+# WRONG — stops now but restarts on reboot
+sudo systemctl stop nginx
+
+# CORRECT if you want it gone permanently
+sudo systemctl disable --now nginx
+```
+
+### Using kill -9 directly instead of systemctl kill
+
+Bypassing systemd means the service may be restarted by systemd's restart policy before you can act.
+
+```bash
+# WRONG — systemd may restart it immediately
+sudo kill -9 $(pgrep nginx)
+
+# CORRECT — systemd stops the whole cgroup and respects restart policy
+sudo systemctl stop nginx
+```
+
+### Not stopping dependent services first
+
+Stopping a database while applications are still writing to it can corrupt data or leave applications in a broken state.
+
+```bash
+# Always check what depends on a service before stopping it
+systemctl list-dependencies postgresql --reverse
+```
+
+### Masking without documenting why
+
+A masked service produces confusing errors when someone tries to start it later. Document it.
+
+```bash
+# Mask with a comment in a note or wiki
+sudo systemctl mask nginx
+echo "nginx masked on $(date) — replaced by caddy" | sudo tee /etc/systemd/system/nginx-masked.note
+```
+
+## Summary
+
+Stopping services on AlmaLinux cleanly is about giving processes time to finish their work, handling dependencies in the right order, and understanding when to escalate from graceful to forced termination.
+
+Key points:
+
+- use `systemctl disable --now` to stop and remove from boot in one step
+- check `Result=` after a stop to confirm it exited cleanly
+- use `systemctl kill --signal=SIGKILL` for force termination — not `kill -9` directly
+- use `mask` to permanently prevent a service from starting on a host
+- stop dependent services before stopping their dependencies
+- configure `TimeoutStopSec` for services that need more time to shut down gracefully
+- use `KillSignal=` for services that need a different signal than SIGTERM
+
+:::tip Related pages
+- [Starting Services](./starting-services)
+- [Service Configuration](./service-configuration)
+- [Service Status](./service-status)
+- [Service Dependencies](./service-dependencies)
+:::

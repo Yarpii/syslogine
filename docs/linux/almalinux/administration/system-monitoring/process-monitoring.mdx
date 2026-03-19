@@ -1,0 +1,410 @@
+---
+sidebar_position: 2
+title: "Process Monitoring | AlmaLinux"
+sidebar_label: "Process Monitoring"
+description: "Track and manage processes on AlmaLinux with ps, pstree, systemd-cgtop, and monitor systemd services effectively."
+keywords:
+  - "almalinux process monitoring"
+  - "almalinux ps"
+  - "almalinux pstree"
+  - "almalinux systemd-cgtop"
+  - "rhel process management"
+tags:
+  - almalinux
+  - system-monitoring
+  - processes
+  - systemd
+slug: /linux/almalinux/administration/system-monitoring/process-monitoring
+---
+
+# Process Monitoring
+
+Understanding what processes are running, how much they consume, and how they relate to each other is essential for diagnosing performance issues, catching runaway processes, and maintaining a stable system. AlmaLinux provides a rich set of tools for both real-time and historical process monitoring.
+
+## Install monitoring tools
+
+```bash
+sudo dnf install -y \
+  procps-ng \
+  htop \
+  sysstat \
+  psmisc \
+  lsof
+```
+
+## List running processes with ps
+
+`ps` is the primary tool for inspecting processes at a point in time.
+
+```bash
+# Show all processes with full details
+ps aux
+
+# Show all processes in full format
+ps -ef
+
+# Sort by CPU usage
+ps aux --sort=-%cpu | head -15
+
+# Sort by memory usage
+ps aux --sort=-%mem | head -15
+
+# Show a specific process by name
+ps aux | grep nginx
+
+# Show a specific process by PID
+ps -p 1234 -o pid,ppid,user,cmd,%cpu,%mem
+```
+
+### Useful ps output columns
+
+| Column | Meaning |
+|--------|---------|
+| `PID` | Process ID |
+| `PPID` | Parent process ID |
+| `USER` | Owner of the process |
+| `%CPU` | CPU usage since process started |
+| `%MEM` | Percentage of physical memory used |
+| `VSZ` | Virtual memory size (KB) |
+| `RSS` | Resident set size — actual RAM used (KB) |
+| `STAT` | Process state |
+| `CMD` | Command that started the process |
+
+### Process states
+
+| State | Meaning |
+|-------|---------|
+| `R` | Running or runnable |
+| `S` | Sleeping (waiting for an event) |
+| `D` | Uninterruptible sleep (usually I/O wait) |
+| `Z` | Zombie — finished but not yet reaped by parent |
+| `T` | Stopped |
+
+A large number of `D` state processes usually indicates a disk I/O bottleneck. Zombie processes (`Z`) in large numbers suggest a parent process is not cleaning up after its children.
+
+## View process tree with pstree
+
+`pstree` shows how processes relate to each other — which process spawned which.
+
+```bash
+# Full process tree
+pstree
+
+# Show PIDs alongside process names
+pstree -p
+
+# Show tree for a specific user
+pstree -u jdoe
+
+# Show tree rooted at a specific PID
+pstree -p 1234
+
+# Show tree with arguments
+pstree -a
+```
+
+## Real-time monitoring with htop
+
+`htop` combines a process list with CPU and memory meters in an interactive interface.
+
+```bash
+htop
+
+# Start filtered to a specific user
+htop -u jdoe
+
+# Start sorted by memory
+htop --sort-key=PERCENT_MEM
+```
+
+Useful `htop` keybindings:
+
+| Key | Action |
+|-----|--------|
+| `F2` | Setup / customise columns |
+| `F3` | Search for a process |
+| `F4` | Filter by string |
+| `F5` | Tree view |
+| `F6` | Sort by column |
+| `F9` | Send a signal to a process |
+| `u` | Filter by user |
+| `t` | Toggle tree view |
+
+## Monitor processes with pidstat
+
+`pidstat` from the `sysstat` package shows per-process CPU, memory, and I/O stats over time.
+
+```bash
+# CPU usage per process, update every 2 seconds
+pidstat 2
+
+# Memory usage per process
+pidstat -r 2
+
+# I/O stats per process
+pidstat -d 2
+
+# Stats for a specific PID
+pidstat -p 1234 2
+
+# Stats for a specific process name
+pidstat -C nginx 2
+
+# All stats combined
+pidstat -urd 2
+```
+
+## Monitor systemd services
+
+On AlmaLinux, most long-running processes are managed by systemd. Monitoring at the service level gives a cleaner picture than tracking individual PIDs.
+
+```bash
+# List all active services
+systemctl list-units --type=service --state=active
+
+# List all failed services
+systemctl list-units --type=service --state=failed
+
+# Status of a specific service
+systemctl status nginx
+
+# Show all properties of a service
+systemctl show nginx
+
+# Watch a service status in real time
+watch -n 2 systemctl status nginx
+```
+
+### Check service resource usage
+
+```bash
+# Memory and CPU used by a service
+systemctl status nginx | grep -E "Memory|CPU"
+
+# Detailed cgroup resource usage
+systemd-cgtop
+
+# Resource usage for a specific service slice
+cat /sys/fs/cgroup/system.slice/nginx.service/memory.current
+```
+
+## Monitor processes with systemd-cgtop
+
+`systemd-cgtop` shows resource consumption broken down by systemd service and cgroup — useful for identifying which service is the biggest consumer.
+
+```bash
+# Live view
+systemd-cgtop
+
+# Sort by memory
+systemd-cgtop -m
+
+# Sort by CPU
+systemd-cgtop -c
+
+# Sort by I/O
+systemd-cgtop -i
+
+# Non-interactive, 5 iterations
+systemd-cgtop -n 5 -b
+```
+
+## Find processes by file or port
+
+```bash
+# Which process is using a specific port
+sudo ss -tlnp | grep :80
+sudo lsof -i :80
+
+# Which process has a specific file open
+sudo lsof /var/log/nginx/access.log
+
+# Which process is using a specific directory
+sudo lsof +D /var/www/html
+
+# Find the PID of a process by name
+pgrep nginx
+
+# Find the PID and full command
+pgrep -a nginx
+```
+
+## Monitor process file descriptor usage
+
+File descriptor exhaustion can cause services to stop accepting connections. Monitor it proactively.
+
+```bash
+# Total open file descriptors system-wide
+cat /proc/sys/fs/file-nr
+
+# Open file descriptors for a specific PID
+ls -l /proc/$(pgrep nginx | head -1)/fd | wc -l
+
+# Top processes by open file descriptors
+for pid in /proc/[0-9]*; do
+  echo "$(ls ${pid}/fd 2>/dev/null | wc -l) $(cat ${pid}/comm 2>/dev/null)"
+done | sort -rn | head -10
+```
+
+## Trace system calls with strace
+
+`strace` attaches to a running process and shows every system call it makes. Useful for diagnosing stuck or misbehaving processes.
+
+```bash
+# Attach to a running process
+sudo strace -p $(pgrep nginx | head -1)
+
+# Trace with timestamps
+sudo strace -t -p $(pgrep nginx | head -1)
+
+# Count syscalls and show summary
+sudo strace -c -p $(pgrep nginx | head -1)
+
+# Trace only file-related syscalls
+sudo strace -e trace=file -p $(pgrep nginx | head -1)
+```
+
+:::warning
+`strace` adds significant overhead to the traced process. Use it only in diagnostics, not as a permanent monitoring tool.
+:::
+
+## Detect zombie processes
+
+Zombies are processes that have finished but whose parent has not called `wait()` to collect the exit status. A few zombies are normal. Many zombies indicate a bug in the parent process.
+
+```bash
+# Count zombie processes
+ps aux | awk '{print $8}' | grep -c Z
+
+# List zombie processes with their parent
+ps aux | awk '$8 == "Z" {print $0}'
+
+# Find the parent of a zombie
+ps -p ZOMBIE_PID -o ppid=
+```
+
+You cannot kill a zombie directly — it has already exited. Restarting or killing the parent process will cause the kernel to reap the zombie.
+
+## Scripted process monitoring
+
+A script to alert when a critical service is not running or a process exceeds a resource threshold:
+
+```bash
+#!/bin/bash
+# process-monitor.sh — check critical services and resource usage
+
+SERVICES=("nginx" "sshd" "postgresql")
+CPU_THRESHOLD=80
+MEM_THRESHOLD=80
+ALERT_EMAIL="ops@example.com"
+HOSTNAME=$(hostname)
+ALERTS=()
+
+# Check each service is active
+for service in "${SERVICES[@]}"; do
+  if ! systemctl is-active --quiet "$service"; then
+    ALERTS+=("SERVICE DOWN: $service is not running on ${HOSTNAME}")
+  fi
+done
+
+# Check for processes exceeding CPU threshold
+while IFS= read -r line; do
+  CPU=$(echo "$line" | awk '{print $3}' | cut -d. -f1)
+  CMD=$(echo "$line" | awk '{print $11}')
+  PID=$(echo "$line" | awk '{print $2}')
+  if [[ "$CPU" -gt "$CPU_THRESHOLD" ]]; then
+    ALERTS+=("HIGH CPU: PID $PID ($CMD) at ${CPU}% CPU")
+  fi
+done < <(ps aux | tail -n +2)
+
+# Check for processes exceeding memory threshold
+while IFS= read -r line; do
+  MEM=$(echo "$line" | awk '{print $4}' | cut -d. -f1)
+  CMD=$(echo "$line" | awk '{print $11}')
+  PID=$(echo "$line" | awk '{print $2}')
+  if [[ "$MEM" -gt "$MEM_THRESHOLD" ]]; then
+    ALERTS+=("HIGH MEM: PID $PID ($CMD) at ${MEM}% memory")
+  fi
+done < <(ps aux | tail -n +2)
+
+# Send alert if needed
+if [[ "${#ALERTS[@]}" -gt 0 ]]; then
+  MESSAGE="Process alert on ${HOSTNAME}:\n\n$(printf '%s\n' "${ALERTS[@]}")"
+  echo -e "$MESSAGE" | mail -s "Process Alert: ${HOSTNAME}" "$ALERT_EMAIL"
+  echo -e "$MESSAGE"
+fi
+```
+
+Schedule with cron:
+
+```bash
+sudo crontab -e
+```
+
+```
+*/5 * * * * /usr/local/bin/process-monitor.sh >> /var/log/process-monitor.log 2>&1
+```
+
+## Common mistakes
+
+### Using %CPU from ps as a real-time figure
+
+`ps` calculates `%CPU` as an average since the process started, not the current moment. Use `top`, `htop`, or `pidstat` for real-time CPU usage.
+
+### Trying to kill zombie processes directly
+
+Zombies are already dead — `kill` has no effect. Identify and restart the parent process instead.
+
+```bash
+# Find and restart the parent of a zombie
+ZOMBIE_PID=1234
+PARENT_PID=$(ps -p $ZOMBIE_PID -o ppid= | tr -d ' ')
+sudo systemctl restart $(ps -p $PARENT_PID -o comm=)
+```
+
+### Ignoring D state processes
+
+Processes stuck in uninterruptible sleep (`D`) often indicate storage issues. Check disk health and I/O wait when you see many `D` state processes.
+
+```bash
+ps aux | awk '$8 ~ /D/ {print $0}'
+```
+
+### Not checking open file descriptor limits
+
+Services that run out of file descriptors fail silently or with confusing errors. Check and raise limits proactively.
+
+```bash
+# Check the system-wide limit
+cat /proc/sys/fs/file-max
+
+# Raise the limit for a service via systemd
+sudo systemctl edit nginx
+```
+
+```ini
+[Service]
+LimitNOFILE=65536
+```
+
+## Summary
+
+Process monitoring on AlmaLinux ranges from quick snapshots with `ps` to deep per-process tracing with `strace`. For day-to-day operations, combining `htop`, `systemctl`, and `systemd-cgtop` gives you a clear picture of what is running and what is consuming resources.
+
+Key points:
+
+- use `ps aux --sort=-%cpu` and `--sort=-%mem` for quick snapshots
+- use `htop` for interactive real-time monitoring
+- use `pidstat` for per-process CPU, memory, and I/O trends over time
+- use `systemctl` and `systemd-cgtop` to monitor at the service level
+- use `lsof` and `ss` to find which process owns a port or file
+- watch for `D` state processes as a sign of I/O problems
+- watch for growing zombie counts as a sign of a misbehaving parent process
+- script service checks and schedule them with cron for proactive alerting
+
+:::tip Related pages
+- [Resource Monitoring](./resource-monitoring)
+- [Storage Monitoring](./storage-monitoring)
+- [Performance Analysis](./performance-analysis)
+- [Metrics Collection](./metrics-collection)
+:::

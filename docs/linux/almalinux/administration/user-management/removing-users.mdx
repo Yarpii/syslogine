@@ -1,0 +1,310 @@
+---
+sidebar_position: 2
+title: "Removing Users | AlmaLinux"
+sidebar_label: "Removing Users"
+description: "Safely remove local users on AlmaLinux with userdel, manage home directory and data retention, and implement secure user deprovisioning."
+keywords:
+  - "almalinux remove user"
+  - "almalinux userdel"
+  - "almalinux delete user"
+  - "almalinux user deprovisioning"
+  - "rhel remove user"
+tags:
+  - almalinux
+  - user-management
+  - system-administration
+slug: /linux/almalinux/administration/user-management/removing-users
+---
+
+# Removing Users
+
+AlmaLinux uses `userdel` to remove local user accounts. Before removing a user, it is important to decide what happens to their files, running processes, and any services tied to that account. A careless removal can leave orphaned files, break running services, or cause data loss.
+
+## Basic user removal
+
+The simplest form removes the user account but **leaves the home directory and mail spool intact**.
+
+```bash
+sudo userdel username
+```
+
+This removes the user from:
+- `/etc/passwd`
+- `/etc/shadow`
+- `/etc/group`
+
+It does **not** remove:
+- `/home/username`
+- `/var/spool/mail/username`
+- Files owned by that user elsewhere on the system
+
+## Remove a user and their home directory
+
+To also delete the home directory and mail spool:
+
+```bash
+sudo userdel --remove username
+```
+
+:::warning
+This permanently deletes `/home/username` and all its contents. Make sure you have a backup or have confirmed the data is no longer needed before running this.
+:::
+
+## Check if a user exists before removing
+
+```bash
+id username
+```
+
+Or check `/etc/passwd` directly:
+
+```bash
+getent passwd username
+```
+
+If the user does not exist, `userdel` will return an error. Use this in scripts to avoid failures:
+
+```bash
+if id username &>/dev/null; then
+  sudo userdel --remove username
+  echo "User removed."
+else
+  echo "User does not exist, skipping."
+fi
+```
+
+## Check for active sessions before removal
+
+Removing a user who is currently logged in can leave orphaned processes. Check first:
+
+```bash
+# Show currently logged-in users
+who
+
+# Show all active sessions
+loginctl list-sessions
+
+# Check for processes owned by the user
+ps -u username
+```
+
+If the user has active processes, terminate them before proceeding:
+
+```bash
+# Send SIGTERM first (graceful)
+sudo pkill -u username
+
+# Wait a moment, then force kill if needed
+sleep 3
+sudo pkill -9 -u username
+```
+
+## Lock an account before removing it
+
+In enterprise environments it is good practice to **lock the account first**, wait a period, then remove it. This gives time to catch anything that depended on that account before it is gone permanently.
+
+```bash
+# Step 1: lock the account immediately
+sudo usermod --lock username
+
+# Step 2: set an expiration date in the past to disable login
+sudo usermod --expiredate 1 username
+
+# Step 3: after a retention period, remove the account
+sudo userdel --remove username
+```
+
+Verify the account is locked:
+
+```bash
+sudo passwd --status username
+# L in the second field means locked
+```
+
+## Find files owned by a user before removal
+
+Before removing a user, it is worth finding all files they own across the system — not just in their home directory.
+
+```bash
+sudo find / -user username 2>/dev/null
+```
+
+To find files by UID (useful after the account is already deleted):
+
+```bash
+sudo find / -uid 1001 2>/dev/null
+```
+
+## Archive a user's home directory before removal
+
+If you need to retain the user's data, archive it before deleting:
+
+```bash
+# Create a compressed archive of the home directory
+sudo tar -czf /backup/username-$(date +%F).tar.gz /home/username
+
+# Verify the archive
+tar -tzf /backup/username-$(date +%F).tar.gz | head
+
+# Then remove the user and their home directory
+sudo userdel --remove username
+```
+
+## Transfer file ownership before removal
+
+If the user owned files that other users or services still need, reassign ownership before removing the account:
+
+```bash
+# Transfer all files owned by 'username' to 'newowner'
+sudo find / -user username -exec chown newowner {} \; 2>/dev/null
+```
+
+Or transfer ownership by UID after the account is removed:
+
+```bash
+# Replace orphaned UID 1001 with a new owner
+sudo find / -uid 1001 -exec chown newowner {} \; 2>/dev/null
+```
+
+## Remove a user from groups only
+
+If you want to revoke access without fully removing the account, remove the user from specific groups instead:
+
+```bash
+# Remove from a supplementary group
+sudo gpasswd --delete username groupname
+
+# Or use usermod to set the full group list explicitly
+sudo usermod --groups othergroup1,othergroup2 username
+```
+
+## Scripted bulk user removal
+
+For deprovisioning multiple users at once:
+
+```bash
+#!/bin/bash
+# deprovision-users.sh
+# Usage: sudo bash deprovision-users.sh users.txt
+#
+# users.txt format (one username per line)
+
+INPUT_FILE="$1"
+BACKUP_DIR="/backup/deprovisioned"
+
+if [[ -z "$INPUT_FILE" || ! -f "$INPUT_FILE" ]]; then
+  echo "Usage: $0 users.txt"
+  exit 1
+fi
+
+mkdir -p "$BACKUP_DIR"
+
+while IFS= read -r username; do
+  # Skip blank lines and comments
+  [[ -z "$username" || "$username" == \#* ]] && continue
+
+  if ! id "$username" &>/dev/null; then
+    echo "SKIP: $username does not exist"
+    continue
+  fi
+
+  # Kill active processes
+  pkill -u "$username" 2>/dev/null
+  sleep 1
+  pkill -9 -u "$username" 2>/dev/null
+
+  # Archive home directory if it exists
+  if [[ -d "/home/$username" ]]; then
+    tar -czf "$BACKUP_DIR/${username}-$(date +%F).tar.gz" "/home/$username"
+    echo "ARCHIVED: /home/$username -> $BACKUP_DIR/${username}-$(date +%F).tar.gz"
+  fi
+
+  # Remove the user and home directory
+  userdel --remove "$username"
+  echo "REMOVED: $username"
+
+done < "$INPUT_FILE"
+```
+
+Run it:
+
+```bash
+sudo bash deprovision-users.sh users.txt
+```
+
+## Remove orphaned files after account deletion
+
+If an account was deleted without cleaning up first, files owned by that UID become orphaned. Find and handle them:
+
+```bash
+# Find all files with no valid owner
+sudo find / -nouser 2>/dev/null
+
+# List them with their UID
+sudo find / -nouser -ls 2>/dev/null
+
+# Remove them (be careful — verify first)
+sudo find / -nouser -delete 2>/dev/null
+```
+
+:::warning
+Always review orphaned files before deleting them. Some may belong to service accounts or be needed by running applications.
+:::
+
+## Common mistakes
+
+### Removing a user while they are still logged in
+
+This can leave orphaned processes running under a now-deleted UID. Always check active sessions and kill processes first.
+
+```bash
+who | grep username
+sudo pkill -u username
+sudo userdel --remove username
+```
+
+### Deleting without backing up data
+
+`userdel --remove` is irreversible. If there is any chance the data is needed, archive it first.
+
+```bash
+sudo tar -czf /backup/username-$(date +%F).tar.gz /home/username
+sudo userdel --remove username
+```
+
+### Forgetting files outside the home directory
+
+Users often own files in `/tmp`, `/var`, or application directories. Find them before removing the account.
+
+```bash
+sudo find / -user username 2>/dev/null
+```
+
+### Removing a system account that a service depends on
+
+Check whether any running service uses the account before deleting it.
+
+```bash
+grep -r username /etc/systemd/system/
+grep -r username /etc/cron.d/
+```
+
+## Summary
+
+Removing users on AlmaLinux is straightforward, but doing it safely requires a few extra steps.
+
+Key points:
+
+- use `userdel --remove` to also delete the home directory and mail spool
+- check for active sessions and kill processes before removing
+- archive the home directory if data retention is needed
+- find and reassign or remove files owned by the user across the whole system
+- in enterprise environments, lock the account first and remove it after a retention period
+- handle orphaned files after any unclean removal
+
+:::tip Related pages
+- [Creating Users](./creating-users)
+- [Group Management](./group-management)
+- [Sudo & Privileges](./sudo-privileges)
+- [Security Policies](./security-policies)
+:::

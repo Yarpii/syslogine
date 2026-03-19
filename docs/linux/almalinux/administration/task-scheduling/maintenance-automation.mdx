@@ -1,0 +1,532 @@
+---
+sidebar_position: 3
+title: "Maintenance Automation | AlmaLinux"
+sidebar_label: "Maintenance Automation"
+description: "Automate system maintenance on AlmaLinux including DNF updates, log rotation, temporary file cleanup, package cache management, and scheduled system health tasks."
+keywords:
+  - "almalinux maintenance automation"
+  - "almalinux dnf automatic"
+  - "almalinux system cleanup"
+  - "almalinux automated updates"
+  - "rhel maintenance automation"
+tags:
+  - almalinux
+  - task-scheduling
+  - maintenance
+  - automation
+  - dnf
+slug: /linux/almalinux/administration/task-scheduling/maintenance-automation
+---
+
+# Maintenance Automation on AlmaLinux
+
+System maintenance covers the recurring tasks that keep a server healthy over time: applying security updates, rotating log files, cleaning up temporary files, refreshing package metadata, and checking filesystem integrity. Performed manually, these tasks are inconsistent — done well when someone remembers, skipped when the team is busy. Automated, they run on schedule without human intervention and produce logs that make it easy to verify they completed correctly.
+
+On AlmaLinux, most standard maintenance tasks are already partially automated through the default system configuration. Understanding what is already scheduled, how to configure it to suit your environment, and how to add your own maintenance jobs alongside the defaults gives you a complete picture of system upkeep.
+
+---
+
+## What AlmaLinux Automates by Default
+
+A default AlmaLinux installation ships with several maintenance tasks already scheduled. Before adding your own automation, it is worth understanding what is already running.
+
+### dnf-makecache
+
+The `dnf-makecache.timer` refreshes the DNF package metadata cache periodically, ensuring that `dnf` commands have access to current repository information without downloading it on demand:
+
+```bash
+systemctl status dnf-makecache.timer
+systemctl cat dnf-makecache.timer
+```
+
+By default it runs hourly. On servers where bandwidth is constrained or repository refreshes should happen less frequently, override the schedule:
+
+```bash
+systemctl edit dnf-makecache.timer
+```
+
+```ini
+[Timer]
+OnCalendar=
+OnCalendar=*-*-* 04:00:00
+```
+
+The first empty `OnCalendar=` clears the original setting before the new one is applied.
+
+### logrotate
+
+The `logrotate.timer` runs `logrotate` daily to rotate, compress, and prune log files according to the rules in `/etc/logrotate.conf` and `/etc/logrotate.d/`. Verify it is active:
+
+```bash
+systemctl status logrotate.timer
+```
+
+logrotate is covered in detail in the [Log Rotation](../log-management/log-rotation) page. From a maintenance automation perspective, the key point is that it runs without any additional configuration and handles most system logs automatically.
+
+### /etc/cron.daily, weekly, monthly
+
+The `crond` daemon runs scripts placed in `/etc/cron.daily/`, `/etc/cron.weekly/`, and `/etc/cron.monthly/` at their respective intervals via `/etc/crontab`. These directories contain maintenance scripts installed by packages — `man-db` updates, `mlocate` database updates, and others. To see what is currently scheduled in these directories:
+
+```bash
+ls /etc/cron.daily/
+ls /etc/cron.weekly/
+ls /etc/cron.monthly/
+```
+
+---
+
+## Automated Package Updates with dnf-automatic
+
+`dnf-automatic` is a DNF plugin that automates package updates on a schedule. It is the standard tool for keeping AlmaLinux systems patched without manual intervention. It supports several modes of operation, from downloading updates and notifying by email to downloading and installing them fully automatically.
+
+### Installing dnf-automatic
+
+```bash
+dnf install dnf-automatic
+```
+
+### Configuration
+
+The configuration file is `/etc/dnf/automatic.conf`. Open it to review and adjust the defaults:
+
+```bash
+nano /etc/dnf/automatic.conf
+```
+
+The key sections are:
+
+**[commands]** — what dnf-automatic does when it runs:
+
+```ini
+[commands]
+# What to do with updates: default, security, bugfix, enhancement, minimal, minimal-security
+upgrade_type = security
+
+# Whether to download updates automatically
+download_updates = yes
+
+# Whether to apply downloaded updates automatically
+apply_updates = no
+
+# Whether to reboot after updates if required
+reboot = never
+```
+
+Setting `upgrade_type = security` limits automatic updates to security patches only, which is the most common choice for production servers — it keeps the system protected without the risk of a feature update breaking an application. Set `apply_updates = yes` to install updates automatically; leave it `no` to have dnf-automatic only download and notify, requiring a human to review and apply.
+
+**[emitters]** — how to report what was done:
+
+```ini
+[emitters]
+# Notification mechanism: stdio, email, motd
+emit_via = email
+
+[email]
+email_from = dnf-automatic@yourhostname.example.com
+email_to = admin@example.com
+email_host = localhost
+```
+
+**[base]** — DNF behavior settings applied to the automatic run:
+
+```ini
+[base]
+debuglevel = 1
+```
+
+### Enabling dnf-automatic
+
+dnf-automatic ships with several timer units for different use cases:
+
+```bash
+# Apply updates automatically (uses apply_updates from config)
+systemctl enable --now dnf-automatic.timer
+
+# Download only, never apply (overrides config)
+systemctl enable --now dnf-automatic-download.timer
+
+# Install updates immediately when downloaded (overrides config)
+systemctl enable --now dnf-automatic-install.timer
+
+# Security updates only (overrides upgrade_type)
+systemctl enable --now dnf-automatic-security.timer
+```
+
+Enable only one of these at a time. For most production servers, `dnf-automatic-download.timer` combined with email notification is the safest starting point — it ensures updates are downloaded and ready, sends an email listing what is available, and leaves the decision to apply to an administrator.
+
+### Checking dnf-automatic Status
+
+To see when dnf-automatic last ran and what it did:
+
+```bash
+journalctl -u dnf-automatic.service -n 50
+```
+
+To see the scheduled next run:
+
+```bash
+systemctl list-timers dnf-automatic.timer
+```
+
+:::tip
+For servers running databases, web applications, or other stateful services, always review available updates before applying them, even security updates. A kernel update requiring a reboot or a library update that changes behaviour can affect running services. `apply_updates = no` with email notification keeps you informed without applying changes automatically.
+:::
+
+---
+
+## Temporary File Cleanup
+
+AlmaLinux uses `systemd-tmpfiles` to manage temporary directories and their contents. The `systemd-tmpfiles-clean.timer` runs periodically to remove temporary files that have exceeded their configured age.
+
+### How systemd-tmpfiles Works
+
+Configuration files in `/usr/lib/tmpfiles.d/` and `/etc/tmpfiles.d/` define which directories to create, which files to clean, and the age at which files are considered stale. The `/tmp/` and `/var/tmp/` directories are managed this way by default.
+
+To see the current tmpfiles configuration for `/tmp/`:
+
+```bash
+cat /usr/lib/tmpfiles.d/tmp.conf
+```
+
+The relevant lines specify that files in `/tmp/` are removed after 10 days of inactivity, and files in `/var/tmp/` after 30 days.
+
+### Checking the Cleanup Timer
+
+```bash
+systemctl status systemd-tmpfiles-clean.timer
+```
+
+The timer runs daily by default. To trigger a manual cleanup immediately:
+
+```bash
+systemd-tmpfiles --clean
+```
+
+### Adding Custom Tmpfiles Rules
+
+To manage additional directories with the same mechanism, create a configuration file in `/etc/tmpfiles.d/`:
+
+```bash
+nano /etc/tmpfiles.d/myapp.conf
+```
+
+```
+# Type  Path                         Mode  User    Group   Age
+d       /var/cache/myapp             0750  myapp   myapp   -
+D       /var/cache/myapp/temp        0750  myapp   myapp   7d
+d       /run/myapp                   0755  myapp   myapp   -
+```
+
+The type column uses different letters:
+
+| Type | Meaning |
+|---|---|
+| `d` | Create the directory if it does not exist; clean files older than the specified age |
+| `D` | Create the directory and remove all contents older than the specified age on each run |
+| `f` | Create or truncate a file |
+| `r` | Remove the path if it exists |
+| `z` | Adjust ownership and SELinux context without removing |
+
+The `D` type on the temp subdirectory causes `systemd-tmpfiles --clean` to remove any files older than 7 days from that directory automatically. Test new rules with:
+
+```bash
+systemd-tmpfiles --create /etc/tmpfiles.d/myapp.conf
+```
+
+---
+
+## Package Cache Management
+
+The DNF package cache in `/var/cache/dnf/` stores downloaded metadata and packages. Over time it grows, particularly on systems that upgrade frequently. Managing it prevents unexpected disk space consumption.
+
+### Checking Cache Size
+
+```bash
+du -sh /var/cache/dnf/
+```
+
+### Cleaning the Cache
+
+To remove cached package files while keeping metadata:
+
+```bash
+dnf clean packages
+```
+
+To remove all cached metadata and packages:
+
+```bash
+dnf clean all
+```
+
+### Automating Cache Cleanup
+
+For servers where disk space is constrained, schedule a monthly cache cleanup to keep the cache from growing unbounded:
+
+```bash
+nano /etc/cron.monthly/dnf-cache-cleanup
+```
+
+```bash
+#!/bin/bash
+# Remove DNF package cache monthly to reclaim disk space
+# Metadata will be refreshed automatically by dnf-makecache.timer
+/usr/bin/dnf clean packages --quiet
+```
+
+```bash
+chmod 755 /etc/cron.monthly/dnf-cache-cleanup
+```
+
+Note the absence of a file extension — scripts in cron interval directories must not have extensions.
+
+---
+
+## Filesystem Integrity Checks
+
+Filesystem integrity checks confirm that the filesystem's internal data structures are consistent. On ext4 filesystems, `e2fsck` performs this check. On XFS (the default on AlmaLinux), `xfs_repair` is used for repairs, but `xfs_db` can check consistency. In practice, XFS is very robust and rarely requires manual integrity checks — the kernel handles most consistency issues automatically through journaling.
+
+For systems using ext4 partitions (common for `/boot/`), schedule a periodic check using `tune2fs` to set a maximum mount count or time interval after which a check is forced at next boot:
+
+```bash
+# Force a check after 30 mounts or 90 days, whichever comes first
+tune2fs -c 30 -i 90d /dev/sda1
+```
+
+To see the current check settings on a partition:
+
+```bash
+tune2fs -l /dev/sda1 | grep -E "Mount count|Check interval|Last checked"
+```
+
+For SMART monitoring of physical disks — detecting early signs of drive failure — install and enable `smartmontools`:
+
+```bash
+dnf install smartmontools
+systemctl enable --now smartd
+```
+
+`smartd` monitors disk health and logs warnings when SMART attributes indicate a drive may be failing. Configure it in `/etc/smartd.conf` to send email alerts:
+
+```bash
+nano /etc/smartd.conf
+```
+
+The default configuration monitors all detected drives. To send email on detected issues:
+
+```
+DEVICESCAN -a -m admin@example.com -M exec /usr/libexec/smartmontools/smartd-runner
+```
+
+---
+
+## System Journal Maintenance
+
+The systemd journal can grow to consume significant disk space on busy systems, particularly if it is configured for persistent storage. Automated journal size management prevents it from filling the disk.
+
+### Configuring Journal Size Limits
+
+Edit `/etc/systemd/journald.conf` to set size limits:
+
+```bash
+nano /etc/systemd/journald.conf
+```
+
+```ini
+[Journal]
+# Maximum disk space the journal may use
+SystemMaxUse=2G
+
+# Maximum size of individual journal files
+SystemMaxFileSize=200M
+
+# How long to keep journal entries
+MaxRetentionSec=3month
+
+# Compress journal files
+Compress=yes
+```
+
+Apply the changes:
+
+```bash
+systemctl restart systemd-journald
+```
+
+### Automated Journal Vacuum
+
+To periodically vacuum the journal — removing old entries beyond the configured limits — the `systemd-journald` daemon handles this automatically based on the configured limits. To trigger a manual vacuum:
+
+```bash
+# Remove journal entries older than 2 months
+journalctl --vacuum-time=2months
+
+# Remove journal until it uses less than 1 GB
+journalctl --vacuum-size=1G
+```
+
+To schedule periodic vacuuming beyond what the automatic limits provide, add it to a cron job or systemd timer. For most setups, the `SystemMaxUse` and `MaxRetentionSec` limits in `journald.conf` are sufficient without additional scheduled vacuuming.
+
+---
+
+## Automating System Health Checks
+
+Beyond specific maintenance tasks, a scheduled health check script that reports on system status gives administrators a regular overview of system condition without requiring manual inspection.
+
+### A Weekly Health Report Script
+
+```bash
+nano /usr/local/sbin/weekly-health-report.sh
+```
+
+```bash
+#!/bin/bash
+# weekly-health-report.sh
+# Generates a basic system health summary and emails it to the admin.
+
+HOSTNAME=$(hostname -f)
+REPORT_DATE=$(date '+%Y-%m-%d %H:%M')
+ALERT_EMAIL="admin@example.com"
+
+# Collect system information
+UPTIME=$(uptime -p)
+LOAD=$(uptime | awk -F'load average:' '{print $2}')
+DISK=$(df -h --output=source,size,used,avail,pcent | grep -v tmpfs)
+MEM=$(free -h | awk 'NR<=2')
+FAILED_UNITS=$(systemctl --failed --no-legend | wc -l)
+PENDING_UPDATES=$(dnf check-update --quiet 2>/dev/null | grep -c "^[a-zA-Z]" || echo 0)
+LAST_BOOT=$(who -b | awk '{print $3, $4}')
+
+# Build the report
+REPORT=$(cat <<EOF
+Weekly Health Report: ${HOSTNAME}
+Generated: ${REPORT_DATE}
+
+── System ──────────────────────────────
+Uptime:          ${UPTIME}
+Load averages:   ${LOAD}
+Last boot:       ${LAST_BOOT}
+
+── Disk Usage ──────────────────────────
+${DISK}
+
+── Memory ──────────────────────────────
+${MEM}
+
+── Services ────────────────────────────
+Failed units:    ${FAILED_UNITS}
+
+── Updates ─────────────────────────────
+Pending updates: ${PENDING_UPDATES}
+EOF
+)
+
+echo "${REPORT}" | mail -s "Weekly Health Report: ${HOSTNAME}" "${ALERT_EMAIL}"
+```
+
+```bash
+chmod 700 /usr/local/sbin/weekly-health-report.sh
+```
+
+Schedule it with a systemd timer:
+
+```bash
+nano /etc/systemd/system/weekly-health-report.service
+```
+
+```ini
+[Unit]
+Description=Weekly system health report
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/weekly-health-report.sh
+```
+
+```bash
+nano /etc/systemd/system/weekly-health-report.timer
+```
+
+```ini
+[Unit]
+Description=Send weekly health report every Monday morning
+
+[Timer]
+OnCalendar=Mon *-*-* 07:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+```
+
+```bash
+systemctl daemon-reload
+systemctl enable --now weekly-health-report.timer
+```
+
+---
+
+## Scheduling Kernel and Bootloader Maintenance
+
+Kernel updates accumulate over time. Each installed kernel occupies space in `/boot/`, which is often a small partition. AlmaLinux keeps up to 3 kernels by default (controlled by `installonly_limit` in `/etc/dnf/dnf.conf`), removing older ones automatically when new ones are installed. Verify the setting:
+
+```bash
+grep installonly_limit /etc/dnf/dnf.conf
+```
+
+After applying kernel updates, the bootloader configuration needs to be regenerated. This happens automatically when the `kernel` package is installed via DNF, but if it is ever needed manually:
+
+```bash
+grub2-mkconfig -o /boot/grub2/grub.cfg
+```
+
+For UEFI systems:
+
+```bash
+grub2-mkconfig -o /boot/efi/EFI/almalinux/grub.cfg
+```
+
+---
+
+## Coordinating Maintenance Windows
+
+On production systems, automated maintenance tasks should respect maintenance windows — periods when changes are acceptable. Running a package update at 14:00 on a Tuesday when the application has peak load is different from running it at 03:00 on a Sunday.
+
+For cron jobs, the time fields directly control when jobs run. For systemd timers, `OnCalendar` does the same. The additional consideration for automated updates is reboots — some updates (kernel updates, glibc updates) require a reboot to take effect. The `reboot = never` setting in `dnf-automatic.conf` prevents automatic reboots; schedule any required reboots explicitly within your maintenance window.
+
+To check whether a reboot is required after an update:
+
+```bash
+# If this file exists, a reboot is needed
+ls /run/reboot-required 2>/dev/null && echo "Reboot required" || echo "No reboot needed"
+
+# Alternatively, check if the running kernel matches the installed kernel
+rpm -q kernel | tail -1
+uname -r
+```
+
+If the output of `uname -r` does not match the most recently installed kernel package, a reboot is needed to activate it.
+
+---
+
+## Summary
+
+Maintenance automation on AlmaLinux builds on a foundation of built-in scheduled tasks — dnf-makecache, logrotate, systemd-tmpfiles-clean — and extends it with configured tools like dnf-automatic for updates, smartd for disk monitoring, and custom scripts for health reporting. The goal is a system that stays healthy, patched, and clean without requiring daily manual attention.
+
+Key points to remember:
+
+- Use `dnf-automatic` with `apply_updates = no` and email notification for production servers — review updates before applying them
+- `upgrade_type = security` limits automatic updates to security patches, reducing the risk of unexpected application breakage
+- Scripts in `/etc/cron.daily/` and similar directories must have no file extension and must be executable
+- `systemd-tmpfiles` manages `/tmp/` and `/var/tmp/` cleanup automatically; extend it with `/etc/tmpfiles.d/` for application directories
+- Set `SystemMaxUse` and `MaxRetentionSec` in `journald.conf` to prevent the journal from consuming unbounded disk space
+- Use `systemctl edit` to override the schedule of package-provided timer units without editing files that would be overwritten by updates
+- Check `/run/reboot-required` or compare `uname -r` to the installed kernel to determine whether a reboot is pending after updates
+
+### Related Pages
+
+- [Cron Scheduling](./cron-scheduling) — crontab syntax and crond management
+- [Systemd Timers](./systemd-timers) — timer unit creation and calendar expressions
+- [Log Rotation](../log-management/log-rotation) — configuring logrotate and journal rotation
+- [Security Automation](./security-automation) — scheduling security scans and compliance checks
+- [Monitoring Automation](./monitoring-automation) — automating system health monitoring

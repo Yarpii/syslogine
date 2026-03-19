@@ -1,0 +1,446 @@
+---
+sidebar_position: 2
+title: "Security Patching | AlmaLinux"
+sidebar_label: "Security Patching"
+description: "Apply security updates on AlmaLinux, monitor CVEs, manage security advisories with DNF, implement patching policies, and maintain enterprise security compliance."
+keywords:
+  - "almalinux security patching"
+  - "almalinux security updates"
+  - "almalinux cve"
+  - "almalinux dnf security"
+  - "rhel security patching"
+tags:
+  - almalinux
+  - system-maintenance
+  - security
+  - patching
+  - cve
+slug: /linux/almalinux/administration/system-maintenance/security-patching
+---
+
+# Security Patching on AlmaLinux
+
+Security patching is the practice of applying updates that address known vulnerabilities before they can be exploited. On AlmaLinux, security updates follow the same advisory system as Red Hat Enterprise Linux — each update is tagged with an Errata ID, a CVE reference, and a severity level, making it possible to apply targeted patches based on their security relevance rather than updating everything blindly.
+
+A security patching strategy balances two competing concerns: applying patches quickly enough to reduce the window of exposure, and applying them carefully enough to avoid breaking running services. Neither extreme — patching immediately without testing, or never patching to avoid risk — is acceptable in a production environment. This page covers the tools and practices that let you patch consistently, track what has been applied, and manage the risk of the patching process itself.
+
+---
+
+## Understanding AlmaLinux Security Advisories
+
+AlmaLinux publishes security advisories through its errata system. Each advisory has:
+
+- An **Errata ID** in the format `ALSA-YYYY:NNNN` (AlmaLinux Security Advisory)
+- One or more **CVE identifiers** referencing the specific vulnerability
+- A **severity level**: Critical, Important, Moderate, or Low
+- The list of **affected packages** and their fixed versions
+
+These advisories are distributed through the package repository metadata, which is why `dnf` can query and filter updates by security status without requiring a separate subscription or tool.
+
+### Viewing Available Security Advisories
+
+To list all available security advisories that apply to the current system:
+
+```bash
+dnf updateinfo list security
+```
+
+The output shows the Errata ID, severity, and package name for each applicable advisory. To filter by severity:
+
+```bash
+# Critical advisories only
+dnf updateinfo list security --sec-severity=Critical
+
+# Critical and Important
+dnf updateinfo list security --sec-severity=Critical --sec-severity=Important
+```
+
+To see detailed information about a specific advisory:
+
+```bash
+dnf updateinfo info ALSA-2024:1234
+```
+
+This shows the full advisory text including the CVE description, affected versions, and the fixed version.
+
+### Checking CVE Coverage
+
+To check whether the system is vulnerable to a specific CVE:
+
+```bash
+dnf updateinfo list cves | grep CVE-2024-1234
+```
+
+If the CVE appears in the output, a patch is available but not yet applied. If it does not appear, either the system is already patched, or AlmaLinux is not affected by that CVE.
+
+To see which CVEs are addressed by available updates:
+
+```bash
+dnf updateinfo list cves
+```
+
+---
+
+## Applying Security Updates
+
+### Applying All Available Security Updates
+
+To update only packages that have security advisories, leaving all other packages unchanged:
+
+```bash
+dnf upgrade --security
+```
+
+This is the safest update approach for production systems because it limits changes to packages with known security relevance. Non-security updates — new features, performance improvements, bug fixes without security implications — are left for a separate, planned update cycle.
+
+Review the planned changes before confirming:
+
+```bash
+# Dry run — show what would be updated without making changes
+dnf upgrade --security --assumeno
+```
+
+### Applying Updates by Severity
+
+To apply only Critical security updates, leaving Important and lower for a subsequent maintenance window:
+
+```bash
+dnf upgrade --sec-severity=Critical
+```
+
+This level of granularity is useful in environments where patching windows are short and only the most urgent patches can be applied before the window closes. Schedule Critical patches immediately and Important patches at the next available window.
+
+### Applying a Specific Advisory
+
+When a specific CVE has been flagged by a security scanner or vulnerability management platform and you need to address it precisely:
+
+```bash
+dnf upgrade --advisory=ALSA-2024:1234
+```
+
+This applies only the packages from the specified advisory, nothing else. It is the most targeted patching approach and minimizes the risk of unintended changes.
+
+### Applying a Specific CVE Fix
+
+To update only the package that fixes a specific CVE:
+
+```bash
+dnf upgrade --cve=CVE-2024-1234
+```
+
+---
+
+## Pre-Patching Preparation
+
+Rushing into a patch cycle without preparation is a leading cause of patching incidents. A consistent pre-patching checklist reduces the risk that patching causes more disruption than the vulnerability it addresses.
+
+### Taking a Pre-Patch Snapshot
+
+Before applying any updates, create a reference point you can return to if something goes wrong.
+
+Note the current DNF transaction ID:
+
+```bash
+dnf history list | head -3
+```
+
+For virtual machines, take a snapshot through the hypervisor before patching. A hypervisor snapshot allows rollback in seconds, which is significantly faster than a package-level rollback.
+
+For physical systems or where snapshots are not available, back up critical configuration directories:
+
+```bash
+tar -czpf /root/pre-patch-etc-$(date +%Y%m%d).tar.gz /etc/
+```
+
+### Checking Current Package State
+
+Verify the system is in a clean state before patching — no partially installed packages, no pending transactions:
+
+```bash
+dnf check
+```
+
+`dnf check` reports problems with the installed package database: broken dependencies, duplicate packages, or packages whose files have been corrupted. Resolve any issues before proceeding with updates.
+
+### Reviewing Pending Updates
+
+Review the full list of what will be updated before applying anything:
+
+```bash
+dnf upgrade --security --assumeno 2>&1 | tee /root/pending-updates-$(date +%Y%m%d).txt
+```
+
+Save the output for the change management record. Review it for any packages that could affect running services — in particular, updates to the kernel, glibc, openssl, or any application libraries.
+
+### Notifying Affected Teams
+
+For production systems that serve other teams, announce the patching window in advance. Even a security patch can cause a brief service interruption during a service restart. Teams relying on those services should be informed before the maintenance window opens.
+
+---
+
+## Applying Patches and Managing Reboots
+
+### Applying the Updates
+
+With preparation complete, apply the security updates:
+
+```bash
+dnf upgrade --security
+```
+
+Monitor the output as packages are downloaded and installed. dnf will report each package as it is processed. Errors during installation are usually dependency conflicts or download failures — both are reported clearly.
+
+### Determining Whether a Reboot Is Required
+
+Not all security updates require a reboot. Library updates and most application patches take effect when the service using them is restarted. Kernel updates and updates to core system libraries (glibc, libstdc++) require a full reboot to take effect.
+
+To check whether a reboot is required:
+
+```bash
+# Check for the reboot-required flag
+ls /run/reboot-required 2>/dev/null && echo "Reboot required" || echo "No reboot needed"
+```
+
+To compare the running kernel against the installed kernel — if they differ, a reboot is needed:
+
+```bash
+echo "Running kernel: $(uname -r)"
+echo "Installed kernel: $(rpm -q kernel --last | head -1 | awk '{print $1}' | sed 's/kernel-//')"
+```
+
+The `needs-restarting` tool from the `yum-utils` package provides a more detailed analysis:
+
+```bash
+dnf install yum-utils
+needs-restarting -r
+```
+
+`needs-restarting -r` exits with code 1 if a reboot is required and 0 if it is not, making it suitable for use in scripts. Without the `-r` flag, it lists individual services that need to be restarted because they are using libraries that have been updated.
+
+### Restarting Services Without a Reboot
+
+For library updates that affect specific services, restarting those services applies the fix without a full reboot:
+
+```bash
+needs-restarting
+```
+
+This lists processes using libraries that have been updated since the process started. Restart each listed service:
+
+```bash
+systemctl restart nginx
+systemctl restart sshd
+```
+
+For applications that cannot be restarted immediately, they continue to use the old (potentially vulnerable) library until the next restart. Document any services left running with old libraries and schedule their restart at the earliest opportunity.
+
+### Scheduling a Reboot
+
+If a reboot is required but cannot be performed immediately, schedule it for a maintenance window:
+
+```bash
+# Schedule a reboot at 03:00
+echo "systemctl reboot" | at 03:00
+```
+
+Or using the `shutdown` command's built-in scheduling:
+
+```bash
+shutdown -r 03:00 "Scheduled reboot for security patches applied $(date +%Y-%m-%d)"
+```
+
+The message is broadcast to logged-in users before the reboot occurs.
+
+---
+
+## Post-Patching Verification
+
+After applying patches and any required reboots, verify that the system is in the expected state.
+
+### Confirming Patches Were Applied
+
+Check that the updated packages are now at the correct versions:
+
+```bash
+dnf updateinfo list security 2>/dev/null | wc -l
+```
+
+If security patches were applied successfully, this count should be zero or close to it (depending on whether new advisories have been published since the patches were applied).
+
+To confirm a specific package is at the expected version:
+
+```bash
+rpm -q nginx
+```
+
+### Verifying Services Are Running
+
+After a reboot or service restarts, confirm that critical services came back up correctly:
+
+```bash
+systemctl status sshd nginx postgresql
+```
+
+Check the journal for any errors that occurred during startup:
+
+```bash
+journalctl -b -p err
+```
+
+### Checking for Remaining Vulnerabilities
+
+Run `needs-restarting` again to confirm no services are still running with outdated libraries:
+
+```bash
+needs-restarting
+```
+
+An empty output means all services have been restarted and are using the current library versions.
+
+---
+
+## Kernel Patch Management
+
+Kernel updates are the most impactful security patches because they address vulnerabilities at the lowest level of the system. They are also the most disruptive because they always require a reboot.
+
+### Managing Installed Kernels
+
+AlmaLinux keeps multiple kernel versions installed simultaneously, controlled by `installonly_limit` in `/etc/dnf/dnf.conf` (default: 3). This means after a kernel update, the previous kernel remains available as a fallback.
+
+To list installed kernels:
+
+```bash
+rpm -q kernel --last
+```
+
+The most recently installed kernel appears first.
+
+### Setting the Default Boot Kernel
+
+After installing a new kernel, it becomes the default boot entry automatically. To verify the current default:
+
+```bash
+grub2-editenv list | grep saved_entry
+```
+
+To temporarily boot into a specific kernel — for example, to test a new kernel before making it the permanent default — select it from the GRUB menu at boot time without changing the default.
+
+To permanently set a specific kernel as the boot default:
+
+```bash
+# List available kernels
+grubby --info=ALL | grep "^kernel\|^title"
+
+# Set a specific kernel as default
+grubby --set-default /boot/vmlinuz-5.14.0-362.8.1.el9_3.x86_64
+```
+
+### Removing Old Kernels
+
+If `installonly_limit` has allowed more than the desired number of kernels to accumulate:
+
+```bash
+dnf remove --oldinstallonly --setopt installonly_limit=2
+```
+
+This removes kernels beyond the most recent 2, keeping the current and one fallback. Always keep at least two kernels — the current one and a known-good fallback.
+
+---
+
+## Security Patching Policy
+
+### Defining Patch Cadence
+
+A written patching policy removes ambiguity about when patches must be applied and creates accountability. A common enterprise policy structure:
+
+| Severity | Maximum patch window |
+|---|---|
+| Critical | 24–72 hours after advisory publication |
+| Important | Within 7–14 days |
+| Moderate | Next scheduled maintenance window (monthly) |
+| Low | Quarterly review |
+
+Critical vulnerabilities in internet-facing services (SSH, web servers, VPN endpoints) should be treated with urgency even at the 24-hour end of the Critical window. Internal-only services may warrant the full 72 hours.
+
+### Patch Testing Environments
+
+Applying patches directly to production without testing is a high-risk practice. A staging environment that mirrors production allows patches to be tested before production deployment. The staging environment should:
+
+- Run the same OS version and patch level as production
+- Have the same package set as production
+- Run the same services with representative configuration
+- Be patched a defined period (24–48 hours) before production
+
+If a patch breaks something in staging, you have time to identify a workaround or rollback strategy before the production window.
+
+### Exception Management
+
+Some packages genuinely cannot be patched promptly — a critical application may have a hard dependency on a specific library version that conflicts with the patched version. These situations require an exception process:
+
+1. Document the vulnerability (CVE, severity, affected component)
+2. Document why the patch cannot be applied (dependency conflict, application incompatibility)
+3. Document compensating controls in place (network segmentation, WAF rules, monitoring)
+4. Set a remediation deadline and track it
+5. Review exceptions regularly — they accumulate over time and represent growing risk
+
+Without this process, unpatched vulnerabilities become invisible technical debt.
+
+---
+
+## Tracking Patching Compliance
+
+### Generating a Patching Report
+
+To generate a report of the current system's patching status — which advisories are applied and which are outstanding:
+
+```bash
+dnf updateinfo summary
+```
+
+This provides a count of outstanding advisories by severity. For a detailed list:
+
+```bash
+dnf updateinfo list security > /var/log/security/patch-status-$(date +%Y%m%d).txt
+```
+
+Store these reports periodically to build a compliance history that can be presented to auditors.
+
+### Auditing Applied Updates
+
+To see a history of all security updates that have been applied to the system:
+
+```bash
+dnf history list | head -30
+```
+
+To filter the history for security-relevant transactions:
+
+```bash
+dnf updateinfo list security --installed
+```
+
+This lists security advisories that have already been applied — the inverse of `dnf updateinfo list security` which shows what is outstanding.
+
+---
+
+## Summary
+
+Security patching on AlmaLinux is built on DNF's advisory system, which tags every update with security metadata — severity, CVE references, and Errata IDs. This allows targeted, risk-calibrated patching: applying Critical advisories immediately and scheduling lower-severity patches within defined windows, without updating packages that have no security relevance.
+
+Key points to remember:
+
+- Use `dnf upgrade --security` to apply only security-relevant updates; use `--sec-severity=Critical` for urgent-only patches
+- Use `dnf upgrade --advisory=ALSA-YYYY:NNNN` or `--cve=CVE-YYYY-NNNN` for the most targeted patching approach
+- Run `dnf check` before patching to verify the package database is in a clean state
+- Use `needs-restarting -r` (from `yum-utils`) to determine whether a reboot is required after patching
+- Keep at least two kernel versions installed — the current and one fallback
+- Define a written patching policy with severity-based timelines and an exception process
+- Test patches in a staging environment before production for high-risk updates
+- Store `dnf updateinfo list security` output periodically to build a compliance history
+
+### Related Pages
+
+- [Package Management](./package-management) — DNF fundamentals, repositories, and history rollback
+- [System Auditing](./system-auditing) — compliance scanning with OpenSCAP and auditd
+- [Maintenance Automation](./maintenance-automation) — automating security patches with dnf-automatic
+- [Security Automation](../task-scheduling/security-automation) — scheduling CVE checks and audit reports

@@ -1,0 +1,454 @@
+---
+sidebar_position: 6
+title: "LDAP Integration | AlmaLinux"
+sidebar_label: "LDAP Integration"
+description: "Integrate AlmaLinux with LDAP and Active Directory using SSSD, configure centralized authentication, and manage identity at scale."
+keywords:
+  - "almalinux ldap"
+  - "almalinux active directory"
+  - "almalinux sssd"
+  - "almalinux realm"
+  - "rhel ldap integration"
+tags:
+  - almalinux
+  - user-management
+  - ldap
+  - active-directory
+  - sssd
+slug: /linux/almalinux/administration/user-management/ldap-integration
+---
+
+# LDAP Integration
+
+Centralized identity management lets you authenticate users from a single directory instead of maintaining local accounts on every server. AlmaLinux supports integration with LDAP directories and Active Directory through **SSSD (System Security Services Daemon)**, which handles caching, offline authentication, and PAM/NSS integration.
+
+## Overview of the stack
+
+```
+Application / PAM / NSS
+        │
+       SSSD
+        │
+   ┌────┴────┐
+  LDAP     Active Directory
+```
+
+| Component | Role |
+|-----------|------|
+| `sssd` | Central daemon — queries the directory, caches results, integrates with PAM and NSS |
+| `realmd` | Discovery and enrollment tool — simplifies joining domains |
+| `oddjob-mkhomedir` | Automatically creates home directories on first login |
+| `krb5` | Kerberos libraries — used for AD authentication |
+| `openldap-clients` | Command-line tools for querying LDAP directly |
+
+## Install required packages
+
+```bash
+sudo dnf install -y \
+  sssd \
+  sssd-tools \
+  sssd-ldap \
+  sssd-krb5 \
+  realmd \
+  oddjob \
+  oddjob-mkhomedir \
+  adcli \
+  krb5-workstation \
+  openldap-clients \
+  authselect
+```
+
+## Option A: Join an Active Directory domain with realmd
+
+`realmd` is the easiest way to join an AD domain. It discovers the domain automatically and configures SSSD for you.
+
+### Discover the domain
+
+```bash
+sudo realm discover example.com
+```
+
+Example output:
+
+```
+example.com
+  type: kerberos
+  realm-name: EXAMPLE.COM
+  domain-name: example.com
+  configured: no
+  server-software: active-directory
+  client-software: sssd
+  required-package: oddjob
+  required-package: oddjob-mkhomedir
+  required-package: sssd
+  required-package: adcli
+  required-package: realmd
+```
+
+### Join the domain
+
+```bash
+sudo realm join --user=Administrator example.com
+```
+
+You will be prompted for the Administrator password. On success, realmd configures SSSD and updates `/etc/sssd/sssd.conf` automatically.
+
+Verify the join:
+
+```bash
+realm list
+```
+
+### Test AD authentication
+
+```bash
+# Look up an AD user
+id jdoe@example.com
+
+# Look up without the domain suffix (if configured)
+id jdoe
+```
+
+### Allow domain users to log in
+
+By default, `realmd` may restrict login to specific groups. Open access to all domain users:
+
+```bash
+sudo realm permit --all
+```
+
+Or restrict to a specific AD group:
+
+```bash
+sudo realm permit --groups "Linux Admins"
+```
+
+Deny all domain logins:
+
+```bash
+sudo realm deny --all
+```
+
+## Option B: Manual SSSD configuration for LDAP
+
+For plain LDAP directories (OpenLDAP, FreeIPA, etc.) configure SSSD manually.
+
+### Create the SSSD configuration
+
+```bash
+sudo nano /etc/sssd/sssd.conf
+```
+
+Example configuration for OpenLDAP:
+
+```ini
+[sssd]
+services = nss, pam
+config_file_version = 2
+domains = ldap_domain
+
+[domain/ldap_domain]
+id_provider = ldap
+auth_provider = ldap
+
+ldap_uri = ldaps://ldap.example.com
+ldap_search_base = dc=example,dc=com
+
+# Bind credentials (use a dedicated read-only service account)
+ldap_default_bind_dn = cn=sssd-bind,ou=service-accounts,dc=example,dc=com
+ldap_default_authtok = BindPasswordHere
+
+# Use TLS — do not disable certificate verification in production
+ldap_tls_reqcert = demand
+ldap_tls_cacert = /etc/pki/tls/certs/ca-bundle.crt
+
+# User and group search paths
+ldap_user_search_base = ou=users,dc=example,dc=com
+ldap_group_search_base = ou=groups,dc=example,dc=com
+
+# Cache credentials for offline use
+cache_credentials = true
+
+# Automatically create home directories
+auto_private_groups = true
+```
+
+Set strict permissions — SSSD will refuse to start if the file is too open:
+
+```bash
+sudo chmod 600 /etc/sssd/sssd.conf
+sudo chown root:root /etc/sssd/sssd.conf
+```
+
+### Enable and start SSSD
+
+```bash
+sudo systemctl enable --now sssd
+```
+
+### Apply the authselect profile
+
+```bash
+sudo authselect select sssd with-mkhomedir with-faillock --force
+```
+
+Enable the oddjobd service so home directories are created automatically on first login:
+
+```bash
+sudo systemctl enable --now oddjobd
+```
+
+## Configure SSSD for FreeIPA
+
+FreeIPA has its own enrollment tool:
+
+```bash
+sudo dnf install -y freeipa-client
+
+sudo ipa-client-install \
+  --domain=ipa.example.com \
+  --realm=IPA.EXAMPLE.COM \
+  --principal=admin \
+  --password=AdminPassword \
+  --mkhomedir \
+  --no-ntp
+```
+
+Verify enrollment:
+
+```bash
+ipa-client-install --verify
+id admin@ipa.example.com
+```
+
+## Test and verify SSSD
+
+```bash
+# Look up a directory user
+getent passwd jdoe@example.com
+
+# Look up a directory group
+getent group "linux-admins"
+
+# Test authentication for a user
+su - jdoe@example.com
+
+# Check SSSD cache and status
+sssctl domain-status example.com
+sssctl user-checks jdoe@example.com
+```
+
+## Configure short username format
+
+By default, AD users log in as `jdoe@example.com`. To allow login with just `jdoe`, set the default domain in SSSD:
+
+```bash
+sudo nano /etc/sssd/sssd.conf
+```
+
+Add under `[sssd]`:
+
+```ini
+default_domain_suffix = example.com
+```
+
+And under `[domain/example.com]`:
+
+```ini
+use_fully_qualified_names = false
+```
+
+Restart SSSD:
+
+```bash
+sudo systemctl restart sssd
+```
+
+## Grant sudo access to AD groups
+
+Add an SSSD-aware rule to sudoers:
+
+```bash
+sudo visudo -f /etc/sudoers.d/ad-admins
+```
+
+```bash
+# Grant sudo to the AD group "Linux Admins"
+%linux\ admins@example.com  ALL=(ALL)  ALL
+
+# Or without domain suffix if use_fully_qualified_names = false
+%linux-admins  ALL=(ALL)  ALL
+```
+
+:::note
+Group names with spaces need the space escaped with a backslash in sudoers: `linux\ admins`.
+:::
+
+## Configure SSSD caching
+
+SSSD caches directory lookups locally. This keeps authentication working if the directory server is temporarily unreachable.
+
+```bash
+sudo nano /etc/sssd/sssd.conf
+```
+
+```ini
+[domain/example.com]
+# Cache credentials for offline login
+cache_credentials = true
+
+# How long to cache user entries (seconds)
+entry_cache_timeout = 5400
+
+# How long to cache group entries
+entry_cache_group_timeout = 5400
+
+# Offline credential lifetime (days)
+offline_credentials_expiration = 3
+```
+
+Restart after changes:
+
+```bash
+sudo systemctl restart sssd
+```
+
+### Clear the SSSD cache
+
+Sometimes you need to flush the cache to pick up directory changes immediately:
+
+```bash
+# Invalidate a specific user's cache
+sudo sss_cache -u jdoe
+
+# Invalidate a specific group
+sudo sss_cache -g linux-admins
+
+# Invalidate everything
+sudo sss_cache -E
+
+# Or stop SSSD, wipe the cache directory, and restart
+sudo systemctl stop sssd
+sudo rm -rf /var/lib/sss/db/*
+sudo systemctl start sssd
+```
+
+## Debug SSSD
+
+```bash
+# View SSSD logs in real time
+sudo journalctl -u sssd -f
+
+# View per-domain logs
+sudo tail -f /var/log/sssd/sssd_example.com.log
+
+# Enable debug logging (add to the domain section)
+sudo nano /etc/sssd/sssd.conf
+```
+
+Add under the domain section:
+
+```ini
+debug_level = 7
+```
+
+Restart SSSD and reproduce the issue, then review the logs:
+
+```bash
+sudo systemctl restart sssd
+sudo tail -100 /var/log/sssd/sssd_example.com.log
+```
+
+:::warning
+Debug level 7 generates a large volume of log data. Set it back to `0` or remove the line after you have finished debugging.
+:::
+
+## Query LDAP directly
+
+The `ldapsearch` command is useful for verifying connectivity and checking what the directory actually returns.
+
+```bash
+# Test an anonymous bind
+ldapsearch -x \
+  -H ldaps://ldap.example.com \
+  -b "dc=example,dc=com" \
+  "(uid=jdoe)"
+
+# Test with bind credentials
+ldapsearch -x \
+  -H ldaps://ldap.example.com \
+  -D "cn=sssd-bind,ou=service-accounts,dc=example,dc=com" \
+  -W \
+  -b "ou=users,dc=example,dc=com" \
+  "(uid=jdoe)"
+```
+
+## Leave a domain
+
+```bash
+sudo realm leave example.com
+```
+
+This removes the SSSD configuration and Kerberos keytab. Local accounts are unaffected.
+
+## Common mistakes
+
+### Wrong permissions on sssd.conf
+
+SSSD will refuse to start if `/etc/sssd/sssd.conf` is world-readable.
+
+```bash
+sudo chmod 600 /etc/sssd/sssd.conf
+```
+
+### Disabling TLS certificate verification
+
+Never use `ldap_tls_reqcert = never` in production. It opens the connection to man-in-the-middle attacks.
+
+```bash
+# Production — always verify
+ldap_tls_reqcert = demand
+ldap_tls_cacert = /etc/pki/tls/certs/ca-bundle.crt
+```
+
+### Not enabling oddjobd for home directory creation
+
+Without `oddjobd`, directory users can authenticate but have no home directory and may see errors on login.
+
+```bash
+sudo systemctl enable --now oddjobd
+sudo authselect select sssd with-mkhomedir --force
+```
+
+### Stale cache after directory changes
+
+If a user's group membership or attributes changed in the directory but the old data is still showing, flush the cache:
+
+```bash
+sudo sss_cache -u jdoe
+```
+
+### Not testing with an existing session open
+
+Changes to SSSD, PAM, or sshd_config can lock you out. Always keep an active root or sudo session while testing.
+
+## Summary
+
+SSSD is the recommended way to integrate AlmaLinux with LDAP and Active Directory. It handles caching, offline authentication, and PAM/NSS integration in a single daemon.
+
+Key points:
+
+- use `realmd` for straightforward AD domain joins
+- configure SSSD manually for OpenLDAP or FreeIPA
+- always use TLS and verify certificates in production
+- enable `oddjobd` and `with-mkhomedir` so home directories are created automatically
+- use `sss_cache` to flush stale entries after directory changes
+- grant sudo to AD groups via `/etc/sudoers.d/`
+- use `sssctl` and SSSD logs to diagnose authentication issues
+
+:::tip Related pages
+- [Authentication Systems](./authentication-systems)
+- [Security Policies](./security-policies)
+- [Sudo & Privileges](./sudo-privileges)
+- [User Auditing](./user-auditing)
+:::

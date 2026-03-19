@@ -1,0 +1,489 @@
+---
+sidebar_position: 3
+title: "Service Configuration | AlmaLinux"
+sidebar_label: "Service Configuration"
+description: "Configure services with systemctl enable/disable, manage targets, and set service startup behavior on AlmaLinux."
+keywords:
+  - "almalinux service configuration"
+  - "almalinux systemctl enable"
+  - "almalinux systemd configuration"
+  - "almalinux service startup"
+  - "rhel service configuration"
+tags:
+  - almalinux
+  - service-management
+  - systemd
+slug: /linux/almalinux/administration/service-management/service-configuration
+---
+
+# Service Configuration
+
+Service configuration on AlmaLinux goes beyond simply starting and stopping. It covers how a service behaves at boot, what environment it runs in, how it handles failures, and what security boundaries it operates within. Most of this is controlled through systemd unit files and their overrides.
+
+## View the current configuration of a service
+
+```bash
+# Show the full unit file as systemd sees it (including overrides)
+systemctl cat nginx
+
+# Show all configuration properties
+systemctl show nginx
+
+# Show a specific property
+systemctl show nginx --property=ExecStart
+systemctl show nginx --property=Restart
+systemctl show nginx --property=Environment
+
+# Show the path to the unit file
+systemctl show nginx --property=FragmentPath
+```
+
+## Unit file locations and precedence
+
+systemd reads unit files from multiple locations. Files in later locations take precedence.
+
+| Location | Purpose | Editable |
+|----------|---------|---------|
+| `/usr/lib/systemd/system/` | Package-provided defaults | No — overwritten by updates |
+| `/etc/systemd/system/` | Administrator overrides | Yes |
+| `/etc/systemd/system/*.d/` | Drop-in override directories | Yes |
+| `/run/systemd/system/` | Runtime units | Lost on reboot |
+
+Always place your changes in `/etc/systemd/system/` — never edit files in `/usr/lib/systemd/system/`.
+
+## Override a service with drop-in files
+
+The safest way to change a service's configuration is a drop-in override. It only changes what you specify, leaving everything else from the package unit intact.
+
+```bash
+# Open the override editor (creates /etc/systemd/system/nginx.service.d/override.conf)
+sudo systemctl edit nginx
+```
+
+Example overrides:
+
+```ini
+[Service]
+# Change the restart policy
+Restart=always
+RestartSec=5
+
+# Add an environment variable
+Environment=NGINX_WORKERS=4
+
+# Change memory limit
+MemoryMax=512M
+
+# Add a pre-start check
+ExecStartPre=/usr/local/bin/nginx-preflight.sh
+```
+
+After saving, apply the changes:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl restart nginx
+```
+
+View all active overrides:
+
+```bash
+# See the merged unit with overrides applied
+systemctl cat nginx
+
+# See just the override file
+cat /etc/systemd/system/nginx.service.d/override.conf
+```
+
+## Replace a unit file completely
+
+For larger changes, copy the full unit file to `/etc/systemd/system/` and edit it there:
+
+```bash
+sudo systemctl edit --full nginx
+```
+
+This opens a full copy of the unit file for editing. Changes here take complete precedence over the package unit.
+
+To revert to the package defaults:
+
+```bash
+sudo systemctl revert nginx
+```
+
+## Configure environment variables
+
+### Inline in the unit file
+
+```bash
+sudo systemctl edit myapp
+```
+
+```ini
+[Service]
+Environment=APP_ENV=production
+Environment=PORT=8080
+Environment=LOG_LEVEL=info
+```
+
+### From an environment file
+
+For secrets and longer variable lists, use an environment file:
+
+```bash
+sudo nano /etc/myapp/env
+```
+
+```bash
+APP_ENV=production
+DB_HOST=localhost
+DB_PORT=5432
+DB_NAME=myapp
+LOG_LEVEL=info
+SECRET_KEY=changeme
+```
+
+Secure it:
+
+```bash
+sudo chmod 640 /etc/myapp/env
+sudo chown root:myapp /etc/myapp/env
+```
+
+Reference it in the unit:
+
+```bash
+sudo systemctl edit myapp
+```
+
+```ini
+[Service]
+# Required file — service fails if missing
+EnvironmentFile=/etc/myapp/env
+
+# Optional file — service continues if missing
+EnvironmentFile=-/etc/myapp/env.local
+```
+
+## Configure restart behaviour
+
+```bash
+sudo systemctl edit myapp
+```
+
+```ini
+[Service]
+# When to restart
+# on-failure: restart on non-zero exit, signal, timeout, watchdog
+# always: restart on any exit except clean systemctl stop
+# on-abnormal: restart on signal, timeout, watchdog (not on exit code)
+# no: never restart
+Restart=on-failure
+
+# Seconds to wait before restarting
+RestartSec=5
+
+# Maximum restarts in a time window before giving up
+StartLimitIntervalSec=120
+StartLimitBurst=5
+
+# Reset the start limit counter after this many seconds of uptime
+StartLimitAction=reboot-force
+```
+
+:::tip
+`Restart=on-failure` with `StartLimitBurst=5` and `StartLimitIntervalSec=120` is the recommended baseline for production services. It gives the service five restart attempts over two minutes before systemd stops trying.
+:::
+
+## Configure service timeouts
+
+```bash
+sudo systemctl edit myapp
+```
+
+```ini
+[Service]
+# How long to wait for the service to start
+TimeoutStartSec=30
+
+# How long to wait for the service to stop
+TimeoutStopSec=60
+
+# Combined timeout for both start and stop
+TimeoutSec=60
+
+# Disable timeouts entirely (not recommended for production)
+TimeoutStartSec=infinity
+```
+
+## Configure the service user and group
+
+Running services as root is a security risk. Always run services as a dedicated unprivileged user.
+
+```bash
+sudo systemctl edit myapp
+```
+
+```ini
+[Service]
+User=myapp
+Group=myapp
+```
+
+Create the service user if it does not exist:
+
+```bash
+sudo useradd \
+  --system \
+  --no-create-home \
+  --shell /sbin/nologin \
+  --comment "myapp service account" \
+  myapp
+```
+
+## Configure the working directory and paths
+
+```ini
+[Service]
+# Working directory for the process
+WorkingDirectory=/opt/myapp
+
+# Runtime directory — created and removed automatically
+RuntimeDirectory=myapp
+RuntimeDirectoryMode=0750
+
+# State directory — persists across restarts
+StateDirectory=myapp
+StateDirectoryMode=0750
+
+# Cache directory
+CacheDirectory=myapp
+CacheDirectoryMode=0750
+
+# Log directory
+LogsDirectory=myapp
+LogsDirectoryMode=0750
+```
+
+These directives create directories under `/run/`, `/var/lib/`, `/var/cache/`, and `/var/log/` respectively, owned by the service user.
+
+## Security hardening directives
+
+Every custom service should include basic security hardening. These are free protections that limit what a compromised service can do.
+
+```ini
+[Service]
+# Prevent the service from gaining new privileges
+NoNewPrivileges=yes
+
+# Make most of the filesystem read-only
+ProtectSystem=strict
+
+# Prevent access to /home
+ProtectHome=yes
+
+# Give the service a private /tmp
+PrivateTmp=yes
+
+# Prevent writing to kernel variables
+ProtectKernelTunables=yes
+
+# Prevent loading kernel modules
+ProtectKernelModules=yes
+
+# Isolate the service from other processes' /proc entries
+ProtectProc=invisible
+
+# Allow writing only to specific paths
+ReadWritePaths=/var/lib/myapp /var/log/myapp
+
+# Restrict which system calls the service can make
+SystemCallFilter=@system-service
+```
+
+## Configure logging behaviour
+
+```ini
+[Service]
+# Where to send stdout
+StandardOutput=journal
+
+# Where to send stderr
+StandardError=journal
+
+# Tag log entries with this identifier
+SyslogIdentifier=myapp
+
+# Set the log level for the service
+SyslogLevel=info
+```
+
+To write to a file instead of the journal:
+
+```ini
+[Service]
+StandardOutput=append:/var/log/myapp/stdout.log
+StandardError=append:/var/log/myapp/stderr.log
+```
+
+## Configure a watchdog
+
+The systemd watchdog kills and restarts a service that stops responding.
+
+```ini
+[Service]
+# Kill and restart if no watchdog ping within 30 seconds
+WatchdogSec=30s
+
+# The service must support sd_notify WATCHDOG=1
+Type=notify
+```
+
+## Apply configuration changes safely
+
+When changing configuration on a running production service:
+
+```bash
+# Step 1 — validate the unit file
+systemd-analyze verify /etc/systemd/system/myapp.service
+
+# Step 2 — reload systemd
+sudo systemctl daemon-reload
+
+# Step 3 — reload config if the service supports it (zero downtime)
+sudo systemctl reload myapp
+
+# Step 4 — if reload is not enough, restart
+sudo systemctl restart myapp
+
+# Step 5 — verify
+systemctl status myapp
+journalctl -u myapp -f
+```
+
+## Audit configuration changes
+
+Track when unit files were changed:
+
+```bash
+# Find recently modified unit files
+find /etc/systemd/system/ -name "*.service" -newer /etc/systemd/system/ -ls
+
+# Check the audit log for unit file changes
+sudo ausearch -k systemd_changes -i 2>/dev/null
+
+# View systemd journal for configuration reloads
+journalctl | grep "daemon-reload\|Reloading"
+```
+
+## Scripted configuration validation
+
+A script to validate all custom unit files before applying them:
+
+```bash
+#!/bin/bash
+# validate-units.sh — check all custom unit files for errors
+
+ERRORS=0
+UNIT_DIR="/etc/systemd/system"
+
+echo "Validating unit files in $UNIT_DIR..."
+echo ""
+
+for unit in "$UNIT_DIR"/*.service; do
+  [[ -f "$unit" ]] || continue
+  OUTPUT=$(systemd-analyze verify "$unit" 2>&1)
+  if [[ -n "$OUTPUT" ]]; then
+    echo "ISSUE: $unit"
+    echo "$OUTPUT"
+    echo ""
+    ((ERRORS++))
+  else
+    echo "OK: $(basename $unit)"
+  fi
+done
+
+echo ""
+if [[ "$ERRORS" -gt 0 ]]; then
+  echo "Found $ERRORS unit file(s) with issues"
+  exit 1
+else
+  echo "All unit files validated successfully"
+fi
+```
+
+```bash
+sudo bash validate-units.sh
+```
+
+## Common mistakes
+
+### Editing files in /usr/lib/systemd/system/
+
+Package updates silently overwrite these files. Always use `systemctl edit` for overrides.
+
+```bash
+# WRONG
+sudo nano /usr/lib/systemd/system/nginx.service
+
+# CORRECT
+sudo systemctl edit nginx
+```
+
+### Forgetting daemon-reload after changes
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl restart myapp
+```
+
+### Storing secrets in inline Environment= directives
+
+Inline environment variables are visible in `systemctl show` output and process listings. Use `EnvironmentFile=` with a restricted-permission file instead.
+
+```bash
+# WRONG — secret visible in systemctl show
+Environment=DB_PASSWORD=secret123
+
+# CORRECT — stored in a file readable only by root and the service user
+EnvironmentFile=/etc/myapp/env
+```
+
+### Not adding security hardening directives
+
+Every new service should include at minimum:
+
+```ini
+[Service]
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+```
+
+### Not validating unit files before applying
+
+```bash
+systemd-analyze verify /etc/systemd/system/myapp.service
+```
+
+## Summary
+
+Service configuration on AlmaLinux is cleanest through `systemctl edit` drop-in overrides — they are safe, reversible, and not affected by package updates.
+
+Key points:
+
+- always use `systemctl edit` for overrides — never touch `/usr/lib/systemd/system/`
+- use `EnvironmentFile=` for secrets and long variable lists
+- set `Restart=on-failure` with `StartLimitBurst` to prevent infinite restart loops
+- always run `daemon-reload` after any unit file change
+- add security hardening directives — `NoNewPrivileges`, `ProtectSystem`, `PrivateTmp`
+- use `systemd-analyze verify` to catch errors before applying
+- use `systemctl revert` to go back to package defaults if something goes wrong
+
+:::tip Related pages
+- [Starting Services](./starting-services)
+- [Stopping Services](./stopping-services)
+- [Custom Unit Files](./custom-unit-files)
+- [Service Status](./service-status)
+:::

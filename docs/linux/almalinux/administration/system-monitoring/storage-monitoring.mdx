@@ -1,0 +1,453 @@
+---
+sidebar_position: 3
+title: "Storage Monitoring | AlmaLinux"
+sidebar_label: "Storage Monitoring"
+description: "Monitor disk I/O, LVM volumes, and filesystem health on AlmaLinux with iotop, iostat, smartctl, and lvm tools."
+keywords:
+  - "almalinux storage monitoring"
+  - "almalinux iotop"
+  - "almalinux iostat"
+  - "almalinux lvm monitoring"
+  - "rhel disk monitoring"
+tags:
+  - almalinux
+  - system-monitoring
+  - storage
+  - disk
+  - lvm
+slug: /linux/almalinux/administration/system-monitoring/storage-monitoring
+---
+
+# Storage Monitoring
+
+Storage problems are one of the most common causes of production incidents — full disks, failing drives, and I/O bottlenecks can all bring services down quickly. AlmaLinux provides a comprehensive set of tools to monitor filesystem usage, disk health, I/O performance, and LVM volumes so you can catch problems before they become outages.
+
+## Install monitoring tools
+
+```bash
+sudo dnf install -y \
+  sysstat \
+  iotop \
+  smartmontools \
+  lvm2 \
+  util-linux \
+  hdparm
+```
+
+Enable sysstat for historical I/O data:
+
+```bash
+sudo systemctl enable --now sysstat
+```
+
+## Filesystem usage
+
+### Check disk space
+
+```bash
+# All mounted filesystems
+df -h
+
+# Include filesystem type
+df -hT
+
+# Show inode usage
+df -i
+
+# Show a specific mount point
+df -h /var /home /tmp
+```
+
+:::warning
+Always monitor inode usage alongside disk space. A filesystem can run out of inodes while still having free space, causing writes to fail. This is especially common on mail servers and systems with many small files.
+:::
+
+### Find large files and directories
+
+```bash
+# Top 10 largest directories under /
+sudo du -h --max-depth=2 / 2>/dev/null | sort -rh | head -10
+
+# Top consumers under /var
+du -ah /var | sort -rh | head -20
+
+# Find files larger than 1GB
+sudo find / -type f -size +1G -exec ls -lh {} \; 2>/dev/null
+
+# Find files modified in the last 24 hours larger than 100MB
+sudo find /var -type f -mtime -1 -size +100M -exec ls -lh {} \;
+```
+
+### Monitor a directory size over time
+
+```bash
+#!/bin/bash
+# watch-dir-size.sh — log directory size every 5 minutes
+DIR="${1:-/var}"
+LOG="/var/log/dir-size.log"
+
+while true; do
+  SIZE=$(du -sh "$DIR" 2>/dev/null | cut -f1)
+  echo "$(date '+%F %T') $DIR $SIZE" >> "$LOG"
+  sleep 300
+done
+```
+
+## Disk I/O monitoring
+
+### Real-time I/O with iotop
+
+`iotop` shows which processes are reading and writing to disk in real time — similar to `top` but for I/O.
+
+```bash
+# Interactive mode (requires root)
+sudo iotop
+
+# Show only processes actively doing I/O
+sudo iotop -o
+
+# Non-interactive, update every 2 seconds, 10 iterations
+sudo iotop -b -n 10 -d 2
+
+# Show accumulated totals instead of rates
+sudo iotop -a
+```
+
+Useful `iotop` keybindings:
+
+| Key | Action |
+|-----|--------|
+| `o` | Toggle only show active I/O |
+| `a` | Toggle accumulated vs rate view |
+| `r` | Reverse sort order |
+| `q` | Quit |
+
+### Disk I/O stats with iostat
+
+```bash
+# Snapshot of all block devices
+iostat
+
+# Extended stats with utilisation
+iostat -x
+
+# Update every 2 seconds
+iostat -x 2
+
+# Stats for a specific device
+iostat -x sda 2
+
+# Stats in megabytes
+iostat -xm 2
+```
+
+Key `iostat -x` columns:
+
+| Column | Meaning |
+|--------|---------|
+| `r/s` | Reads per second |
+| `w/s` | Writes per second |
+| `rMB/s` | MB read per second |
+| `wMB/s` | MB written per second |
+| `r_await` | Average read wait time (ms) |
+| `w_await` | Average write wait time (ms) |
+| `aqu-sz` | Average queue depth |
+| `%util` | Percentage of time the device was busy |
+
+A `%util` above 80% consistently or `await` above 20ms indicates a storage bottleneck.
+
+### Historical I/O with sar
+
+```bash
+# Block device I/O summary for today
+sar -b
+
+# Per-device I/O stats
+sar -d
+
+# I/O every 5 minutes for the last hour
+sar -b 300 12
+
+# I/O stats from a specific date
+sar -d -f /var/log/sa/sa$(date +%d)
+```
+
+## Disk health with smartctl
+
+SMART (Self-Monitoring, Analysis and Reporting Technology) data comes directly from the drive firmware and is the best early warning system for failing hardware.
+
+```bash
+# List all disks
+lsblk
+
+# Check if SMART is supported
+sudo smartctl -i /dev/sda
+
+# Run a quick health check
+sudo smartctl -H /dev/sda
+
+# Full SMART attribute report
+sudo smartctl -a /dev/sda
+
+# Run a short self-test (takes 1-2 minutes)
+sudo smartctl -t short /dev/sda
+
+# Run a long self-test (can take hours)
+sudo smartctl -t long /dev/sda
+
+# View self-test results
+sudo smartctl -l selftest /dev/sda
+```
+
+### Key SMART attributes to watch
+
+| Attribute | What it means |
+|-----------|---------------|
+| `Reallocated_Sector_Ct` | Bad sectors remapped — any non-zero value is a warning |
+| `Current_Pending_Sector` | Sectors waiting to be remapped — drive instability |
+| `Offline_Uncorrectable` | Sectors that could not be corrected — serious warning |
+| `Spin_Retry_Count` | Drive struggled to spin up — mechanical stress |
+| `Temperature_Celsius` | Drive temperature — above 55°C is a concern |
+
+```bash
+# Check specific SMART attributes
+sudo smartctl -a /dev/sda | grep -E "Reallocated|Pending|Uncorrectable|Temperature"
+```
+
+### Enable SMART monitoring daemon
+
+`smartd` monitors drives in the background and can send email alerts when problems are detected.
+
+```bash
+sudo nano /etc/smartd.conf
+```
+
+```ini
+# Monitor all drives, run short test weekly, long test monthly,
+# email on error
+DEVICESCAN -a -o on -S on -s (S/../../6/02|L/../../1/02) \
+  -m ops@example.com -M exec /usr/libexec/smartmontools/smartdnotify
+```
+
+Enable and start the daemon:
+
+```bash
+sudo systemctl enable --now smartd
+```
+
+## LVM monitoring
+
+### View LVM layout
+
+```bash
+# Physical volumes
+sudo pvs
+sudo pvdisplay
+
+# Volume groups
+sudo vgs
+sudo vgdisplay
+
+# Logical volumes
+sudo lvs
+sudo lvdisplay
+
+# Full LVM tree
+sudo lvm fullreport
+```
+
+### Check LVM space usage
+
+```bash
+# Free space in each volume group
+sudo vgs -o vg_name,vg_size,vg_free,vg_free_count
+
+# Usage of each logical volume
+sudo lvs -o lv_name,vg_name,lv_size,data_percent,snap_percent
+```
+
+### Monitor thin pool usage
+
+Thin pools can silently fill up and cause data loss. Monitor them carefully.
+
+```bash
+# Check thin pool data and metadata usage
+sudo lvs -a -o lv_name,lv_size,data_percent,metadata_percent | grep -i pool
+```
+
+:::warning
+If a thin pool reaches 100% data usage, writes will fail for all volumes in the pool. Set up alerting before it reaches 80%.
+:::
+
+### Extend a logical volume when space is low
+
+```bash
+# Extend the LV and resize the filesystem in one step
+sudo lvextend -L +20G --resizefs /dev/vg0/lv_data
+
+# Or extend to use all available space in the VG
+sudo lvextend -l +100%FREE --resizefs /dev/vg0/lv_data
+```
+
+## Filesystem health checks
+
+### Check for filesystem errors
+
+```bash
+# View filesystem type and mount options
+mount | column -t
+
+# Check ext4 filesystem (must be unmounted or use -n for dry run)
+sudo fsck -n /dev/sda1
+
+# Check XFS filesystem
+sudo xfs_repair -n /dev/sda2
+
+# View XFS filesystem info
+sudo xfs_info /dev/sda2
+```
+
+### Check mount options
+
+Verify important filesystems are mounted with the right options:
+
+```bash
+# View all current mount options
+cat /proc/mounts
+
+# Check if a filesystem is mounted read-only unexpectedly
+mount | grep "ro,"
+```
+
+A filesystem that remounts read-only unexpectedly usually indicates disk errors. Check `dmesg` immediately:
+
+```bash
+sudo dmesg | grep -E "error|failed|I/O error" | tail -20
+```
+
+## Monitor block device errors in dmesg
+
+```bash
+# Watch for storage errors in real time
+sudo dmesg -w | grep -E "error|failed|I/O error|reset"
+
+# Show recent storage errors
+sudo dmesg | grep -E "sd[a-z]|nvme|I/O error" | tail -30
+
+# Persistent kernel messages (survives reboots on AlmaLinux)
+sudo journalctl -k | grep -E "error|I/O error|failed" | tail -30
+```
+
+## Scripted storage monitoring
+
+A script to alert on disk space, inode usage, and SMART health:
+
+```bash
+#!/bin/bash
+# storage-monitor.sh — alert on storage thresholds
+
+DISK_THRESHOLD=85
+INODE_THRESHOLD=85
+ALERT_EMAIL="ops@example.com"
+HOSTNAME=$(hostname)
+ALERTS=()
+
+# Disk space check
+while read -r line; do
+  USE=$(echo "$line" | awk '{print $5}' | tr -d '%')
+  MOUNT=$(echo "$line" | awk '{print $6}')
+  [[ "$USE" =~ ^[0-9]+$ ]] || continue
+  if [[ "$USE" -gt "$DISK_THRESHOLD" ]]; then
+    ALERTS+=("DISK SPACE: ${MOUNT} at ${USE}%")
+  fi
+done < <(df -h | tail -n +2)
+
+# Inode usage check
+while read -r line; do
+  USE=$(echo "$line" | awk '{print $5}' | tr -d '%')
+  MOUNT=$(echo "$line" | awk '{print $6}')
+  [[ "$USE" =~ ^[0-9]+$ ]] || continue
+  if [[ "$USE" -gt "$INODE_THRESHOLD" ]]; then
+    ALERTS+=("INODE USAGE: ${MOUNT} at ${USE}%")
+  fi
+done < <(df -i | tail -n +2)
+
+# SMART health check
+for disk in $(lsblk -dn -o NAME | grep -E "^sd|^nvme"); do
+  HEALTH=$(smartctl -H /dev/"$disk" 2>/dev/null | grep "SMART overall-health" | awk '{print $NF}')
+  if [[ "$HEALTH" != "PASSED" && -n "$HEALTH" ]]; then
+    ALERTS+=("SMART FAILURE: /dev/$disk health status: $HEALTH")
+  fi
+done
+
+# Send alert if needed
+if [[ "${#ALERTS[@]}" -gt 0 ]]; then
+  MESSAGE="Storage alert on ${HOSTNAME}:\n\n$(printf '%s\n' "${ALERTS[@]}")"
+  echo -e "$MESSAGE" | mail -s "Storage Alert: ${HOSTNAME}" "$ALERT_EMAIL"
+  echo -e "$MESSAGE"
+fi
+```
+
+Schedule with cron:
+
+```bash
+sudo crontab -e
+```
+
+```
+*/15 * * * * /usr/local/bin/storage-monitor.sh >> /var/log/storage-monitor.log 2>&1
+```
+
+## Common mistakes
+
+### Only monitoring disk space and ignoring inodes
+
+```bash
+# Always check both
+df -h && df -i
+```
+
+### Not monitoring thin pool usage
+
+Thin pools do not give obvious warnings before filling up. Add explicit monitoring.
+
+```bash
+sudo lvs -o lv_name,data_percent,metadata_percent | grep pool
+```
+
+### Ignoring dmesg storage errors
+
+A filesystem that is throwing I/O errors in `dmesg` but still mounted can corrupt data silently. Check regularly.
+
+```bash
+sudo dmesg | grep -i "i/o error" | tail -20
+```
+
+### Not running SMART tests regularly
+
+SMART data is only as useful as the last test. Schedule short weekly and long monthly tests via `smartd`.
+
+### Waiting until a disk is full before acting
+
+By the time `df -h` shows 100%, services are already failing. Alert at 85% and act at 90%.
+
+## Summary
+
+Storage monitoring on AlmaLinux covers four layers — filesystem usage, I/O performance, hardware health, and LVM capacity — and all four need attention.
+
+Key points:
+
+- monitor both disk space and inode usage with `df -h` and `df -i`
+- use `iotop` to identify which processes are driving I/O in real time
+- use `iostat -x` to measure device utilisation and wait times
+- use `smartctl` and `smartd` for hardware health monitoring and alerting
+- monitor LVM volume groups and thin pool usage before they fill up
+- watch `dmesg` for I/O errors — a remounted read-only filesystem is a serious warning
+- script threshold checks and schedule them with cron to catch problems early
+
+:::tip Related pages
+- [Resource Monitoring](./resource-monitoring)
+- [Process Monitoring](./process-monitoring)
+- [Performance Analysis](./performance-analysis)
+- [Metrics Collection](./metrics-collection)
+:::

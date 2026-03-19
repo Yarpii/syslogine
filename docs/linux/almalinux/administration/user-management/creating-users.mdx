@@ -1,0 +1,383 @@
+---
+sidebar_position: 1
+title: "Creating Users | AlmaLinux"
+sidebar_label: "Creating Users"
+description: "Create local users on AlmaLinux with useradd, configure defaults, set passwords, and implement enterprise user provisioning."
+keywords:
+  - "almalinux create user"
+  - "almalinux useradd"
+  - "almalinux adduser"
+  - "almalinux user provisioning"
+  - "rhel create user"
+tags:
+  - almalinux
+  - user-management
+  - system-administration
+slug: /linux/almalinux/administration/user-management/creating-users
+---
+
+# Creating Users
+
+AlmaLinux uses `useradd` to create local user accounts. The command gives you precise control over home directories, shells, UIDs, group memberships, and account expiration — making it suitable for both single-server setups and scripted enterprise provisioning.
+
+## Basic user creation
+
+The simplest form of `useradd` creates a user with system defaults.
+
+```bash
+sudo useradd username
+```
+
+This creates:
+- a user account in `/etc/passwd`
+- a shadow entry in `/etc/shadow`
+- a primary group matching the username
+- a home directory at `/home/username`
+
+After creating the user, set a password immediately.
+
+```bash
+sudo passwd username
+```
+
+## Verify the user was created
+
+```bash
+# Show the user's entry in /etc/passwd
+getent passwd username
+
+# Show group memberships
+groups username
+
+# Confirm the home directory exists
+ls -la /home/username
+```
+
+## Common useradd options
+
+| Option | Description |
+|--------|-------------|
+| `-m` | Create the home directory (default on AlmaLinux) |
+| `-M` | Do not create a home directory |
+| `-d /path` | Set a custom home directory path |
+| `-s /bin/bash` | Set the login shell |
+| `-c "Full Name"` | Add a comment / full name |
+| `-u 1500` | Set a specific UID |
+| `-g groupname` | Set the primary group |
+| `-G group1,group2` | Add to supplementary groups |
+| `-e YYYY-MM-DD` | Set account expiration date |
+| `-r` | Create a system account (no home, low UID) |
+
+## Create a user with full details
+
+```bash
+sudo useradd \
+  --comment "Jane Doe" \
+  --home-dir /home/jdoe \
+  --create-home \
+  --shell /bin/bash \
+  --groups wheel,developers \
+  jdoe
+```
+
+Then set the password:
+
+```bash
+sudo passwd jdoe
+```
+
+## Set a custom home directory
+
+By default, the home directory is created under `/home`. For environments that use a different path — such as `/data/users` or NFS-mounted homes — specify the path explicitly.
+
+```bash
+sudo useradd \
+  --home-dir /data/users/jdoe \
+  --create-home \
+  jdoe
+```
+
+:::warning
+If the parent directory does not exist, `useradd` will fail. Create it first:
+
+```bash
+sudo mkdir -p /data/users
+sudo useradd --home-dir /data/users/jdoe --create-home jdoe
+```
+:::
+
+## Specify a login shell
+
+```bash
+# Bash (most common)
+sudo useradd --shell /bin/bash jdoe
+
+# Zsh
+sudo useradd --shell /bin/zsh jdoe
+
+# No interactive login (for service accounts)
+sudo useradd --shell /sbin/nologin serviceaccount
+```
+
+To see all valid shells on the system:
+
+```bash
+cat /etc/shells
+```
+
+## Set account expiration
+
+Use `--expiredate` to automatically disable an account on a given date. This is useful for contractors, temporary staff, or accounts tied to a project timeline.
+
+```bash
+sudo useradd \
+  --expiredate 2025-12-31 \
+  --comment "Contractor - expires end of 2025" \
+  --shell /bin/bash \
+  contractor1
+```
+
+Check when an account expires:
+
+```bash
+sudo chage -l contractor1
+```
+
+## Create a system account
+
+System accounts are used for services and daemons. They typically have no home directory, no password login, and a UID below 1000.
+
+```bash
+sudo useradd \
+  --system \
+  --no-create-home \
+  --shell /sbin/nologin \
+  --comment "App service account" \
+  appservice
+```
+
+Verify the UID is in the system range:
+
+```bash
+id appservice
+```
+
+## Add a user to groups at creation
+
+To give a new user sudo access, add them to the `wheel` group.
+
+```bash
+sudo useradd \
+  --groups wheel \
+  --shell /bin/bash \
+  --create-home \
+  adminuser
+sudo passwd adminuser
+```
+
+To add to multiple supplementary groups:
+
+```bash
+sudo useradd \
+  --groups wheel,docker,developers \
+  --shell /bin/bash \
+  jdoe
+```
+
+:::note
+The `--groups` flag sets **supplementary** groups. The primary group is set separately with `--gid`. If no primary group is specified, AlmaLinux creates a new group matching the username.
+:::
+
+## View default useradd settings
+
+AlmaLinux stores defaults in `/etc/default/useradd`. You can view them with:
+
+```bash
+useradd --defaults
+```
+
+Example output:
+
+```
+GROUP=100
+HOME=/home
+INACTIVE=-1
+EXPIRE=
+SHELL=/bin/bash
+SKEL=/etc/skel
+CREATE_MAIL_SPOOL=no
+```
+
+## Change default settings
+
+To update the defaults system-wide, edit `/etc/default/useradd` directly, or use the `-D` flag:
+
+```bash
+# Change the default shell for all new users
+sudo useradd -D --shell /bin/bash
+
+# Change the default home base directory
+sudo useradd -D --home /data/users
+
+# Set a default expiration for all new accounts
+sudo useradd -D --expiredate 2026-01-01
+```
+
+## The skeleton directory
+
+When a home directory is created, AlmaLinux copies files from `/etc/skel` into it. This is how you pre-populate home directories for all new users.
+
+```bash
+# View current skeleton files
+ls -la /etc/skel
+
+# Add a custom .bashrc for all new users
+sudo cp custom-bashrc /etc/skel/.bashrc
+
+# Add a shared policy file
+sudo cp acceptable-use.txt /etc/skel/README.txt
+```
+
+Any files you place in `/etc/skel` will appear in the home directory of every user created after that point.
+
+## Scripted bulk user creation
+
+For provisioning multiple users at once, use a script.
+
+```bash
+#!/bin/bash
+# provision-users.sh
+# Usage: sudo bash provision-users.sh users.txt
+#
+# users.txt format (one per line):
+#   username:fullname:group
+
+INPUT_FILE="$1"
+
+if [[ -z "$INPUT_FILE" || ! -f "$INPUT_FILE" ]]; then
+  echo "Usage: $0 users.txt"
+  exit 1
+fi
+
+while IFS=: read -r username fullname group; do
+  # Skip blank lines and comments
+  [[ -z "$username" || "$username" == \#* ]] && continue
+
+  if id "$username" &>/dev/null; then
+    echo "SKIP: $username already exists"
+    continue
+  fi
+
+  useradd \
+    --comment "$fullname" \
+    --shell /bin/bash \
+    --create-home \
+    --groups "$group" \
+    "$username"
+
+  # Set a temporary password — force change on first login
+  echo "${username}:ChangeMe123!" | chpasswd
+  chage --lastday 0 "$username"
+
+  echo "CREATED: $username ($fullname) -> group: $group"
+done < "$INPUT_FILE"
+```
+
+Example `users.txt`:
+
+```
+jdoe:Jane Doe:developers
+bsmith:Bob Smith:developers
+mwilson:Maria Wilson:wheel
+```
+
+Run it:
+
+```bash
+sudo bash provision-users.sh users.txt
+```
+
+:::warning
+The example script sets a temporary password and immediately expires it so the user is forced to set their own on first login. Do not leave provisioned accounts with a shared default password.
+:::
+
+## Force password change on first login
+
+```bash
+# Expire the password immediately — user must change it on next login
+sudo chage --lastday 0 username
+```
+
+Verify:
+
+```bash
+sudo chage -l username
+```
+
+## Set password policy at user creation
+
+Combine `useradd` with `chage` to enforce a password aging policy for a new account:
+
+```bash
+sudo useradd --shell /bin/bash --create-home jdoe
+sudo passwd jdoe
+
+# Max 90 days before password must be changed
+# Warn 14 days before expiry
+# Minimum 1 day between password changes
+sudo chage \
+  --maxdays 90 \
+  --warndays 14 \
+  --mindays 1 \
+  jdoe
+```
+
+## Common mistakes
+
+### Creating a user without setting a password
+
+A user without a password has a locked account by default on AlmaLinux. Always follow `useradd` with `passwd` or `chpasswd`.
+
+```bash
+# Check if the account is locked (look for ! in the password field)
+sudo grep username /etc/shadow
+```
+
+### Forgetting --create-home
+
+On some minimal installs or when using certain flags, the home directory may not be created automatically. Use `--create-home` explicitly to be safe.
+
+```bash
+sudo useradd --create-home --shell /bin/bash username
+```
+
+### Adding to groups without checking they exist
+
+If you specify a group that does not exist, `useradd` will fail.
+
+```bash
+# Check if a group exists before referencing it
+getent group developers || sudo groupadd developers
+
+sudo useradd --groups developers username
+```
+
+## Summary
+
+Creating users on AlmaLinux is straightforward with `useradd`, but the options give you fine-grained control for enterprise environments.
+
+Key points:
+
+- always set a password after creating an account
+- use `--create-home` and `--shell` explicitly in scripts
+- use `/etc/skel` to pre-populate home directories
+- use `chage` to enforce password aging policies
+- use `--system` and `--shell /sbin/nologin` for service accounts
+- script provisioning for repeatability, and force a password change on first login
+
+:::tip Related pages
+- [Removing Users](./removing-users)
+- [Group Management](./group-management)
+- [Sudo & Privileges](./sudo-privileges)
+- [Security Policies](./security-policies)
+:::

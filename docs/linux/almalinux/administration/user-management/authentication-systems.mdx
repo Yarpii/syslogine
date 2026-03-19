@@ -1,0 +1,453 @@
+---
+sidebar_position: 5
+title: "Authentication Systems | AlmaLinux"
+sidebar_label: "Authentication Systems"
+description: "Configure PAM modules, implement multi-factor authentication, and integrate with enterprise identity providers on AlmaLinux."
+keywords:
+  - "almalinux pam"
+  - "almalinux authentication"
+  - "almalinux mfa"
+  - "almalinux sssd"
+  - "rhel pam configuration"
+tags:
+  - almalinux
+  - user-management
+  - authentication
+  - security
+slug: /linux/almalinux/administration/user-management/authentication-systems
+---
+
+# Authentication Systems
+
+AlmaLinux uses **PAM (Pluggable Authentication Modules)** as the foundation for all authentication. PAM sits between applications and the actual authentication logic, letting you configure password policies, multi-factor authentication, account lockout, and session controls — without modifying individual applications.
+
+Understanding PAM lets you build a layered authentication strategy that works across local accounts, LDAP, and Active Directory.
+
+## How PAM works
+
+Every service that requires authentication — `login`, `sshd`, `sudo`, `su` — has a corresponding PAM configuration file in `/etc/pam.d/`.
+
+```bash
+# List PAM configuration files
+ls /etc/pam.d/
+
+# View the PAM config for SSH
+cat /etc/pam.d/sshd
+
+# View the PAM config for sudo
+cat /etc/pam.d/sudo
+```
+
+Each PAM file contains rules in this format:
+
+```
+type  control  module  [arguments]
+```
+
+| Field | Description |
+|-------|-------------|
+| `type` | `auth`, `account`, `password`, or `session` |
+| `control` | `required`, `requisite`, `sufficient`, `optional` |
+| `module` | Path to the `.so` PAM module |
+| `arguments` | Module-specific options |
+
+### PAM types
+
+| Type | Purpose |
+|------|---------|
+| `auth` | Verify identity — checks passwords, tokens, keys |
+| `account` | Check account validity — expiration, access hours, lockout |
+| `password` | Handle password changes |
+| `session` | Set up and tear down the user session |
+
+### PAM control flags
+
+| Flag | Behaviour |
+|------|-----------|
+| `required` | Must succeed. Failure continues through the stack but ultimately denies access |
+| `requisite` | Must succeed. Failure immediately denies access |
+| `sufficient` | If this succeeds and nothing required has failed, grant access |
+| `optional` | Result does not affect overall outcome |
+
+## View the current authentication configuration
+
+AlmaLinux uses `authselect` to manage PAM profiles. This is the recommended way to configure authentication — editing PAM files directly can break things if authselect overwrites them.
+
+```bash
+# Show the current active profile
+authselect current
+
+# List available profiles
+authselect list
+
+# Show what files the current profile manages
+authselect current --raw
+```
+
+## Switch authentication profiles with authselect
+
+```bash
+# Use the sssd profile (for LDAP/AD integration)
+sudo authselect select sssd
+
+# Use the winbind profile (for Samba/AD)
+sudo authselect select winbind
+
+# Use the minimal profile (local accounts only)
+sudo authselect select minimal
+
+# Apply a profile with optional features
+sudo authselect select sssd with-mkhomedir with-faillock
+```
+
+## Account lockout with faillock
+
+`faillock` locks an account after a configurable number of failed login attempts. It is enabled by default on AlmaLinux.
+
+### View and configure faillock settings
+
+```bash
+# View current faillock configuration
+cat /etc/security/faillock.conf
+```
+
+Key settings in `/etc/security/faillock.conf`:
+
+```ini
+# Lock after 5 failed attempts
+deny = 5
+
+# Lock for 10 minutes (600 seconds)
+unlock_time = 600
+
+# Count failures within a 15-minute window
+fail_interval = 900
+
+# Also lock the root account
+even_deny_root = true
+```
+
+Apply changes:
+
+```bash
+sudo authselect select sssd with-faillock --force
+```
+
+### Check and reset locked accounts
+
+```bash
+# Check failed attempts for a user
+faillock --user jdoe
+
+# Reset a locked account
+sudo faillock --user jdoe --reset
+
+# Reset all locked accounts
+sudo faillock --reset
+```
+
+## Password quality with pwquality
+
+`pam_pwquality` enforces password complexity rules at the PAM layer. Configure it in `/etc/security/pwquality.conf`.
+
+```bash
+cat /etc/security/pwquality.conf
+```
+
+Common settings:
+
+```ini
+# Minimum password length
+minlen = 15
+
+# Minimum number of character classes required (upper, lower, digit, special)
+minclass = 0
+
+# Reject passwords that contain the username
+usercheck = 1
+
+# Number of characters that must differ from the previous password
+difok = 3
+
+# Reject passwords found in a dictionary
+dictcheck = 1
+
+# Reject passwords that are too similar to the old one
+maxrepeat = 3
+```
+
+:::tip
+Setting `minclass = 0` removes forced complexity rules while keeping length enforcement — consistent with modern password policy guidance. Pair this with a deny list and MFA rather than arbitrary symbol rules.
+:::
+
+Test a password against the current policy without changing it:
+
+```bash
+pwscore <<< "your-test-password"
+```
+
+## Configure password aging in PAM
+
+Password aging defaults for new users are set in `/etc/login.defs`:
+
+```bash
+sudo nano /etc/login.defs
+```
+
+Key values:
+
+```ini
+# Maximum days before password must be changed
+PASS_MAX_DAYS   90
+
+# Minimum days between password changes
+PASS_MIN_DAYS   1
+
+# Days before expiry to warn the user
+PASS_WARN_AGE   14
+```
+
+These apply to newly created accounts. For existing accounts, use `chage`:
+
+```bash
+sudo chage --maxdays 90 --mindays 1 --warndays 14 jdoe
+
+# View current aging settings
+sudo chage -l jdoe
+```
+
+## Set up multi-factor authentication with TOTP
+
+`pam_oath` or `pam_google_authenticator` adds TOTP (time-based one-time password) as a second factor. The example below uses `google-authenticator-libpam`.
+
+### Install the module
+
+```bash
+sudo dnf install google-authenticator-libpam -y
+```
+
+### Configure for a user
+
+Each user runs this once to set up their authenticator app:
+
+```bash
+google-authenticator
+```
+
+Follow the prompts. This generates a QR code and a set of scratch codes, and writes a `.google_authenticator` file to the user's home directory.
+
+### Enable TOTP for SSH logins
+
+Edit the PAM config for SSH:
+
+```bash
+sudo nano /etc/pam.d/sshd
+```
+
+Add this line near the top:
+
+```
+auth  required  pam_google_authenticator.so nullok
+```
+
+The `nullok` option allows users without TOTP configured to still log in — remove it once all users are enrolled.
+
+Then update `/etc/ssh/sshd_config` to require both password and TOTP:
+
+```bash
+sudo nano /etc/ssh/sshd_config
+```
+
+```ini
+ChallengeResponseAuthentication yes
+AuthenticationMethods keyboard-interactive
+```
+
+Restart SSH:
+
+```bash
+sudo systemctl restart sshd
+```
+
+:::warning
+Test the new SSH configuration in a **separate session** before closing your existing one. A misconfigured PAM or sshd_config can lock you out.
+:::
+
+## Restrict login times with pam_time
+
+`pam_time` lets you restrict when users can log in based on time and day.
+
+Configure rules in `/etc/security/time.conf`:
+
+```bash
+sudo nano /etc/security/time.conf
+```
+
+Format:
+
+```
+services;ttys;users;times
+```
+
+Examples:
+
+```ini
+# Block all logins for contractors outside business hours (Mon-Fri 08:00-18:00)
+login;*;contractor1|contractor2;Wk0800-1800
+
+# Block root login on all terminals at all times except from console
+login;tty1;root;Al0000-2400
+login;*;root;!Al0000-2400
+```
+
+Enable `pam_time` for login:
+
+```bash
+sudo nano /etc/pam.d/login
+```
+
+Add:
+
+```
+account  required  pam_time.so
+```
+
+## Restrict access by group with pam_access
+
+`pam_access` controls which users or groups can access a service from which hosts.
+
+Configure in `/etc/security/access.conf`:
+
+```bash
+sudo nano /etc/security/access.conf
+```
+
+Format:
+
+```
+permission : users/groups : origins
+```
+
+Examples:
+
+```ini
+# Allow wheel group from anywhere
++ : wheel : ALL
+
+# Allow developers from the internal network only
++ : developers : 10.0.0.0/8
+
+# Deny everyone else
+- : ALL : ALL
+```
+
+Enable for SSH:
+
+```bash
+sudo nano /etc/pam.d/sshd
+```
+
+Add:
+
+```
+account  required  pam_access.so
+```
+
+## Limit resources with pam_limits
+
+`pam_limits` enforces resource limits per user or group. These are configured in `/etc/security/limits.conf` and files under `/etc/security/limits.d/`.
+
+```bash
+sudo nano /etc/security/limits.conf
+```
+
+Format:
+
+```
+domain  type  item  value
+```
+
+Examples:
+
+```ini
+# Limit max open files for all users
+*         soft  nofile   4096
+*         hard  nofile   65536
+
+# Restrict a service account to one login session
+appservice hard  maxlogins 1
+
+# Set process limits for the developers group
+@developers soft  nproc    512
+@developers hard  nproc    1024
+```
+
+Verify limits for the current session:
+
+```bash
+ulimit -a
+```
+
+## View PAM logs
+
+PAM authentication events are logged to `/var/log/secure` and the systemd journal.
+
+```bash
+# View authentication events
+sudo tail -f /var/log/secure
+
+# Filter for failed logins
+sudo grep "authentication failure" /var/log/secure
+
+# View PAM events in the journal
+sudo journalctl | grep pam
+```
+
+## Common mistakes
+
+### Editing PAM files directly when using authselect
+
+`authselect` manages PAM files automatically. Direct edits may be overwritten when the profile is reapplied. Use `authselect` features or custom configuration where possible.
+
+```bash
+# Check what authselect controls
+authselect current
+```
+
+### Locking yourself out while testing PAM changes
+
+Always keep an existing root or sudo session open while testing changes to `/etc/pam.d/sshd` or `sudo`.
+
+```bash
+# Test SSH config without disconnecting
+sudo sshd -t
+```
+
+### Removing nullok before all users are enrolled for MFA
+
+If `nullok` is removed from the TOTP PAM rule before all users have set up their authenticator, those users will be unable to log in.
+
+### Setting PASS_MAX_DAYS too low
+
+Overly aggressive password rotation pushes users toward predictable incremental changes. A 90-day maximum with good MFA coverage is a reasonable baseline.
+
+## Summary
+
+PAM gives AlmaLinux a flexible, layered authentication system that covers everything from basic password policies to MFA and time-based access restrictions.
+
+Key points:
+
+- use `authselect` to manage PAM profiles rather than editing files directly
+- enable `faillock` to protect against brute force attacks
+- configure password quality in `/etc/security/pwquality.conf`
+- use `pam_google_authenticator` or `pam_oath` for TOTP-based MFA
+- use `pam_access` and `pam_time` for access restrictions beyond passwords
+- always test PAM and SSH changes with an existing session open
+- monitor authentication events in `/var/log/secure` and the journal
+
+:::tip Related pages
+- [Sudo & Privileges](./sudo-privileges)
+- [LDAP Integration](./ldap-integration)
+- [Security Policies](./security-policies)
+- [User Auditing](./user-auditing)
+:::

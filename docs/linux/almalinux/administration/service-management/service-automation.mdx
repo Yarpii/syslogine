@@ -1,0 +1,548 @@
+---
+sidebar_position: 8
+title: "Service Automation | AlmaLinux"
+sidebar_label: "Service Automation"
+description: "Implement automatic restarts, service monitoring, timers, and enterprise service automation with systemd on AlmaLinux."
+keywords:
+  - "almalinux service automation"
+  - "almalinux systemd timers"
+  - "almalinux automatic restart"
+  - "almalinux systemd watchdog"
+  - "rhel service automation"
+tags:
+  - almalinux
+  - service-management
+  - systemd
+  - automation
+  - timers
+slug: /linux/almalinux/administration/service-management/service-automation
+---
+
+# Service Automation
+
+Service automation on AlmaLinux covers everything that happens without manual intervention — automatic restarts on failure, scheduled tasks via systemd timers, watchdog health monitoring, and event-driven service activation. Done well, automation reduces toil, improves reliability, and ensures your services recover from failures without waking anyone up at 3am.
+
+## Automatic restarts
+
+The most fundamental automation is restarting a service when it crashes.
+
+```ini
+[Service]
+# Restart on non-zero exit, signal, timeout, or watchdog failure
+Restart=on-failure
+
+# Wait 5 seconds before restarting
+RestartSec=5
+
+# Maximum 5 restart attempts in 2 minutes before giving up
+StartLimitIntervalSec=120
+StartLimitBurst=5
+```
+
+### Restart policy options
+
+| Policy | When systemd restarts |
+|--------|----------------------|
+| `no` | Never — default if not specified |
+| `always` | On any exit, including clean stops |
+| `on-failure` | On non-zero exit code, signal, timeout, or watchdog |
+| `on-abnormal` | On signal, timeout, or watchdog (not on exit code) |
+| `on-abort` | Only on uncaught signals |
+| `on-watchdog` | Only on watchdog timeout |
+
+### Exponential backoff for restarts
+
+For services prone to thundering herd on restart, use increasing delays:
+
+```bash
+sudo systemctl edit myapp
+```
+
+```ini
+[Service]
+Restart=on-failure
+RestartSec=5
+# systemd does not natively support exponential backoff,
+# but you can approximate it with a wrapper script:
+ExecStartPre=/bin/sleep $((RANDOM % 10))
+```
+
+For true exponential backoff, use a wrapper:
+
+```bash
+sudo nano /usr/local/bin/myapp-with-backoff.sh
+```
+
+```bash
+#!/bin/bash
+ATTEMPTS=0
+MAX_ATTEMPTS=5
+DELAY=5
+
+while [[ $ATTEMPTS -lt $MAX_ATTEMPTS ]]; do
+  /opt/myapp/bin/myapp "$@"
+  EXIT_CODE=$?
+  [[ $EXIT_CODE -eq 0 ]] && exit 0
+  ATTEMPTS=$((ATTEMPTS + 1))
+  SLEEP=$((DELAY * ATTEMPTS))
+  echo "Attempt $ATTEMPTS failed (exit $EXIT_CODE) — retrying in ${SLEEP}s"
+  sleep $SLEEP
+done
+
+echo "Service failed after $MAX_ATTEMPTS attempts"
+exit 1
+```
+
+```ini
+[Service]
+ExecStart=/usr/local/bin/myapp-with-backoff.sh
+Restart=on-failure
+StartLimitBurst=3
+StartLimitIntervalSec=300
+```
+
+## Systemd timers — replacing cron
+
+Systemd timers are the modern replacement for cron jobs. They integrate with the journal for logging, support all systemd dependency and resource control features, and are easier to debug than cron.
+
+### Timer unit structure
+
+A timer always activates another unit — typically a `.service` with the same name.
+
+```
+myapp-cleanup.timer  →  activates  →  myapp-cleanup.service
+```
+
+### Create a simple recurring timer
+
+```bash
+sudo nano /etc/systemd/system/myapp-cleanup.service
+```
+
+```ini
+[Unit]
+Description=Clean up old myapp temporary files
+
+[Service]
+Type=oneshot
+User=myapp
+ExecStart=/opt/myapp/bin/cleanup.sh --older-than 7d
+```
+
+```bash
+sudo nano /etc/systemd/system/myapp-cleanup.timer
+```
+
+```ini
+[Unit]
+Description=Run myapp cleanup daily
+
+[Timer]
+# Run daily at 02:30
+OnCalendar=*-*-* 02:30:00
+
+# Run immediately if the last run was missed (e.g. system was off)
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+```
+
+Enable and start:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now myapp-cleanup.timer
+
+# Check status
+systemctl status myapp-cleanup.timer
+systemctl list-timers myapp-cleanup.timer
+```
+
+### OnCalendar schedule syntax
+
+```ini
+# Every day at 02:30
+OnCalendar=*-*-* 02:30:00
+
+# Every hour
+OnCalendar=hourly
+
+# Every day at midnight
+OnCalendar=daily
+
+# Every week on Monday at 04:00
+OnCalendar=Mon *-*-* 04:00:00
+
+# Every 15 minutes
+OnCalendar=*:0/15
+
+# First day of every month at 06:00
+OnCalendar=*-*-01 06:00:00
+
+# Weekdays only at 08:00
+OnCalendar=Mon..Fri *-*-* 08:00:00
+
+# Every 6 hours
+OnCalendar=0/6:00:00
+```
+
+Test a calendar expression before using it:
+
+```bash
+systemd-analyze calendar "*-*-* 02:30:00"
+systemd-analyze calendar "Mon..Fri *-*-* 08:00:00"
+```
+
+### Monotonic timers — relative to boot or last run
+
+```ini
+[Timer]
+# Run 15 minutes after boot
+OnBootSec=15min
+
+# Run 1 hour after the service last ran
+OnUnitActiveSec=1h
+
+# Run 30 minutes after the timer itself was activated
+OnActiveSec=30min
+```
+
+### Add randomised delay to spread load
+
+When multiple servers run the same timer simultaneously, they can overload a shared resource. A random delay spreads the load.
+
+```ini
+[Timer]
+OnCalendar=*-*-* 02:00:00
+# Add a random delay of up to 30 minutes
+RandomizedDelaySec=1800
+Persistent=true
+```
+
+### View all active timers
+
+```bash
+# All active timers with next trigger time
+systemctl list-timers
+
+# All timers including inactive
+systemctl list-timers --all
+
+# Status of a specific timer
+systemctl status myapp-cleanup.timer
+
+# When did the timer last trigger?
+journalctl -u myapp-cleanup.service -n 10
+```
+
+## Watchdog — automatic health monitoring
+
+The systemd watchdog kills and restarts a service if it stops responding within a configured timeout. It requires the service to periodically send a heartbeat signal.
+
+### Configure the watchdog
+
+```bash
+sudo systemctl edit myapp
+```
+
+```ini
+[Service]
+Type=notify
+# Kill and restart if no watchdog ping within 30 seconds
+WatchdogSec=30s
+Restart=on-failure
+RestartSec=5
+```
+
+### Send watchdog pings from the application
+
+Applications must call `sd_notify("WATCHDOG=1")` periodically. Most modern service frameworks support this natively.
+
+For shell scripts or applications without sd_notify support, use a wrapper:
+
+```bash
+sudo nano /usr/local/bin/watchdog-wrapper.sh
+```
+
+```bash
+#!/bin/bash
+# Sends watchdog pings while the main process runs
+
+INTERVAL=$(( ${WATCHDOG_USEC:-30000000} / 2000000 ))
+
+# Start the main process in the background
+/opt/myapp/bin/myapp "$@" &
+MAIN_PID=$!
+
+# Signal systemd that we are ready
+systemd-notify --ready
+
+# Send watchdog pings while the process is running
+while kill -0 $MAIN_PID 2>/dev/null; do
+  systemd-notify WATCHDOG=1
+  sleep $INTERVAL
+done
+
+# Return the exit code of the main process
+wait $MAIN_PID
+```
+
+```ini
+[Service]
+Type=notify
+ExecStart=/usr/local/bin/watchdog-wrapper.sh
+WatchdogSec=30s
+NotifyAccess=all
+```
+
+## Path activation — trigger on filesystem events
+
+Activate a service automatically when a file or directory changes.
+
+```bash
+sudo nano /etc/systemd/system/process-uploads.path
+```
+
+```ini
+[Unit]
+Description=Watch upload directory for new files
+
+[Path]
+# Trigger when a file is created in this directory
+PathExistsGlob=/var/spool/uploads/*.pending
+# Unit to activate (defaults to same name with .service)
+Unit=process-uploads.service
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo nano /etc/systemd/system/process-uploads.service
+```
+
+```ini
+[Unit]
+Description=Process pending uploads
+
+[Service]
+Type=oneshot
+User=myapp
+ExecStart=/opt/myapp/bin/process-uploads.sh
+```
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now process-uploads.path
+```
+
+## Socket activation — start on demand
+
+Socket activation starts a service only when a connection arrives. The socket stays open and queues connections while the service is starting.
+
+```bash
+sudo nano /etc/systemd/system/myapp.socket
+```
+
+```ini
+[Unit]
+Description=myapp on-demand socket
+
+[Socket]
+ListenStream=8080
+# Keep the socket open even when the service is not running
+Accept=no
+
+[Install]
+WantedBy=sockets.target
+```
+
+```bash
+sudo nano /etc/systemd/system/myapp.service
+```
+
+```ini
+[Unit]
+Description=myapp (socket activated)
+Requires=myapp.socket
+
+[Service]
+Type=simple
+User=myapp
+ExecStart=/opt/myapp/bin/myapp
+# Stop the service after 5 minutes of inactivity
+TimeoutStopSec=5min
+```
+
+```bash
+sudo systemctl enable --now myapp.socket
+```
+
+## OnFailure — alert when a service crashes
+
+Run a script automatically whenever a service fails.
+
+```bash
+sudo nano /etc/systemd/system/notify-on-failure@.service
+```
+
+```ini
+[Unit]
+Description=Notify on failure of %i
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/service-failure-notify.sh %i
+```
+
+```bash
+sudo nano /usr/local/bin/service-failure-notify.sh
+```
+
+```bash
+#!/bin/bash
+SERVICE="$1"
+HOSTNAME=$(hostname)
+ALERT_EMAIL="ops@example.com"
+
+RESULT=$(systemctl show "$SERVICE" --property=Result | cut -d= -f2)
+LOG=$(journalctl -u "$SERVICE" -n 20 --no-pager)
+
+echo -e "Service FAILED on ${HOSTNAME}\n\nService: $SERVICE\nResult: $RESULT\n\nLast 20 log lines:\n${LOG}" \
+  | mail -s "Service Failure: $SERVICE on $HOSTNAME" "$ALERT_EMAIL"
+```
+
+```bash
+sudo chmod +x /usr/local/bin/service-failure-notify.sh
+```
+
+Attach it to any service:
+
+```bash
+sudo systemctl edit nginx
+```
+
+```ini
+[Unit]
+OnFailure=notify-on-failure@nginx.service
+```
+
+## Automate service lifecycle with a compound script
+
+A script to start a full application stack in the correct order and verify each step:
+
+```bash
+#!/bin/bash
+# stack-start.sh — start the full application stack
+
+SERVICES=("postgresql" "redis" "myapp-web" "myapp-worker" "myapp-scheduler")
+TIMEOUT=30
+FAILED=()
+
+start_service() {
+  local service="$1"
+  echo "Starting $service..."
+  sudo systemctl start "$service"
+
+  for i in $(seq 1 $TIMEOUT); do
+    if systemctl is-active --quiet "$service"; then
+      echo "  OK: $service active after ${i}s"
+      return 0
+    fi
+    sleep 1
+  done
+
+  echo "  FAIL: $service did not start within ${TIMEOUT}s"
+  journalctl -u "$service" -n 10 --no-pager
+  return 1
+}
+
+for service in "${SERVICES[@]}"; do
+  if ! start_service "$service"; then
+    FAILED+=("$service")
+    echo "Aborting — $service failed to start"
+    break
+  fi
+done
+
+echo ""
+if [[ "${#FAILED[@]}" -gt 0 ]]; then
+  echo "Stack start FAILED — could not start: ${FAILED[*]}"
+  exit 1
+else
+  echo "Stack started successfully"
+  systemctl status "${SERVICES[@]}" --no-pager | grep -E "Active:|●"
+fi
+```
+
+## Common mistakes
+
+### Using Restart=always without StartLimitBurst
+
+Without a restart limit, a service that fails immediately on start will restart in an infinite loop.
+
+```ini
+[Service]
+Restart=always
+RestartSec=5
+StartLimitIntervalSec=120
+StartLimitBurst=5
+```
+
+### Using cron instead of systemd timers for new jobs
+
+cron jobs do not integrate with systemd logging, resource controls, or dependency management. For new scheduled tasks on AlmaLinux, use timers.
+
+```bash
+# Check if a timer already exists before creating a cron job
+systemctl list-timers | grep myapp
+```
+
+### Not setting Persistent=true on timers
+
+Without `Persistent=true`, a timer that was missed while the system was off simply skips that run. For jobs that must not be skipped, always set it.
+
+```ini
+[Timer]
+OnCalendar=daily
+Persistent=true
+```
+
+### Forgetting NotifyAccess=all for watchdog wrappers
+
+If the watchdog ping comes from a child process rather than the main PID, systemd ignores it unless `NotifyAccess=all` is set.
+
+```ini
+[Service]
+NotifyAccess=all
+```
+
+### Not testing timer schedules before deploying
+
+```bash
+# Always verify the schedule before enabling
+systemd-analyze calendar "Mon..Fri *-*-* 08:00:00"
+```
+
+## Summary
+
+Service automation on AlmaLinux ranges from simple restart policies to sophisticated event-driven activation patterns. systemd timers, watchdogs, path units, and socket activation give you everything you need to build self-healing, low-maintenance services.
+
+Key points:
+
+- set `Restart=on-failure` with `StartLimitBurst` on all production services
+- use systemd timers instead of cron for new scheduled tasks — they integrate with journald and resource controls
+- set `Persistent=true` on timers for jobs that must not be skipped
+- use `WatchdogSec=` for services that need health monitoring beyond simple restart
+- use `OnFailure=` to trigger alerts automatically when a service crashes
+- use path units for filesystem-triggered automation
+- use socket activation for on-demand services that do not need to run continuously
+- test timer schedules with `systemd-analyze calendar` before deploying
+
+:::tip Related pages
+- [Service Configuration](./service-configuration)
+- [Service Dependencies](./service-dependencies)
+- [Custom Unit Files](./custom-unit-files)
+- [Service Status](./service-status)
+:::

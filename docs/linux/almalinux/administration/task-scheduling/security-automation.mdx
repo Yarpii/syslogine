@@ -1,0 +1,688 @@
+---
+sidebar_position: 6
+title: "Security Automation | AlmaLinux"
+sidebar_label: "Security Automation"
+description: "Schedule security scans, compliance checks, audit reports, and automated security updates on AlmaLinux to maintain a hardened and continuously monitored system posture."
+keywords:
+  - "almalinux security automation"
+  - "almalinux security scanning"
+  - "almalinux compliance checks"
+  - "almalinux aide"
+  - "rhel security automation"
+tags:
+  - almalinux
+  - task-scheduling
+  - security
+  - automation
+  - compliance
+slug: /linux/almalinux/administration/task-scheduling/security-automation
+---
+
+# Security Automation on AlmaLinux
+
+Security is not a configuration you apply once and forget. Systems drift from their intended state as packages are updated, configurations are changed, users are added or removed, and new vulnerabilities are discovered. Automated security checks run on a schedule, compare the current state of the system against a known baseline or policy, and alert when something has changed or when a new risk has emerged.
+
+On AlmaLinux, the tools for automated security checks are a combination of built-in utilities — `auditd`, AIDE, `oscap` — and scheduled scripts that check specific conditions. This page covers how to schedule these tools effectively, how to generate compliance reports automatically, and how to structure security automation so that the results are actionable rather than just data.
+
+---
+
+## Security Update Scheduling
+
+The most impactful security automation on most systems is ensuring that security patches are applied promptly. Unpatched known vulnerabilities are the most common vector for successful attacks. `dnf-automatic` handles this on AlmaLinux, and its configuration for security-focused environments differs from general update automation.
+
+### Security-Only Updates
+
+Configure `dnf-automatic` to apply only security updates automatically, leaving feature and bugfix updates for manual review:
+
+```bash
+nano /etc/dnf/automatic.conf
+```
+
+```ini
+[commands]
+upgrade_type = security
+download_updates = yes
+apply_updates = yes
+reboot = never
+
+[emitters]
+emit_via = email
+
+[email]
+email_from = dnf-security@yourhostname.example.com
+email_to = security@example.com
+email_host = localhost
+```
+
+Enable the security-specific timer:
+
+```bash
+systemctl enable --now dnf-automatic-security.timer
+```
+
+Verify the timer schedule:
+
+```bash
+systemctl cat dnf-automatic-security.timer
+```
+
+By default, the security timer runs once daily. Review the applied updates regularly:
+
+```bash
+dnf history list
+dnf history info <id>
+```
+
+### Checking for Available Security Updates Without Applying
+
+For environments where even security updates require a change control process before application, schedule a daily check that reports available security updates without applying them:
+
+```bash
+nano /usr/local/sbin/check-security-updates.sh
+```
+
+```bash
+#!/bin/bash
+# check-security-updates.sh
+# Reports available security updates and sends an alert if any are found.
+
+ALERT_EMAIL="security@example.com"
+LOGFILE="/var/log/security/update-check.log"
+HOSTNAME=$(hostname -s)
+
+mkdir -p "$(dirname "${LOGFILE}")"
+log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "${LOGFILE}"; }
+
+log "Checking for security updates"
+
+UPDATES=$(dnf updateinfo list security 2>/dev/null | grep "^[A-Z]")
+COUNT=$(echo "${UPDATES}" | grep -c "^[A-Z]" || echo 0)
+
+log "Security updates available: ${COUNT}"
+
+if [[ "${COUNT}" -gt 0 ]]; then
+    {
+        echo "${COUNT} security update(s) available on ${HOSTNAME} as of $(date):"
+        echo ""
+        echo "${UPDATES}"
+        echo ""
+        echo "Run 'dnf update --security' to apply them."
+    } | mail -s "Security Updates Available: ${HOSTNAME} (${COUNT})" "${ALERT_EMAIL}"
+fi
+```
+
+```bash
+chmod 700 /usr/local/sbin/check-security-updates.sh
+echo "0 7 * * *  root  /usr/local/sbin/check-security-updates.sh" \
+    >> /etc/cron.d/security-checks
+```
+
+---
+
+## File Integrity Monitoring with AIDE
+
+AIDE (Advanced Intrusion Detection Environment) monitors the filesystem for unauthorized changes. It maintains a cryptographic database of file attributes — permissions, ownership, size, and hashes — and reports any deviations from the baseline when a check is run. Changes to critical system files, binaries, or configuration files are a strong indicator of compromise or unintended modification.
+
+### Installing and Initializing AIDE
+
+```bash
+dnf install aide
+```
+
+Before initializing the database, review the AIDE configuration to understand what it monitors:
+
+```bash
+nano /etc/aide.conf
+```
+
+The configuration defines which directories and file attributes to monitor. The defaults cover most critical system paths. After reviewing and adjusting the configuration, initialize the database:
+
+```bash
+aide --init
+```
+
+This takes several minutes as AIDE hashes every monitored file. When complete, move the new database into place:
+
+```bash
+mv /var/lib/aide/aide.db.new.gz /var/lib/aide/aide.db.gz
+```
+
+:::tip
+Initialize the AIDE database on a freshly configured system before any production workload begins. A database built on a system that has already been running for months may capture a state that includes unauthorized changes, making those changes invisible to future checks.
+:::
+
+### Scheduling AIDE Checks
+
+Schedule a nightly AIDE check to run after the system is otherwise quiet:
+
+```bash
+nano /etc/systemd/system/aide-check.service
+```
+
+```ini
+[Unit]
+Description=AIDE file integrity check
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/aide --check
+StandardOutput=append:/var/log/security/aide.log
+StandardError=append:/var/log/security/aide.log
+```
+
+```bash
+nano /etc/systemd/system/aide-check.timer
+```
+
+```ini
+[Unit]
+Description=Run AIDE integrity check nightly
+
+[Timer]
+OnCalendar=*-*-* 03:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+```
+
+```bash
+systemctl daemon-reload
+systemctl enable --now aide-check.timer
+```
+
+AIDE's output goes to the log file. To receive an alert only when changes are found, wrap the AIDE check in a script that parses the exit code:
+
+```bash
+nano /usr/local/sbin/aide-check-alert.sh
+```
+
+```bash
+#!/bin/bash
+# aide-check-alert.sh
+# Runs AIDE and sends an alert if file changes are detected.
+
+ALERT_EMAIL="security@example.com"
+LOGFILE="/var/log/security/aide.log"
+HOSTNAME=$(hostname -s)
+
+mkdir -p "$(dirname "${LOGFILE}")"
+
+OUTPUT=$(aide --check 2>&1)
+EXIT_CODE=$?
+
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] AIDE check exit code: ${EXIT_CODE}" >> "${LOGFILE}"
+echo "${OUTPUT}" >> "${LOGFILE}"
+
+# AIDE exit codes: 0 = no changes, 1 = new files, 2 = removed files,
+# 4 = changed files, and combinations thereof (bitfield)
+if [[ "${EXIT_CODE}" -ne 0 ]]; then
+    {
+        echo "AIDE detected filesystem changes on ${HOSTNAME} at $(date)"
+        echo "Exit code: ${EXIT_CODE}"
+        echo ""
+        echo "${OUTPUT}" | head -100
+        echo ""
+        echo "Full output: ${LOGFILE}"
+    } | mail -s "AIDE Alert: Filesystem Changes on ${HOSTNAME}" "${ALERT_EMAIL}"
+fi
+```
+
+```bash
+chmod 700 /usr/local/sbin/aide-check-alert.sh
+```
+
+Update the service unit to call this script instead:
+
+```bash
+systemctl edit aide-check.service
+```
+
+```ini
+[Service]
+ExecStart=
+ExecStart=/usr/local/sbin/aide-check-alert.sh
+```
+
+### Updating the AIDE Database After Authorized Changes
+
+When a legitimate change is made to the system — a package update, a configuration change, a new file installed — the AIDE database must be updated to reflect the new baseline. Without this, every subsequent check reports the same authorized change as a potential intrusion.
+
+After authorized changes, update the database:
+
+```bash
+aide --update
+mv /var/lib/aide/aide.db.new.gz /var/lib/aide/aide.db.gz
+```
+
+Document the reason for the update alongside the command so there is a record of why the baseline was changed and when.
+
+---
+
+## OpenSCAP Compliance Scanning
+
+OpenSCAP is the open-source implementation of the SCAP (Security Content Automation Protocol) standard. It evaluates a system against security profiles — sets of rules derived from benchmarks like the CIS AlmaLinux Benchmark or the DISA STIG — and generates detailed reports showing which rules pass and which fail.
+
+### Installing OpenSCAP
+
+```bash
+dnf install openscap-scanner scap-security-guide
+```
+
+The `scap-security-guide` package provides the security profiles for AlmaLinux and RHEL-compatible systems. List available profiles:
+
+```bash
+oscap info /usr/share/xml/scap/ssg/content/ssg-almalinux9-ds.xml \
+    | grep "Profile ID"
+```
+
+Common profiles for AlmaLinux 9 include:
+
+| Profile | Description |
+|---|---|
+| `xccdf_org.ssgproject.content_profile_cis` | CIS AlmaLinux Benchmark Level 1 |
+| `xccdf_org.ssgproject.content_profile_cis_server_l2` | CIS AlmaLinux Benchmark Level 2 |
+| `xccdf_org.ssgproject.content_profile_stig` | DISA STIG for RHEL 9 |
+| `xccdf_org.ssgproject.content_profile_pci-dss` | PCI DSS compliance profile |
+
+### Running a Manual Scan
+
+To run an evaluation against the CIS Level 1 profile and generate an HTML report:
+
+```bash
+oscap xccdf eval \
+    --profile xccdf_org.ssgproject.content_profile_cis \
+    --results /var/log/security/oscap-results-$(date +%Y%m%d).xml \
+    --report /var/log/security/oscap-report-$(date +%Y%m%d).html \
+    /usr/share/xml/scap/ssg/content/ssg-almalinux9-ds.xml
+```
+
+The HTML report provides a human-readable breakdown of pass/fail results for every rule in the profile, with explanations and remediation guidance for each failure.
+
+### Scheduling Automated Compliance Scans
+
+Schedule weekly compliance scans to track how the system's compliance posture changes over time:
+
+```bash
+nano /usr/local/sbin/oscap-weekly-scan.sh
+```
+
+```bash
+#!/bin/bash
+# oscap-weekly-scan.sh
+# Runs an OpenSCAP compliance scan and emails a summary of failures.
+
+PROFILE="xccdf_org.ssgproject.content_profile_cis"
+CONTENT="/usr/share/xml/scap/ssg/content/ssg-almalinux9-ds.xml"
+REPORT_DIR="/var/log/security/oscap"
+DATE=$(date +%Y%m%d)
+ALERT_EMAIL="security@example.com"
+HOSTNAME=$(hostname -s)
+
+mkdir -p "${REPORT_DIR}"
+
+RESULTS="${REPORT_DIR}/results-${DATE}.xml"
+REPORT="${REPORT_DIR}/report-${DATE}.html"
+
+oscap xccdf eval \
+    --profile "${PROFILE}" \
+    --results "${RESULTS}" \
+    --report "${REPORT}" \
+    "${CONTENT}" > /dev/null 2>&1
+
+# Extract a summary of failed rules from the results XML
+FAIL_COUNT=$(grep -c 'result>fail<' "${RESULTS}" 2>/dev/null || echo 0)
+PASS_COUNT=$(grep -c 'result>pass<' "${RESULTS}" 2>/dev/null || echo 0)
+TOTAL=$(( FAIL_COUNT + PASS_COUNT ))
+
+{
+    echo "OpenSCAP compliance scan completed on ${HOSTNAME} at $(date)"
+    echo "Profile: ${PROFILE}"
+    echo ""
+    echo "Results: ${PASS_COUNT} passed, ${FAIL_COUNT} failed of ${TOTAL} rules evaluated"
+    echo ""
+    echo "Full HTML report: ${REPORT}"
+    echo ""
+    if [[ "${FAIL_COUNT}" -gt 0 ]]; then
+        echo "Failed rules:"
+        grep -A1 'result>fail<' "${RESULTS}" \
+            | grep 'idref' \
+            | sed 's/.*idref="//;s/".*//' \
+            | head -30
+    fi
+} | mail -s "OpenSCAP Scan: ${HOSTNAME} — ${FAIL_COUNT} failures" "${ALERT_EMAIL}"
+
+# Remove scan results older than 90 days
+find "${REPORT_DIR}" -name "*.xml" -o -name "*.html" -mtime +90 -delete
+```
+
+```bash
+chmod 700 /usr/local/sbin/oscap-weekly-scan.sh
+```
+
+Schedule weekly on Sunday morning, before the AIDE check and backup jobs:
+
+```bash
+nano /etc/cron.d/security-checks
+```
+
+```
+# Weekly OpenSCAP compliance scan — Sunday at 05:00
+0 5 * * 0  root  /usr/local/sbin/oscap-weekly-scan.sh
+
+# Daily security update check — 07:00
+0 7 * * *  root  /usr/local/sbin/check-security-updates.sh
+```
+
+---
+
+## Audit Log Reporting
+
+The `auditd` daemon records security-relevant events at the kernel level. Automated reporting extracts meaningful summaries from the audit log rather than leaving administrators to read raw audit records manually.
+
+### Scheduling aureport Summaries
+
+`aureport` generates summary reports from the audit log. Schedule a daily summary that highlights authentication events, command executions, and anomalies:
+
+```bash
+nano /usr/local/sbin/audit-daily-report.sh
+```
+
+```bash
+#!/bin/bash
+# audit-daily-report.sh
+# Generates a daily summary of audit log activity and emails it.
+
+ALERT_EMAIL="security@example.com"
+HOSTNAME=$(hostname -s)
+YESTERDAY_START=$(date -d yesterday '+%m/%d/%Y 00:00:00')
+YESTERDAY_END=$(date -d yesterday '+%m/%d/%Y 23:59:59')
+
+{
+    echo "Daily Audit Report for ${HOSTNAME}"
+    echo "Period: ${YESTERDAY_START} — ${YESTERDAY_END}"
+    echo "Generated: $(date)"
+    echo ""
+
+    echo "══ Summary ═══════════════════════════════════"
+    aureport --start "${YESTERDAY_START}" --end "${YESTERDAY_END}" 2>/dev/null
+    echo ""
+
+    echo "══ Authentication Events ══════════════════════"
+    aureport -au --start "${YESTERDAY_START}" --end "${YESTERDAY_END}" 2>/dev/null
+    echo ""
+
+    echo "══ Commands Executed (sudo/su) ════════════════"
+    aureport -c --start "${YESTERDAY_START}" --end "${YESTERDAY_END}" 2>/dev/null
+    echo ""
+
+    echo "══ Failed Events ══════════════════════════════"
+    aureport --start "${YESTERDAY_START}" --end "${YESTERDAY_END}" \
+        --failed 2>/dev/null
+    echo ""
+
+    echo "══ Anomalies ══════════════════════════════════"
+    aureport -a --start "${YESTERDAY_START}" --end "${YESTERDAY_END}" 2>/dev/null
+
+} | mail -s "Daily Audit Report: ${HOSTNAME}" "${ALERT_EMAIL}"
+```
+
+```bash
+chmod 700 /usr/local/sbin/audit-daily-report.sh
+```
+
+Schedule daily at 06:00, after the audit log for the previous day is complete:
+
+```bash
+echo "0 6 * * *  root  /usr/local/sbin/audit-daily-report.sh" \
+    >> /etc/cron.d/security-checks
+```
+
+### Alerting on Specific Audit Events
+
+For high-severity audit events that require immediate attention rather than waiting for the daily report, schedule a frequent check using `ausearch`:
+
+```bash
+nano /usr/local/sbin/check-audit-critical.sh
+```
+
+```bash
+#!/bin/bash
+# check-audit-critical.sh
+# Checks for high-severity audit events in the last 15 minutes and alerts immediately.
+
+ALERT_EMAIL="security@example.com"
+LOGFILE="/var/log/security/audit-alerts.log"
+HOSTNAME=$(hostname -s)
+
+mkdir -p "$(dirname "${LOGFILE}")"
+log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "${LOGFILE}"; }
+
+# Look for events in the last 15 minutes
+START_TIME=$(date -d "15 minutes ago" '+%m/%d/%Y %H:%M:%S')
+
+# Check for setuid/privilege escalation events
+SETUID=$(ausearch -k setuid_exec --start "${START_TIME}" -i 2>/dev/null | grep -v "^----$")
+
+# Check for modifications to critical files
+IDENTITY=$(ausearch -k identity --start "${START_TIME}" -i 2>/dev/null | grep -v "^----$")
+
+# Check for failed sudo attempts
+SUDO_FAIL=$(ausearch -k sudo_exec --start "${START_TIME}" --success no -i 2>/dev/null | grep -v "^----$")
+
+ALERTS=""
+[[ -n "${SETUID}" ]] && ALERTS+="SETUID EXECUTION DETECTED:\n${SETUID}\n\n"
+[[ -n "${IDENTITY}" ]] && ALERTS+="CRITICAL FILE MODIFICATION:\n${IDENTITY}\n\n"
+[[ -n "${SUDO_FAIL}" ]] && ALERTS+="FAILED SUDO ATTEMPTS:\n${SUDO_FAIL}\n\n"
+
+if [[ -n "${ALERTS}" ]]; then
+    log "Security events detected — sending alert"
+    echo -e "Security events on ${HOSTNAME} at $(date):\n\n${ALERTS}" \
+        | mail -s "SECURITY ALERT: ${HOSTNAME}" "${ALERT_EMAIL}"
+else
+    log "No critical audit events detected"
+fi
+```
+
+```bash
+chmod 700 /usr/local/sbin/check-audit-critical.sh
+```
+
+Schedule every 15 minutes:
+
+```bash
+echo "*/15 * * * *  root  /usr/local/sbin/check-audit-critical.sh" \
+    >> /etc/cron.d/security-checks
+```
+
+---
+
+## Login and Authentication Monitoring
+
+Monitoring authentication events — particularly failed login attempts, successful logins from unexpected locations, and new user account activity — provides early warning of credential attacks and unauthorized access.
+
+### Failed Login Monitoring
+
+Schedule a check that summarizes failed authentication attempts and alerts if the count exceeds a threshold:
+
+```bash
+nano /usr/local/sbin/check-failed-logins.sh
+```
+
+```bash
+#!/bin/bash
+# check-failed-logins.sh
+# Checks for excessive failed login attempts in the past hour.
+
+THRESHOLD=20
+ALERT_EMAIL="security@example.com"
+LOGFILE="/var/log/security/login-checks.log"
+HOSTNAME=$(hostname -s)
+
+mkdir -p "$(dirname "${LOGFILE}")"
+log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "${LOGFILE}"; }
+
+FAILED_COUNT=$(grep "Failed password" /var/log/secure \
+    | awk -v d="$(date -d '1 hour ago' '+%b %e %H')" '$0 >= d' \
+    | wc -l)
+
+log "Failed logins in last hour: ${FAILED_COUNT} (threshold: ${THRESHOLD})"
+
+if [[ "${FAILED_COUNT}" -ge "${THRESHOLD}" ]]; then
+    TOP_IPS=$(grep "Failed password" /var/log/secure \
+        | awk -v d="$(date -d '1 hour ago' '+%b %e %H')" '$0 >= d {print $11}' \
+        | sort | uniq -c | sort -rn | head -10)
+
+    {
+        echo "${FAILED_COUNT} failed login attempts on ${HOSTNAME} in the last hour"
+        echo ""
+        echo "Top source IPs:"
+        echo "${TOP_IPS}"
+        echo ""
+        echo "Consider checking fail2ban status: fail2ban-client status sshd"
+    } | mail -s "High Failed Login Rate: ${HOSTNAME}" "${ALERT_EMAIL}"
+fi
+```
+
+```bash
+chmod 700 /usr/local/sbin/check-failed-logins.sh
+echo "0 * * * *  root  /usr/local/sbin/check-failed-logins.sh" \
+    >> /etc/cron.d/security-checks
+```
+
+---
+
+## Checking for Unauthorized SUID/SGID Files
+
+SetUID and SetGID binaries run with elevated privileges and represent a potential security risk if an unauthorized one is introduced. Schedule a periodic check that compares the current list of SUID/SGID files against a known baseline:
+
+```bash
+nano /usr/local/sbin/check-suid-files.sh
+```
+
+```bash
+#!/bin/bash
+# check-suid-files.sh
+# Detects new or removed SUID/SGID files compared to a baseline.
+
+BASELINE="/var/lib/security/suid-baseline.txt"
+CURRENT="/tmp/suid-current.txt"
+ALERT_EMAIL="security@example.com"
+LOGFILE="/var/log/security/suid-check.log"
+HOSTNAME=$(hostname -s)
+
+mkdir -p "$(dirname "${BASELINE}")"
+mkdir -p "$(dirname "${LOGFILE}")"
+log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "${LOGFILE}"; }
+
+# Find all SUID and SGID files on local filesystems
+find / -xdev \( -perm -4000 -o -perm -2000 \) -type f \
+    -printf '%p\t%m\t%u\t%g\n' 2>/dev/null | sort > "${CURRENT}"
+
+# Initialize baseline on first run
+if [[ ! -f "${BASELINE}" ]]; then
+    cp "${CURRENT}" "${BASELINE}"
+    log "Baseline initialized with $(wc -l < "${BASELINE}") SUID/SGID files"
+    rm -f "${CURRENT}"
+    exit 0
+fi
+
+# Compare current against baseline
+ADDED=$(comm -13 "${BASELINE}" "${CURRENT}")
+REMOVED=$(comm -23 "${BASELINE}" "${CURRENT}")
+
+log "SUID/SGID check: $(wc -l < "${CURRENT}") files found"
+
+if [[ -n "${ADDED}" || -n "${REMOVED}" ]]; then
+    {
+        echo "SUID/SGID file changes detected on ${HOSTNAME} at $(date)"
+        echo ""
+        [[ -n "${ADDED}" ]] && echo "NEW files:" && echo "${ADDED}"
+        [[ -n "${REMOVED}" ]] && echo "REMOVED files:" && echo "${REMOVED}"
+    } | mail -s "SUID/SGID Change Alert: ${HOSTNAME}" "${ALERT_EMAIL}"
+    log "Alert sent: SUID/SGID changes detected"
+else
+    log "No SUID/SGID changes detected"
+fi
+
+rm -f "${CURRENT}"
+```
+
+```bash
+chmod 700 /usr/local/sbin/check-suid-files.sh
+```
+
+Schedule daily:
+
+```bash
+echo "0 4 * * *  root  /usr/local/sbin/check-suid-files.sh" \
+    >> /etc/cron.d/security-checks
+```
+
+When authorized new SUID binaries are installed — for example, after a package update — update the baseline:
+
+```bash
+find / -xdev \( -perm -4000 -o -perm -2000 \) -type f \
+    -printf '%p\t%m\t%u\t%g\n' 2>/dev/null | sort \
+    > /var/lib/security/suid-baseline.txt
+```
+
+---
+
+## The Complete Security Cron Schedule
+
+Consolidating all the security automation into a single organized cron file makes the schedule easy to audit and maintain:
+
+```bash
+nano /etc/cron.d/security-checks
+```
+
+```
+# ── Security Automation Schedule ─────────────────────────────────────────────
+# All times are local system time.
+
+# Critical audit event check — every 15 minutes
+*/15 * * * *  root  /usr/local/sbin/check-audit-critical.sh
+
+# Failed login rate check — hourly
+0 * * * *     root  /usr/local/sbin/check-failed-logins.sh
+
+# Security update availability — daily at 07:00
+0 7 * * *     root  /usr/local/sbin/check-security-updates.sh
+
+# Daily audit report — daily at 06:00 (covers previous day)
+0 6 * * *     root  /usr/local/sbin/audit-daily-report.sh
+
+# AIDE file integrity check — nightly at 03:00
+0 3 * * *     root  /usr/local/sbin/aide-check-alert.sh
+
+# SUID/SGID file check — nightly at 04:00
+0 4 * * *     root  /usr/local/sbin/check-suid-files.sh
+
+# OpenSCAP compliance scan — weekly on Sunday at 05:00
+0 5 * * 0     root  /usr/local/sbin/oscap-weekly-scan.sh
+```
+
+---
+
+## Summary
+
+Security automation on AlmaLinux is a layered practice: security updates applied promptly through `dnf-automatic`, file integrity monitored continuously with AIDE, compliance posture evaluated weekly with OpenSCAP, audit events summarized daily with `aureport`, and specific high-risk events checked frequently with `ausearch`. Together these give both real-time alerting on critical events and a regular compliance and integrity baseline.
+
+Key points to remember:
+
+- Initialize the AIDE database on a known-clean system before production workloads begin; update it explicitly after authorized changes
+- AIDE exit codes are a bitfield — exit code 0 means no changes; any non-zero value means changes were detected
+- OpenSCAP HTML reports are the most human-readable output; store them for compliance audit purposes
+- `aureport` daily reports are most useful for reviewing what happened; `ausearch` near-real-time checks catch critical events while they are still fresh
+- Update the SUID/SGID baseline explicitly after package updates that install new privileged binaries
+- All security check scripts should log their results to files in addition to sending alerts — the logs provide the historical record needed for incident investigation
+- Consolidate all security cron entries into a single well-commented file for easier auditing of what is scheduled
+
+### Related Pages
+
+- [Audit Logging](../log-management/audit-logging) — configuring auditd rules and understanding audit records
+- [Log Monitoring](../log-management/log-monitoring) — real-time alerting with fail2ban and logwatch
+- [Maintenance Automation](./maintenance-automation) — automated updates with dnf-automatic
+- [Cron Scheduling](./cron-scheduling) — crontab syntax and crond management
+- [Enterprise Scheduling](./enterprise-scheduling) — complex job coordination and dependencies

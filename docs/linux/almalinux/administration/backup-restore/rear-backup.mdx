@@ -1,0 +1,446 @@
+---
+sidebar_position: 3
+title: "ReaR Backup | AlmaLinux"
+sidebar_label: "ReaR Backup"
+description: "Use Relax-and-Recover (ReaR) on AlmaLinux to create bootable rescue media and bare-metal recovery backups. Configure ReaR for full system disaster recovery."
+keywords:
+  - "almalinux rear backup"
+  - "almalinux relax and recover"
+  - "almalinux bare metal recovery"
+  - "almalinux disaster recovery"
+  - "rhel rear backup"
+tags:
+  - almalinux
+  - backup-restore
+  - rear
+  - disaster-recovery
+  - bare-metal
+slug: /linux/almalinux/administration/backup-restore/rear-backup
+---
+
+# ReaR Backup on AlmaLinux
+
+Relax-and-Recover (ReaR) is a disaster recovery framework designed specifically for Linux systems. Where tools like `tar` and `rsync` back up data, ReaR goes further: it creates a bootable rescue system that contains everything needed to restore a machine to bare metal — including the partition layout, bootloader, filesystem structure, and the system data itself. Boot from the ReaR rescue image on a replacement disk or a new machine, run the recovery, and the system is restored to a working state without manual partitioning or bootloader reinstallation.
+
+ReaR is the standard disaster recovery solution for enterprise RHEL-compatible systems and is included in AlmaLinux's package repositories. It integrates with existing backup tools — it can use `tar` internally, or hand off to Bacula, rsync, or other backends — and supports a wide range of boot media types and backup destinations.
+
+---
+
+## How ReaR Works
+
+ReaR operates in two phases that are run separately: backup creation and recovery.
+
+During **backup creation**, ReaR does three things. First, it collects information about the current system: disk layout, partition table, LVM configuration, filesystem types, mount points, bootloader configuration, and network settings. This layout information is saved as a set of shell scripts. Second, it builds a minimal bootable rescue environment containing just enough to boot the machine and run the recovery. Third, it creates an archive of the system data using whichever backup method is configured (by default, `tar`).
+
+During **recovery**, you boot the target machine from the ReaR rescue image. The rescue environment presents a menu. Selecting the recovery option runs the saved layout scripts, which recreate the partition table, LVM volumes, filesystems, and mount points on the target disk. The backup archive is then extracted into the restored filesystem, and the bootloader is reinstalled. The result is a working system on the new disk.
+
+This two-phase approach means ReaR can restore to hardware that is entirely different from the original — a different disk size, different controller, different network card — as long as the rescue environment can drive the hardware. It also means the rescue image and the backup archive can be stored separately: the image on a USB stick for physical access, the archive on a network share for the data.
+
+---
+
+## Installing ReaR
+
+ReaR is available in the AlmaLinux package repositories:
+
+```bash
+dnf install rear
+```
+
+For some backup output methods (particularly those that create ISO images for burning to optical media or booting from a virtual machine), you also need `genisoimage`:
+
+```bash
+dnf install genisoimage
+```
+
+Verify the installation:
+
+```bash
+rear --version
+```
+
+---
+
+## Configuration
+
+ReaR's configuration lives in `/etc/rear/local.conf`. This file overrides the defaults in `/usr/share/rear/conf/default.conf` — never edit the default file, as it will be overwritten by package updates. The local configuration file is initially empty or nearly empty; you add only the settings relevant to your environment.
+
+Open the configuration file:
+
+```bash
+nano /etc/rear/local.conf
+```
+
+### Output Method
+
+The `OUTPUT` variable defines what kind of rescue media ReaR produces. The most common choices are:
+
+| Value | Description |
+|---|---|
+| `ISO` | Bootable ISO image, suitable for CD/DVD, USB, or virtual machine boot |
+| `USB` | Write directly to a USB device; bootable without a separate burning step |
+| `PXE` | Network boot files for PXE/TFTP booting |
+| `RAWDISK` | Raw disk image suitable for writing to a USB stick with `dd` |
+
+For most physical servers, `ISO` is the most flexible because the image can be burned to media, attached as a virtual CD, or booted via IPMI/iDRAC remote console:
+
+```
+OUTPUT=ISO
+```
+
+### Backup Method
+
+The `BACKUP` variable defines how the system data is archived. ReaR's built-in backup method is `NETFS`, which uses `tar` to create an archive and writes it to a network share or local directory:
+
+```
+BACKUP=NETFS
+```
+
+Other options include `BACULA`, `RSYNC`, `DUPLICITY`, and several commercial solutions. The `NETFS` method is sufficient for most environments and requires no additional software.
+
+### Backup Location
+
+The `BACKUP_URL` variable tells ReaR where to write the backup archive and the rescue ISO. The URL format varies by protocol:
+
+```
+# Write to a local directory (useful for testing; not recommended for production)
+BACKUP_URL=file:///backup/rear/
+
+# Write to an NFS share
+BACKUP_URL=nfs://backupserver.example.com/exports/rear/
+
+# Write to a CIFS/SMB share
+BACKUP_URL=cifs://backupserver.example.com/rear/
+```
+
+For NFS, ensure the NFS client packages are installed and the share is accessible from the system:
+
+```bash
+dnf install nfs-utils
+showmount -e backupserver.example.com
+```
+
+For CIFS, install the CIFS utilities:
+
+```bash
+dnf install cifs-utils
+```
+
+If using CIFS with credentials, add them to the configuration:
+
+```
+BACKUP_URL=cifs://backupserver.example.com/rear/
+BACKUP_OPTIONS="credentials=/etc/rear/cifs-credentials"
+```
+
+Create the credentials file with restricted permissions:
+
+```bash
+nano /etc/rear/cifs-credentials
+```
+
+```
+username=backupuser
+password=secretpassword
+domain=WORKGROUP
+```
+
+```bash
+chmod 600 /etc/rear/cifs-credentials
+```
+
+### ISO Output Location
+
+By default, the rescue ISO is written to the same location as the backup archive. To write it to a different location — for example, a local directory that is then served via IPMI for remote booting — use `OUTPUT_URL`:
+
+```
+OUTPUT_URL=file:///backup/rear-iso/
+```
+
+### A Complete Basic Configuration
+
+Putting the above together, a minimal but functional configuration for a system backing up to an NFS share looks like this:
+
+```
+OUTPUT=ISO
+BACKUP=NETFS
+BACKUP_URL=nfs://backupserver.example.com/exports/rear/$(hostname)/
+
+# Include the hostname in the backup path so multiple systems can use the same share
+# (ReaR uses the hostname automatically in subdirectory naming, but being explicit helps)
+
+# Keep the last 3 backup archives
+NUMBER_OF_RESULT_FILES_KEEP=3
+```
+
+---
+
+## Running a ReaR Backup
+
+### Checking the Configuration
+
+Before running a backup, verify that ReaR can parse the configuration and identify potential problems:
+
+```bash
+rear -v dump
+```
+
+This prints all active configuration variables and their values. Review the output to confirm the backup URL, output method, and excluded paths are set as intended.
+
+To check whether the system layout can be saved correctly without actually creating a backup:
+
+```bash
+rear -v savelayout
+```
+
+This saves the disk layout to `/var/lib/rear/layout/disklayout.conf` and reports any warnings. It is worth reviewing this file to confirm that ReaR has correctly identified the partition structure, LVM volumes, and filesystems.
+
+### Creating the Backup
+
+Run the full backup:
+
+```bash
+rear -v mkbackup
+```
+
+The `-v` flag enables verbose output so you can follow progress. The `mkbackup` workflow performs all steps: saving the system layout, building the rescue environment, and creating the backup archive.
+
+On a first run, this takes time proportional to the size of the system — typically 20 to 60 minutes for a standard server. Subsequent runs are faster if the rescue ISO does not need to be rebuilt (which it does not unless the running kernel or rescue environment packages have changed).
+
+ReaR logs its activity to `/var/log/rear/rear-<hostname>.log`. If the backup fails, this log contains the full output and is the first place to look for the cause:
+
+```bash
+tail -100 /var/log/rear/rear-$(hostname).log
+```
+
+### Creating Only the Rescue Image
+
+If you want to rebuild the rescue ISO without creating a new backup archive — for example, after a kernel update that requires a new initramfs — use `mkrescue` instead of `mkbackup`:
+
+```bash
+rear -v mkrescue
+```
+
+This is much faster than a full backup run and is appropriate when only the rescue environment needs updating but the backup data is still current.
+
+---
+
+## Excluding Files and Directories
+
+By default, ReaR backs up everything on the root filesystem and other local filesystems. Large directories containing data that does not need to be in the disaster recovery backup — build caches, temporary files, mounted NFS shares — can be excluded to reduce backup size and time.
+
+Add exclusions to `/etc/rear/local.conf`:
+
+```
+EXCLUDE_BACKUP+=( /tmp /var/tmp /var/cache/dnf /home/builder/build )
+```
+
+The `+=` syntax appends to the existing list rather than replacing it, which is important because ReaR's default configuration already excludes some paths.
+
+To exclude entire filesystems (useful for NFS mounts or data volumes that are backed up separately):
+
+```
+EXCLUDE_MOUNTPOINTS=( /mnt/nfs /data )
+```
+
+---
+
+## Verifying the Backup
+
+After a backup run, verify that the output files were written correctly. Check the backup destination:
+
+```bash
+ls -lh /backup/rear/$(hostname)/
+```
+
+You should see at minimum:
+
+- `rear-<hostname>.iso` — the bootable rescue image
+- `backup.tar.gz` — the system data archive
+- `README` — basic information about the backup
+- `VERSION` — ReaR version information
+
+Check that the ISO is a valid bootable image:
+
+```bash
+file /backup/rear/$(hostname)/rear-$(hostname).iso
+```
+
+The output should identify it as an ISO 9660 CD-ROM filesystem with El Torito boot information.
+
+To verify the backup archive is not corrupt:
+
+```bash
+rear -v checklayout
+```
+
+This compares the saved disk layout against the current system layout. If the disk configuration has changed since the last backup — a new partition, a resized LVM volume, a new filesystem — `checklayout` will report a mismatch, indicating that a new backup is needed.
+
+---
+
+## Testing the Recovery
+
+A ReaR backup that has never been tested is an untested backup. The only way to be confident that recovery will work is to actually run it, ideally before you need it in an emergency.
+
+### Testing in a Virtual Machine
+
+The most practical way to test recovery without disrupting production is to boot the rescue ISO in a virtual machine with a disk of equal or greater size than the original system's root volume.
+
+Copy the rescue ISO to a location accessible from the hypervisor, then create a virtual machine with:
+
+- A disk at least as large as the source system's root filesystem
+- The rescue ISO attached as a boot device
+- Network access to the backup server (if using NFS or CIFS backup URL)
+
+Boot the VM from the ISO. The ReaR rescue menu appears. Select the automatic recovery option:
+
+```
+Recover <hostname>
+```
+
+ReaR will connect to the backup server, download the layout and archive, recreate the disk structure, and restore the system. After completion, reboot the VM without the ISO and verify the system boots and operates correctly.
+
+Document the recovery time from the test — this is your actual RTO for this system, not a theoretical estimate.
+
+### Running checklayout Before Recovery
+
+In a real recovery scenario, before starting the restore, run `rear checklayout` from within the rescue environment to confirm the target disk geometry matches what the layout scripts expect. If the replacement disk is a different size, you may need to edit the layout scripts before proceeding.
+
+---
+
+## Automating ReaR with Cron
+
+In production environments, ReaR backups should run automatically on a schedule. Add a cron entry to run a full backup weekly:
+
+```bash
+nano /etc/cron.d/rear-backup
+```
+
+```
+# Run ReaR full backup every Sunday at 01:00
+0 1 * * 0  root  /usr/sbin/rear -v mkbackup >> /var/log/rear/rear-cron.log 2>&1
+```
+
+For environments where the system disk layout changes infrequently but you want the rescue ISO kept current, run `mkrescue` more frequently and `mkbackup` less often:
+
+```
+# Rebuild rescue ISO nightly (fast — only updates if kernel changed)
+0 2 * * *  root  /usr/sbin/rear -v mkrescue >> /var/log/rear/rear-cron.log 2>&1
+
+# Full backup weekly
+0 1 * * 0  root  /usr/sbin/rear -v mkbackup >> /var/log/rear/rear-cron.log 2>&1
+```
+
+Monitor the cron log to confirm backups are completing:
+
+```bash
+tail -50 /var/log/rear/rear-cron.log
+grep -i "error\|warn\|finished" /var/log/rear/rear-cron.log | tail -20
+```
+
+:::tip
+Configure logrotate for the ReaR cron log to prevent it from growing indefinitely. Create `/etc/logrotate.d/rear-cron`:
+
+```
+/var/log/rear/rear-cron.log {
+    weekly
+    rotate 8
+    compress
+    missingok
+    notifempty
+}
+```
+:::
+
+---
+
+## Advanced Configuration Options
+
+### Keeping Multiple Backup Versions
+
+By default, each `mkbackup` run overwrites the previous backup. To keep multiple versions, enable the dated backup option:
+
+```
+NETFS_KEEP_OLD_BACKUP_COPY=yes
+```
+
+With this enabled, ReaR moves the previous backup to a dated directory before writing the new one. Combine this with `NUMBER_OF_RESULT_FILES_KEEP` to limit how many versions are retained:
+
+```
+NUMBER_OF_RESULT_FILES_KEEP=3
+```
+
+### Excluding Specific File Patterns
+
+In addition to directory exclusions, specific file patterns can be excluded from the backup archive:
+
+```
+BACKUP_PROG_EXCLUDE+=( '/var/log/*.log' '/var/log/*.gz' '*.core' )
+```
+
+This is useful for excluding log files (which change constantly and can be regenerated or are already handled by a centralized logging system) and core dump files.
+
+### Splitting Large Backups
+
+For systems with large filesystems, the backup archive can be split into smaller chunks — useful when the backup destination has a file size limit:
+
+```
+BACKUP_PROG_COMPRESS_OPTIONS=( --use-compress-program=pigz )
+SPLIT_BACKUP_SIZE=4096m
+```
+
+The first line uses `pigz` (parallel gzip) for faster compression on multi-core systems — install it with `dnf install pigz`. The second splits the archive into 4 GB chunks.
+
+### Network Configuration in the Rescue Environment
+
+By default, ReaR attempts to configure networking in the rescue environment using the same settings as the running system. If the rescue environment needs to reach a backup server and the network configuration is complex (bonding, VLANs, static routes), verify it is included:
+
+```
+USE_DHCLIENT=no
+USE_STATIC_NETWORKING=yes
+```
+
+After building the rescue ISO, test that the rescue environment can reach the backup server by booting it in a VM and verifying network connectivity before you need it in a real recovery.
+
+---
+
+## Integrating ReaR with Other Backup Tools
+
+ReaR's `BACKUP=NETFS` method is convenient but produces a single monolithic archive that grows with the system. For large systems or environments where backup windows are constrained, integrating ReaR with an existing backup solution is often more practical.
+
+With `BACKUP=RSYNC`, ReaR uses rsync for the data backup, enabling incremental transfers:
+
+```
+OUTPUT=ISO
+BACKUP=RSYNC
+BACKUP_URL=rsync://backupuser@backupserver.example.com/rear/$(hostname)/
+OUTPUT_URL=file:///backup/rear-iso/
+```
+
+With `BACKUP=BACULA`, ReaR generates the rescue ISO but delegates all data backup and restore to the Bacula client — suitable for environments already running Bacula. The rescue environment includes the Bacula client, which connects to the director during recovery to restore the data. Configuration details depend on the specific Bacula setup and are beyond the scope of this page.
+
+For environments running a dedicated backup solution, the typical pattern is: use ReaR with `BACKUP=EXTERNAL` and a custom backup/restore script pair, so the rescue environment can invoke the existing backup tool during recovery.
+
+---
+
+## Summary
+
+ReaR provides bare-metal disaster recovery capability that goes beyond what filesystem backup tools alone can offer. By capturing the disk layout, bootloader configuration, and system data together, it enables complete restoration to a working system on new or replacement hardware without manual intervention.
+
+Key points to remember:
+
+- ReaR requires two phases: `mkbackup` to create the rescue image and archive, and booting the rescue image to recover
+- Configure ReaR in `/etc/rear/local.conf` only — never edit `/usr/share/rear/conf/default.conf`
+- Use `rear -v dump` to review active configuration before running a backup
+- Use `rear -v checklayout` to detect when disk layout changes require a new backup
+- Test recovery in a virtual machine before you need it in a real emergency — document the actual recovery time
+- Run `mkrescue` after kernel updates to keep the rescue environment current without a full backup run
+- Add `NUMBER_OF_RESULT_FILES_KEEP=3` to retain multiple backup versions automatically
+- Monitor `/var/log/rear/rear-<hostname>.log` after each run to confirm success
+
+### Related Pages
+
+- [System Backup](./system-backup) — full system backup with tar, rsync, and LVM snapshots
+- [Enterprise Backup](./enterprise-backup) — Bacula, Amanda, and large-scale backup solutions
+- [Restore Procedures](./restore-procedures) — recovering systems from backups
+- [Automated Backup](./automated-backup) — scheduling backups with cron and systemd timers
+- [Backup Verification](./backup-verification) — testing and validating backup integrity

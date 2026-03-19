@@ -1,0 +1,411 @@
+---
+sidebar_position: 1
+title: "System Backup | AlmaLinux"
+sidebar_label: "System Backup"
+description: "Create full system backups on AlmaLinux using tar, rsync, and LVM snapshots. Understand backup strategies, handle exclusions, and protect critical system data."
+keywords:
+  - "almalinux system backup"
+  - "almalinux tar backup"
+  - "almalinux rsync backup"
+  - "almalinux lvm snapshot"
+  - "rhel system backup"
+tags:
+  - almalinux
+  - backup-restore
+  - tar
+  - rsync
+  - lvm
+slug: /linux/almalinux/administration/backup-restore/system-backup
+---
+
+# System Backup on AlmaLinux
+
+A system backup captures the state of a running server so that it can be restored to a known-good condition after data loss, hardware failure, accidental deletion, or a failed update. On AlmaLinux, full system backups are achievable with tools that ship with the operating system — primarily `tar` and `rsync` — combined with LVM snapshots to ensure consistency while the system remains running.
+
+This page covers what a full system backup includes, how to create one with `tar` and `rsync`, how to use LVM snapshots to back up live systems without downtime, and what to keep in mind when planning a backup strategy for production environments.
+
+---
+
+## What a Full System Backup Includes
+
+A full system backup captures everything needed to reconstruct a working system: the operating system files, configuration, installed packages, user data, and system state. On AlmaLinux this means, at minimum:
+
+- `/etc/` — system configuration files
+- `/home/` — user home directories
+- `/root/` — root user's home directory
+- `/var/` — variable data including databases, mail spools, and log files
+- `/usr/local/` — locally installed software not managed by dnf
+- `/opt/` — optional software installed outside the package manager
+- `/srv/` — service data, if used
+- Boot configuration — `/boot/` and the bootloader configuration
+
+What a full system backup typically excludes:
+
+- `/proc/`, `/sys/`, `/dev/` — virtual filesystems representing kernel state; they do not contain real files and should never be backed up
+- `/tmp/`, `/var/tmp/` — temporary files that are intentionally ephemeral
+- `/run/` — runtime data that is recreated at boot
+- `/mnt/`, `/media/` — mount points for external and removable media
+- The backup destination itself, if it is a mounted directory on the same system
+
+Understanding these inclusions and exclusions is important because a naive backup of `/` without proper exclusions will try to back up pseudo-filesystems and produce either errors or a corrupt archive.
+
+---
+
+## Backup Strategy Fundamentals
+
+Before running your first backup command, it is worth thinking through three questions that shape every backup decision.
+
+**How much data can you afford to lose?** This is your Recovery Point Objective (RPO). A daily backup means you may lose up to 24 hours of changes in the worst case. Hourly backups reduce this to one hour. The answer drives your backup frequency.
+
+**How quickly must the system be back online?** This is your Recovery Time Objective (RTO). A full system backup to a local disk restores faster than one stored on a remote server, but offers no protection against local hardware failure. Your RTO influences where you store backups and what tools you use.
+
+**How long must backups be kept?** Retention requirements come from both operational needs (you may not discover a problem until days after it occurred) and compliance frameworks. Keep enough generations of backups that you can restore from before the problem existed.
+
+With these answers in mind, the technical choices — tool, frequency, destination, retention — follow naturally.
+
+---
+
+## Creating a Full System Backup with tar
+
+`tar` (tape archive) is the traditional Unix tool for creating archives. It handles file permissions, ownership, symbolic links, hard links, special files, and extended attributes correctly, making it well-suited for full system backups.
+
+### Basic Full System Archive
+
+The following command creates a compressed archive of the entire filesystem, with the standard exclusions applied:
+
+```bash
+tar --exclude=/proc \
+    --exclude=/sys \
+    --exclude=/dev \
+    --exclude=/run \
+    --exclude=/tmp \
+    --exclude=/var/tmp \
+    --exclude=/mnt \
+    --exclude=/media \
+    --exclude=/lost+found \
+    -czpf /backup/system-$(hostname)-$(date +%Y%m%d).tar.gz \
+    /
+```
+
+Breaking down the flags:
+
+- `--exclude=<path>` — omit the specified path from the archive
+- `-c` — create a new archive
+- `-z` — compress with gzip
+- `-p` — preserve file permissions and ownership
+- `-f <file>` — write the archive to this file
+
+The filename uses `$(hostname)` and `$(date +%Y%m%d)` to embed the hostname and date, producing a name like `system-web01-20240601.tar.gz`. This makes it easy to identify and sort archives when multiple hosts or dates are involved.
+
+:::warning
+If the backup destination (`/backup/` in this example) is on the same filesystem as the root, you must also add `--exclude=/backup` to the command. Otherwise, tar will try to include the archive it is currently writing, causing an error and a corrupt backup.
+:::
+
+### Verifying the Archive
+
+After creating an archive, verify it is readable and complete before relying on it:
+
+```bash
+tar -tzf /backup/system-web01-20240601.tar.gz | head -50
+```
+
+The `-t` flag lists the archive contents without extracting. Piping to `head` shows the first 50 entries — enough to confirm the archive structure is correct and begins with expected paths. To verify every file in the archive can be read without extracting:
+
+```bash
+tar -tzf /backup/system-web01-20240601.tar.gz > /dev/null && echo "Archive OK"
+```
+
+If tar encounters a corrupt block or unreadable data, it exits with a non-zero status and the `echo "Archive OK"` line will not run.
+
+### Excluding Additional Paths
+
+In practice, you will often want to exclude more than just the virtual filesystems. Large directories containing cache data, build artifacts, or frequently changing files that do not need to be backed up can be excluded to reduce archive size and backup time.
+
+To exclude the package manager cache and a build directory:
+
+```bash
+tar --exclude=/proc \
+    --exclude=/sys \
+    --exclude=/dev \
+    --exclude=/run \
+    --exclude=/tmp \
+    --exclude=/var/tmp \
+    --exclude=/var/cache/dnf \
+    --exclude=/home/builder/build \
+    --exclude=/mnt \
+    --exclude=/media \
+    -czpf /backup/system-$(hostname)-$(date +%Y%m%d).tar.gz \
+    /
+```
+
+For systems with many exclusions, maintaining a separate exclusion file is cleaner:
+
+```bash
+nano /etc/backup-excludes.txt
+```
+
+```
+/proc
+/sys
+/dev
+/run
+/tmp
+/var/tmp
+/var/cache/dnf
+/mnt
+/media
+/lost+found
+/backup
+```
+
+Then reference it with `--exclude-from`:
+
+```bash
+tar --exclude-from=/etc/backup-excludes.txt \
+    -czpf /backup/system-$(hostname)-$(date +%Y%m%d).tar.gz \
+    /
+```
+
+### Compression Options
+
+gzip (`-z`) is the default choice and offers a good balance of speed and compression ratio. For better compression at the cost of speed, use bzip2 (`-j`) or xz (`-J`):
+
+```bash
+# bzip2 compression — better ratio, slower
+tar --exclude-from=/etc/backup-excludes.txt -cjpf /backup/system-$(hostname)-$(date +%Y%m%d).tar.bz2 /
+
+# xz compression — best ratio, slowest
+tar --exclude-from=/etc/backup-excludes.txt -cJpf /backup/system-$(hostname)-$(date +%Y%m%d).tar.xz /
+```
+
+For large backups on systems where CPU is the bottleneck, skipping compression entirely and relying on the destination storage's own compression (if available) may be faster:
+
+```bash
+tar --exclude-from=/etc/backup-excludes.txt -cpf /backup/system-$(hostname)-$(date +%Y%m%d).tar /
+```
+
+---
+
+## Creating Backups with rsync
+
+`rsync` takes a different approach to backup: rather than creating an archive file, it synchronizes files from a source to a destination, transferring only the differences. This makes it efficient for repeated backups because subsequent runs only transfer changed files.
+
+### Basic rsync System Backup
+
+To synchronize the system to a local backup directory:
+
+```bash
+rsync -aAXv \
+    --exclude=/proc \
+    --exclude=/sys \
+    --exclude=/dev \
+    --exclude=/run \
+    --exclude=/tmp \
+    --exclude=/var/tmp \
+    --exclude=/mnt \
+    --exclude=/media \
+    --exclude=/lost+found \
+    / /backup/system/
+```
+
+The flags used here:
+
+- `-a` — archive mode: preserves permissions, ownership, timestamps, symbolic links, and recursion
+- `-A` — preserve ACLs (Access Control Lists)
+- `-X` — preserve extended attributes (SELinux contexts, capabilities)
+- `-v` — verbose output, showing each file as it is transferred
+
+The `-A` and `-X` flags are important on AlmaLinux because SELinux contexts are stored as extended attributes. Without `-X`, a restore from an rsync backup will produce files without their correct SELinux labels, which can cause services to fail or be denied access to their own files.
+
+### Incremental Backups with Hard Links
+
+rsync can implement an efficient incremental backup scheme using hard links. The `--link-dest` option causes rsync to hard-link unchanged files from a previous backup rather than copying them again. Each backup directory appears to be a full copy, but unchanged files share disk blocks with previous backups, so the total storage used is much less than multiple full copies.
+
+```bash
+BACKUPDIR=/backup/system
+TODAY=$(date +%Y%m%d)
+YESTERDAY=$(date -d yesterday +%Y%m%d)
+
+rsync -aAXv \
+    --exclude=/proc \
+    --exclude=/sys \
+    --exclude=/dev \
+    --exclude=/run \
+    --exclude=/tmp \
+    --exclude=/var/tmp \
+    --exclude=/mnt \
+    --exclude=/media \
+    --link-dest="$BACKUPDIR/$YESTERDAY" \
+    / "$BACKUPDIR/$TODAY/"
+```
+
+After running this, `$BACKUPDIR/20240601/` will contain a complete snapshot of the system. Files that did not change since `20240601` share disk blocks with `$BACKUPDIR/20240531/`. You can browse any snapshot directory and see a complete filesystem state, but the total disk usage is only the size of the changes between snapshots plus one full copy.
+
+### rsync to a Remote Host
+
+rsync transfers efficiently over SSH, making it straightforward to back up to a remote server:
+
+```bash
+rsync -aAXzv \
+    --exclude=/proc \
+    --exclude=/sys \
+    --exclude=/dev \
+    --exclude=/run \
+    --exclude=/tmp \
+    --exclude=/var/tmp \
+    --exclude=/mnt \
+    --exclude=/media \
+    / backup@backupserver.example.com:/backup/$(hostname)/
+```
+
+The `-z` flag enables compression during transfer, which reduces bandwidth usage at the cost of CPU. On fast local networks, omitting `-z` is often faster because the CPU overhead of compression exceeds the time saved by transferring fewer bytes.
+
+SSH key-based authentication should be configured for the backup user so that automated backups can run without a password prompt. See the [Automated Backup](./automated-backup) page for scheduling details.
+
+---
+
+## LVM Snapshots for Consistent Backups
+
+Both `tar` and `rsync` back up a running filesystem, which means files can change between the start and end of the backup. On a busy system — particularly one running a database — this can result in an inconsistent backup where some files reflect a state before a write and others reflect a state after. Restoring such a backup may produce a system that appears intact but has corrupted application state.
+
+LVM (Logical Volume Manager) snapshots solve this problem. A snapshot captures the state of an LVM logical volume at a specific instant. While the snapshot exists, you can back up the frozen point-in-time copy without worrying about concurrent writes to the live filesystem.
+
+### Checking LVM Configuration
+
+LVM snapshots are only available if your filesystems reside on LVM logical volumes. To check:
+
+```bash
+lvs
+```
+
+If this command shows your root and data volumes, LVM snapshots are available. If your root filesystem is on a plain partition (not LVM), snapshots are not an option for that volume.
+
+To see the volume group and available free space (snapshots require free space in the volume group):
+
+```bash
+vgs
+```
+
+The `VFree` column shows how much space is available for snapshots. A snapshot needs enough space to hold all writes that occur to the source volume while the snapshot is active — typically a few gigabytes is sufficient for a backup window of one to two hours.
+
+### Creating an LVM Snapshot
+
+To create a snapshot of the root logical volume:
+
+```bash
+lvcreate -L 5G -s -n root-snapshot /dev/almalinux/root
+```
+
+The flags:
+
+- `-L 5G` — allocate 5 GB for the snapshot's copy-on-write storage
+- `-s` — create a snapshot
+- `-n root-snapshot` — name the snapshot logical volume `root-snapshot`
+- `/dev/almalinux/root` — the source logical volume to snapshot
+
+Verify the snapshot was created:
+
+```bash
+lvs
+```
+
+The snapshot appears as a separate logical volume with an `s` attribute and a percentage showing how much of its allocated space has been used by copy-on-write data.
+
+### Mounting and Backing Up the Snapshot
+
+Mount the snapshot to a temporary mount point:
+
+```bash
+mkdir -p /mnt/snapshot
+mount -o ro /dev/almalinux/root-snapshot /mnt/snapshot
+```
+
+The `-o ro` flag mounts the snapshot read-only, which is appropriate since you are only reading from it for backup purposes.
+
+Now back up from the snapshot mount point rather than the live filesystem:
+
+```bash
+tar --exclude=/mnt/snapshot/proc \
+    --exclude=/mnt/snapshot/sys \
+    --exclude=/mnt/snapshot/dev \
+    --exclude=/mnt/snapshot/run \
+    --exclude=/mnt/snapshot/tmp \
+    -czpf /backup/system-$(hostname)-$(date +%Y%m%d).tar.gz \
+    /mnt/snapshot/
+```
+
+### Removing the Snapshot
+
+After the backup is complete, unmount and remove the snapshot:
+
+```bash
+umount /mnt/snapshot
+lvremove -f /dev/almalinux/root-snapshot
+```
+
+It is important to remove snapshots promptly after use. A snapshot that fills its allocated space becomes invalid — writes to the source volume that would have been recorded in the snapshot's copy-on-write storage are lost, and the snapshot is automatically disabled by the kernel. Monitor snapshot space usage with `lvs` if a backup takes a long time.
+
+:::tip
+For databases (MySQL, PostgreSQL) and other applications with their own transaction logs, take an application-consistent snapshot by briefly flushing and locking writes before creating the LVM snapshot, then releasing the lock immediately after. For MySQL this means running `FLUSH TABLES WITH READ LOCK` before `lvcreate` and `UNLOCK TABLES` after. The lock needs to be held only for the fraction of a second it takes to create the snapshot — not for the entire backup duration.
+:::
+
+---
+
+## What to Back Up Beyond the Filesystem
+
+A complete system backup strategy includes more than filesystem contents. Several categories of data are commonly overlooked:
+
+**Package list.** Knowing exactly which packages are installed allows you to reconstruct the software environment even without a full backup. Save the package list regularly:
+
+```bash
+dnf list installed > /backup/package-list-$(hostname)-$(date +%Y%m%d).txt
+```
+
+**Crontabs.** User-specific crontabs live in `/var/spool/cron/` and are included in a full backup, but are worth noting explicitly. System cron jobs in `/etc/cron.d/` and `/etc/crontab` are covered by an `/etc/` backup.
+
+**Bootloader configuration.** The GRUB configuration in `/boot/grub2/` and `/etc/default/grub` is included in a full system backup but should be given special attention. If the bootloader itself (the MBR or EFI partition) needs to be restored, additional steps are required beyond restoring files — this is covered in the [Restore Procedures](./restore-procedures) page.
+
+**SELinux policy customizations.** Custom SELinux policy modules compiled with `semodule` are stored in `/etc/selinux/` and included in a standard backup, but their associated source files may be elsewhere. Back up source `.te` files alongside the compiled modules.
+
+---
+
+## Checking Backup Destination Space
+
+Before running a backup, confirm the destination has sufficient space. A backup that runs out of space partway through is worse than no backup — it produces a partial archive that cannot be used for restore:
+
+```bash
+df -h /backup/
+```
+
+To estimate how large the backup will be before creating it, use `du` on the source directories:
+
+```bash
+du -shx --exclude=/proc --exclude=/sys --exclude=/dev --exclude=/run /
+```
+
+The `-x` flag limits `du` to the current filesystem, which is a quick way to get a size estimate without crossing mount points into virtual filesystems.
+
+---
+
+## Summary
+
+Full system backups on AlmaLinux are built on `tar` for archive-based backups and `rsync` for synchronization-based backups, with LVM snapshots providing consistency guarantees for live systems. The choice between tools depends on your RPO, RTO, available storage, and whether the systems run workloads sensitive to filesystem inconsistency.
+
+Key points to remember:
+
+- Always exclude `/proc`, `/sys`, `/dev`, `/run`, and `/tmp` from system backups — these are virtual filesystems, not real data
+- Include `-A` and `-X` flags with rsync to preserve ACLs and SELinux extended attributes
+- Use `--exclude-from` to maintain exclusion lists as files rather than long command-line flags
+- LVM snapshots provide point-in-time consistency; size them generously and remove them promptly after use
+- Verify every archive with `tar -tzf` before relying on it
+- Back up the package list separately as a lightweight complement to filesystem backups
+- Check destination free space before starting a large backup
+
+### Related Pages
+
+- [Filesystem Backup](./filesystem-backup) — directory-level and incremental backup strategies
+- [LVM Snapshots](../system-maintenance/lvm-management) — detailed LVM snapshot management
+- [Automated Backup](./automated-backup) — scheduling backups with cron and systemd timers
+- [Restore Procedures](./restore-procedures) — recovering from system backups
+- [Backup Verification](./backup-verification) — testing and validating backup integrity
+- [Remote Backup](./remote-backup) — offsite and cloud backup destinations

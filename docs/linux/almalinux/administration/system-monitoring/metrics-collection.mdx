@@ -1,0 +1,522 @@
+---
+sidebar_position: 7
+title: "Metrics Collection | AlmaLinux"
+sidebar_label: "Metrics Collection"
+description: "Collect metrics with Prometheus, Grafana, collectd, and implement enterprise monitoring dashboards on AlmaLinux."
+keywords:
+  - "almalinux metrics collection"
+  - "almalinux prometheus"
+  - "almalinux grafana"
+  - "almalinux collectd"
+  - "rhel metrics monitoring"
+tags:
+  - almalinux
+  - system-monitoring
+  - prometheus
+  - grafana
+  - metrics
+slug: /linux/almalinux/administration/system-monitoring/metrics-collection
+---
+
+# Metrics Collection
+
+Logs and alerts tell you when something is wrong. Metrics tell you why — and help you spot trends before they become problems. AlmaLinux supports a full modern metrics stack built around Prometheus for collection, Grafana for visualization, and Node Exporter for system-level metrics. For environments that already use collectd or statsd, those integrate cleanly too.
+
+## Overview of the stack
+
+```
+AlmaLinux host
+  └── node_exporter        ──► exposes system metrics on :9100
+  └── custom exporters     ──► exposes app metrics
+
+Prometheus server          ──► scrapes and stores metrics
+  └── Alertmanager         ──► routes alerts
+
+Grafana                    ──► queries Prometheus, renders dashboards
+```
+
+## Node Exporter — system metrics
+
+Node Exporter exposes CPU, memory, disk, network, and filesystem metrics in Prometheus format.
+
+### Install Node Exporter
+
+```bash
+# Download the latest release
+curl -LO https://github.com/prometheus/node_exporter/releases/latest/download/node_exporter-1.8.2.linux-amd64.tar.gz
+
+tar -xzf node_exporter-1.8.2.linux-amd64.tar.gz
+sudo mv node_exporter-1.8.2.linux-amd64/node_exporter /usr/local/bin/
+sudo chmod +x /usr/local/bin/node_exporter
+```
+
+Create a dedicated system user:
+
+```bash
+sudo useradd --system --no-create-home --shell /sbin/nologin node_exporter
+```
+
+Create a systemd unit:
+
+```bash
+sudo nano /etc/systemd/system/node_exporter.service
+```
+
+```ini
+[Unit]
+Description=Prometheus Node Exporter
+After=network.target
+
+[Service]
+User=node_exporter
+Group=node_exporter
+Type=simple
+ExecStart=/usr/local/bin/node_exporter \
+  --collector.systemd \
+  --collector.processes \
+  --web.listen-address=:9100
+
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Enable and start:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now node_exporter
+```
+
+Open the firewall for the Prometheus server only:
+
+```bash
+sudo firewall-cmd --permanent --add-rich-rule='rule family="ipv4" source address="192.168.1.10/32" port port="9100" protocol="tcp" accept'
+sudo firewall-cmd --reload
+```
+
+Verify metrics are being exposed:
+
+```bash
+curl http://localhost:9100/metrics | head -30
+```
+
+## Prometheus server
+
+### Install Prometheus
+
+```bash
+curl -LO https://github.com/prometheus/prometheus/releases/latest/download/prometheus-2.52.0.linux-amd64.tar.gz
+
+tar -xzf prometheus-2.52.0.linux-amd64.tar.gz
+sudo mv prometheus-2.52.0.linux-amd64/{prometheus,promtool} /usr/local/bin/
+sudo mkdir -p /etc/prometheus /var/lib/prometheus
+
+sudo useradd --system --no-create-home --shell /sbin/nologin prometheus
+sudo chown prometheus:prometheus /var/lib/prometheus
+```
+
+### Configure Prometheus
+
+```bash
+sudo nano /etc/prometheus/prometheus.yml
+```
+
+```yaml
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ['localhost:9093']
+
+rule_files:
+  - /etc/prometheus/rules/*.yml
+
+scrape_configs:
+  # Prometheus scrapes itself
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+  # AlmaLinux hosts
+  - job_name: 'node'
+    static_configs:
+      - targets:
+          - 'server1.example.com:9100'
+          - 'server2.example.com:9100'
+          - 'server3.example.com:9100'
+        labels:
+          environment: 'production'
+
+  # Dynamic targets from a file (useful for large fleets)
+  - job_name: 'node_file_sd'
+    file_sd_configs:
+      - files:
+          - /etc/prometheus/targets/*.yml
+        refresh_interval: 30s
+```
+
+### Dynamic target file
+
+```bash
+sudo mkdir -p /etc/prometheus/targets
+sudo nano /etc/prometheus/targets/almalinux.yml
+```
+
+```yaml
+- targets:
+    - 'server1.example.com:9100'
+    - 'server2.example.com:9100'
+  labels:
+    datacenter: 'ams1'
+    environment: 'production'
+```
+
+### Create the systemd unit
+
+```bash
+sudo nano /etc/systemd/system/prometheus.service
+```
+
+```ini
+[Unit]
+Description=Prometheus
+After=network.target
+
+[Service]
+User=prometheus
+Group=prometheus
+Type=simple
+ExecStart=/usr/local/bin/prometheus \
+  --config.file=/etc/prometheus/prometheus.yml \
+  --storage.tsdb.path=/var/lib/prometheus \
+  --storage.tsdb.retention.time=30d \
+  --web.listen-address=:9090 \
+  --web.enable-lifecycle
+
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now prometheus
+```
+
+Validate the config:
+
+```bash
+promtool check config /etc/prometheus/prometheus.yml
+```
+
+### Useful PromQL queries
+
+```promql
+# CPU usage per host (%)
+100 - (avg by(instance) (rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100)
+
+# Available memory (%)
+(node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes) * 100
+
+# Disk usage per filesystem (%)
+100 - ((node_filesystem_avail_bytes / node_filesystem_size_bytes) * 100)
+
+# Network receive rate (MB/s)
+rate(node_network_receive_bytes_total[5m]) / 1024 / 1024
+
+# Disk I/O utilisation (%)
+rate(node_disk_io_time_seconds_total[5m]) * 100
+
+# Load average vs CPU count
+node_load1 / count by(instance)(node_cpu_seconds_total{mode="idle"})
+
+# Systemd service state (1 = active)
+node_systemd_unit_state{state="active"}
+```
+
+## Grafana — dashboards
+
+### Install Grafana
+
+```bash
+sudo nano /etc/yum.repos.d/grafana.repo
+```
+
+```ini
+[grafana]
+name=grafana
+baseurl=https://rpm.grafana.com
+repo_gpgcheck=1
+enabled=1
+gpgcheck=1
+gpgkey=https://rpm.grafana.com/gpg.key
+sslverify=1
+sslcacert=/etc/pki/tls/certs/ca-bundle.crt
+```
+
+```bash
+sudo dnf install -y grafana
+
+sudo systemctl enable --now grafana-server
+```
+
+Open the firewall:
+
+```bash
+sudo firewall-cmd --permanent --add-port=3000/tcp
+sudo firewall-cmd --reload
+```
+
+Access Grafana at `http://serverip:3000`. Default credentials are `admin` / `admin` — change immediately on first login.
+
+### Add Prometheus as a data source via API
+
+```bash
+curl -s -X POST http://admin:admin@localhost:3000/api/datasources \
+  -H 'Content-Type: application/json' \
+  --data '{
+    "name": "Prometheus",
+    "type": "prometheus",
+    "url": "http://localhost:9090",
+    "access": "proxy",
+    "isDefault": true
+  }'
+```
+
+### Import the Node Exporter dashboard
+
+The official Node Exporter Full dashboard (ID 1860) is the standard starting point for AlmaLinux / RHEL hosts.
+
+```bash
+curl -s -X POST http://admin:admin@localhost:3000/api/dashboards/import \
+  -H 'Content-Type: application/json' \
+  --data '{
+    "dashboard": {"id": null},
+    "folderId": 0,
+    "inputs": [{"name": "DS_PROMETHEUS", "type": "datasource", "pluginId": "prometheus", "value": "Prometheus"}],
+    "overwrite": true,
+    "path": "https://grafana.com/api/dashboards/1860/revisions/latest/download"
+  }'
+```
+
+Or import it manually in the Grafana UI: **Dashboards → Import → ID 1860**.
+
+## collectd — lightweight metrics collection
+
+`collectd` is a lightweight alternative to Node Exporter, suited for environments that already use a collectd-based infrastructure.
+
+### Install collectd
+
+```bash
+sudo dnf install -y collectd collectd-write_prometheus
+```
+
+### Configure collectd
+
+```bash
+sudo nano /etc/collectd.conf
+```
+
+```apache
+# Global settings
+Hostname "server.example.com"
+Interval 10
+
+# Load collection plugins
+LoadPlugin cpu
+LoadPlugin memory
+LoadPlugin disk
+LoadPlugin interface
+LoadPlugin load
+LoadPlugin df
+LoadPlugin swap
+LoadPlugin processes
+LoadPlugin write_prometheus
+
+# Expose metrics for Prometheus scraping on port 9103
+<Plugin write_prometheus>
+  Port "9103"
+</Plugin>
+
+# Disk stats
+<Plugin disk>
+  Disk "/^sda/"
+  IgnoreSelected false
+</Plugin>
+
+# Filesystem stats
+<Plugin df>
+  MountPoint "/"
+  MountPoint "/var"
+  IgnoreSelected false
+  ReportInodes true
+</Plugin>
+```
+
+Enable and start:
+
+```bash
+sudo systemctl enable --now collectd
+```
+
+Add to Prometheus scrape config:
+
+```yaml
+- job_name: 'collectd'
+  static_configs:
+    - targets: ['server.example.com:9103']
+```
+
+## Write custom metrics with a Prometheus textfile collector
+
+Node Exporter can expose custom metrics from shell scripts via the textfile collector. This is useful for business metrics, application health checks, or anything not covered by standard exporters.
+
+### Enable the textfile collector
+
+Add `--collector.textfile.directory` to the node_exporter systemd unit:
+
+```bash
+sudo systemctl edit node_exporter
+```
+
+```ini
+[Service]
+ExecStart=
+ExecStart=/usr/local/bin/node_exporter \
+  --collector.systemd \
+  --collector.processes \
+  --collector.textfile.directory=/var/lib/node_exporter/textfile \
+  --web.listen-address=:9100
+```
+
+```bash
+sudo mkdir -p /var/lib/node_exporter/textfile
+sudo chown node_exporter:node_exporter /var/lib/node_exporter/textfile
+sudo systemctl restart node_exporter
+```
+
+### Write a custom metric script
+
+```bash
+sudo nano /usr/local/bin/metrics-backup-status.sh
+```
+
+```bash
+#!/bin/bash
+# Expose backup job status as a Prometheus metric
+# 1 = success, 0 = failed or missing
+
+TEXTFILE_DIR="/var/lib/node_exporter/textfile"
+BACKUP_LOG="/var/log/backup/last-run.log"
+OUTPUT="$TEXTFILE_DIR/backup_status.prom"
+
+if [[ -f "$BACKUP_LOG" ]] && grep -q "Backup completed successfully" "$BACKUP_LOG"; then
+  STATUS=1
+else
+  STATUS=0
+fi
+
+TIMESTAMP=$(date +%s)
+
+cat > "$OUTPUT.tmp" << EOF
+# HELP backup_last_success Timestamp of last successful backup
+# TYPE backup_last_success gauge
+backup_last_success $([ "$STATUS" -eq 1 ] && echo "$TIMESTAMP" || echo "0")
+
+# HELP backup_status Last backup status (1=success, 0=failed)
+# TYPE backup_status gauge
+backup_status $STATUS
+EOF
+
+mv "$OUTPUT.tmp" "$OUTPUT"
+```
+
+```bash
+sudo chmod +x /usr/local/bin/metrics-backup-status.sh
+```
+
+Schedule it with cron:
+
+```bash
+sudo crontab -e
+```
+
+```
+*/5 * * * * /usr/local/bin/metrics-backup-status.sh
+```
+
+## Common mistakes
+
+### Exposing Node Exporter to the internet
+
+Node Exporter exposes detailed system information. Restrict access to the Prometheus server only using firewall rules or bind to localhost.
+
+```bash
+# Bind to localhost only if Prometheus runs on the same host
+ExecStart=/usr/local/bin/node_exporter --web.listen-address=127.0.0.1:9100
+```
+
+### Not setting retention limits on Prometheus
+
+Without a retention limit, Prometheus storage grows indefinitely.
+
+```bash
+# Set in the systemd unit
+--storage.tsdb.retention.time=30d
+--storage.tsdb.retention.size=20GB
+```
+
+### Using short scrape intervals without enough resources
+
+A 5-second scrape interval across 50 hosts generates significant load. Start with 15s and tune down only if you need higher resolution.
+
+### Not validating Prometheus config before reloading
+
+An invalid config file will prevent Prometheus from starting or reloading.
+
+```bash
+promtool check config /etc/prometheus/prometheus.yml
+```
+
+### Writing textfile metrics without atomic moves
+
+Writing directly to `.prom` files can cause Prometheus to scrape a partially written file. Always write to a `.tmp` file and then move it atomically.
+
+```bash
+# WRONG
+echo "metric 1" > /var/lib/node_exporter/textfile/metric.prom
+
+# CORRECT
+echo "metric 1" > /var/lib/node_exporter/textfile/metric.prom.tmp
+mv /var/lib/node_exporter/textfile/metric.prom.tmp \
+   /var/lib/node_exporter/textfile/metric.prom
+```
+
+## Summary
+
+A Prometheus and Grafana stack on AlmaLinux gives you a production-grade metrics platform that scales from a single server to hundreds of hosts with minimal operational overhead.
+
+Key points:
+
+- deploy Node Exporter on every host and restrict port 9100 to the Prometheus server
+- configure Prometheus with appropriate scrape intervals and retention limits
+- validate config changes with `promtool check config` before applying
+- use file-based service discovery for large or dynamic fleets
+- import dashboard ID 1860 in Grafana as a ready-made starting point
+- use the textfile collector to expose custom and business metrics alongside system metrics
+- write textfile metrics atomically to avoid partial scrapes
+
+:::tip Related pages
+- [Resource Monitoring](./resource-monitoring)
+- [Enterprise Alerting](./enterprise-alerting)
+- [Performance Analysis](./performance-analysis)
+- [Log Monitoring](./log-monitoring)
+:::

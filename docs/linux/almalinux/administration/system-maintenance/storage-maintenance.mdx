@@ -1,0 +1,501 @@
+---
+sidebar_position: 5
+title: "Storage Maintenance | AlmaLinux"
+sidebar_label: "Storage Maintenance"
+description: "Maintain LVM volumes, XFS and ext4 filesystems, monitor disk health with SMART, implement RAID monitoring, and manage enterprise storage on AlmaLinux."
+keywords:
+  - "almalinux storage maintenance"
+  - "almalinux lvm"
+  - "almalinux xfs maintenance"
+  - "almalinux smart monitoring"
+  - "rhel storage maintenance"
+tags:
+  - almalinux
+  - system-maintenance
+  - storage
+  - lvm
+  - filesystem
+slug: /linux/almalinux/administration/system-maintenance/storage-maintenance
+---
+
+# Storage Maintenance on AlmaLinux
+
+Storage is the layer of a system that is most difficult to recover from when something goes wrong. A failed process can be restarted, a misconfigured service can be reconfigured, but a filesystem that has lost data or a disk that has failed silently may have caused irreversible damage before anyone noticed. Proactive storage maintenance — monitoring disk health, verifying filesystem integrity, managing LVM volumes, and understanding RAID status — is one of the highest-value maintenance practices on any production system.
+
+AlmaLinux uses XFS as the default filesystem, LVM for flexible volume management, and standard Linux software RAID (mdadm) for redundancy where hardware RAID is not available. This page covers maintenance procedures for each layer, from the physical disk up through the logical volume to the filesystem.
+
+---
+
+## Disk Health Monitoring with SMART
+
+SMART (Self-Monitoring, Analysis, and Reporting Technology) is a built-in capability of modern HDDs and SSDs that tracks internal health indicators — read error rates, reallocated sectors, spin-up times, and many others. Monitoring SMART data gives early warning of drive failures, often days or weeks before the drive becomes unusable.
+
+### Installing and Enabling smartmontools
+
+```bash
+dnf install smartmontools
+systemctl enable --now smartd
+```
+
+### Checking SMART Status
+
+To run an immediate SMART health check on a drive:
+
+```bash
+smartctl -H /dev/sda
+```
+
+A healthy drive reports `SMART overall-health self-assessment test result: PASSED`. Any other result warrants immediate attention.
+
+To view all SMART attributes:
+
+```bash
+smartctl -A /dev/sda
+```
+
+The most important attributes to watch are:
+
+| ID | Attribute | Concern when... |
+|---|---|---|
+| 1 | Raw Read Error Rate | Value decreasing over time |
+| 5 | Reallocated Sectors Count | Any non-zero value |
+| 187 | Reported Uncorrectable Errors | Any non-zero value |
+| 188 | Command Timeout | Increasing count |
+| 197 | Current Pending Sector Count | Any non-zero value |
+| 198 | Offline Uncorrectable | Any non-zero value |
+| 199 | UDMA CRC Error Count | Increasing (cable/controller issue) |
+
+Attributes 5, 197, and 198 are the most critical — non-zero values in any of these indicate the drive has sectors it cannot reliably read or write and should be replaced.
+
+### Running SMART Self-Tests
+
+Schedule regular SMART self-tests to actively probe drive health:
+
+```bash
+# Short test (1–2 minutes)
+smartctl -t short /dev/sda
+
+# Long test (hours, tests entire drive surface)
+smartctl -t long /dev/sda
+```
+
+Check the results after the test completes:
+
+```bash
+smartctl -l selftest /dev/sda
+```
+
+### Configuring smartd for Automated Monitoring
+
+`smartd` monitors drives continuously and sends alerts when problems are detected. Configure it in `/etc/smartd.conf`:
+
+```bash
+nano /etc/smartd.conf
+```
+
+```
+# Monitor all detected drives automatically
+# -a: all checks
+# -o on: enable automatic offline tests
+# -S on: enable attribute autosave
+# -s S/../.././02: run short self-test daily at 02:00
+# -s L/../../6/03: run long self-test weekly on Saturday at 03:00
+# -m admin@example.com: email alerts to this address
+DEVICESCAN -a -o on -S on \
+    -s (S/../.././02|L/../../6/03) \
+    -m admin@example.com \
+    -M exec /usr/libexec/smartmontools/smartd-runner
+```
+
+Reload smartd after changing the configuration:
+
+```bash
+systemctl restart smartd
+```
+
+### NVMe Drive Health
+
+NVMe drives use a different interface for health monitoring. To check NVMe health:
+
+```bash
+smartctl -a /dev/nvme0
+```
+
+Or using the nvme-cli tool:
+
+```bash
+dnf install nvme-cli
+nvme smart-log /dev/nvme0
+```
+
+Key NVMe health fields: `media_errors` (non-zero is serious), `percentage_used` (approaches 100% as the drive nears end of life), and `available_spare` (drops below `available_spare_threshold` when drive endurance is nearly exhausted).
+
+---
+
+## Filesystem Maintenance
+
+### XFS Filesystem Health
+
+XFS is AlmaLinux's default filesystem. It is a journaling filesystem that handles most consistency issues automatically through its journal. In normal operation, `xfs_repair` should rarely be needed, but health checks are worth including in a maintenance routine.
+
+**Checking XFS filesystem metadata:**
+
+```bash
+# Check filesystem metadata consistency (read-only, does not modify)
+xfs_db -r -c "check" /dev/almalinux/root
+```
+
+**Checking inode usage:**
+
+```bash
+df -i /
+```
+
+A filesystem can run out of inodes before it runs out of space — each file, directory, and symlink consumes one inode. If `IUse%` approaches 100%, no new files can be created even if disk space remains. On XFS, inodes are allocated dynamically so this is less common than on ext4, but worth monitoring.
+
+**Growing an XFS filesystem:**
+
+XFS filesystems can be grown online (while mounted) but cannot be shrunk. To grow an XFS filesystem after expanding the underlying block device or LVM volume:
+
+```bash
+xfs_growfs /
+```
+
+No unmounting is required. `xfs_growfs` uses the mount point, not the device name.
+
+**Repairing XFS:**
+
+XFS repair must be performed on an unmounted filesystem. For the root filesystem, boot from rescue media:
+
+```bash
+xfs_repair /dev/almalinux/root
+```
+
+Run `xfs_repair` only when the filesystem is actually damaged — it makes structural modifications that are not needed on healthy filesystems.
+
+### ext4 Filesystem Health
+
+`/boot/` is commonly formatted as ext4 on AlmaLinux. ext4 maintenance differs from XFS in that it supports periodic `fsck` checks and has a richer set of tunable parameters.
+
+**Checking ext4 filesystem health:**
+
+```bash
+# Check when the filesystem was last checked and its error count
+tune2fs -l /dev/sda1 | grep -E "Last checked|Mount count|Maximum mount|Filesystem state|Filesystem errors"
+```
+
+`Filesystem state: clean` means the filesystem was unmounted cleanly last time. `Filesystem state: with errors` indicates problems were detected and warrants investigation.
+
+**Scheduling periodic fsck:**
+
+```bash
+# Force a check after 30 mounts or 180 days, whichever comes first
+tune2fs -c 30 -i 180d /dev/sda1
+```
+
+**Running fsck manually:**
+
+ext4 `fsck` must be run on an unmounted filesystem. For `/boot/`:
+
+```bash
+umount /boot
+fsck.ext4 -f /dev/sda1
+mount /boot
+```
+
+The `-f` flag forces a check even if the filesystem appears clean.
+
+---
+
+## LVM Maintenance
+
+LVM (Logical Volume Manager) provides flexible volume management between the physical disk and the filesystem. Regular LVM maintenance ensures the configuration is accurate, snapshots are not left stale, and free space is managed proactively.
+
+### Checking LVM Status
+
+To see all physical volumes, volume groups, and logical volumes:
+
+```bash
+pvs    # Physical volumes
+vgs    # Volume groups
+lvs    # Logical volumes
+```
+
+For more detail on the volume group, including free space:
+
+```bash
+vgdisplay almalinux
+```
+
+The `VG Status` line shows whether the volume group is `resizable`. `VFree` shows how much unallocated space is available for new logical volumes or volume growth.
+
+### Extending a Logical Volume
+
+When a filesystem is running low on space and the volume group has free space available, extend the logical volume and grow the filesystem in one step:
+
+```bash
+# Extend the logical volume by 10 GB and grow the XFS filesystem
+lvextend -L +10G --resizefs /dev/almalinux/root
+```
+
+The `--resizefs` flag automatically calls `xfs_growfs` (for XFS) or `resize2fs` (for ext4) after extending the logical volume. On a live system with XFS, this works without unmounting.
+
+To extend using all available free space in the volume group:
+
+```bash
+lvextend -l +100%FREE --resizefs /dev/almalinux/root
+```
+
+### Adding a Physical Volume to a Volume Group
+
+When a volume group has no more free space and the logical volumes need to grow further, add a new disk or partition as a physical volume:
+
+```bash
+# Initialize the new disk as a physical volume
+pvcreate /dev/sdb
+
+# Add it to the existing volume group
+vgextend almalinux /dev/sdb
+```
+
+After this, the volume group has additional free space that can be allocated to logical volumes.
+
+### Moving Data Between Physical Volumes
+
+To migrate data from an old disk to a new one while the system remains running — useful when replacing a failing drive:
+
+```bash
+# Move all extents from /dev/sda to /dev/sdb
+pvmove /dev/sda /dev/sdb
+```
+
+`pvmove` moves LVM extents one at a time in the background. Progress can be monitored:
+
+```bash
+pvmove      # Shows progress of an ongoing move
+```
+
+After `pvmove` completes, the old disk can be removed from the volume group and decommissioned:
+
+```bash
+vgreduce almalinux /dev/sda
+pvremove /dev/sda
+```
+
+### Managing LVM Snapshots
+
+LVM snapshots created for backups must be removed promptly after use. Stale snapshots that have filled their allocated space become invalid and prevent the source volume from being written to correctly.
+
+To check snapshot status:
+
+```bash
+lvs -a -o name,size,lv_attr,snap_percent
+```
+
+The `snap_percent` column shows how full each snapshot is. A snapshot at 100% is invalid. Remove stale snapshots:
+
+```bash
+lvremove /dev/almalinux/root-snapshot
+```
+
+### Scanning for Inconsistencies
+
+To scan the LVM metadata for inconsistencies:
+
+```bash
+vgck almalinux
+```
+
+No output means no problems were found. Any reported issues should be addressed before they affect volume availability.
+
+---
+
+## RAID Monitoring and Maintenance
+
+### Software RAID with mdadm
+
+AlmaLinux supports Linux software RAID managed by `mdadm`. Software RAID provides redundancy at the storage layer without requiring specialized hardware.
+
+**Checking RAID array status:**
+
+```bash
+cat /proc/mdstat
+```
+
+A healthy RAID 1 array shows `[UU]` (both drives active). A degraded array shows `[U_]` (one drive failed) or `[_U]` depending on which drive failed.
+
+For detailed status of a specific array:
+
+```bash
+mdadm --detail /dev/md0
+```
+
+Look for `State: clean` (healthy) vs `State: degraded` (needs attention). The `Rebuild Status` line appears when a rebuild is in progress after adding a replacement drive.
+
+**Monitoring for failures:**
+
+Configure `mdadm` to send email alerts when array events occur:
+
+```bash
+nano /etc/mdadm.conf
+```
+
+```
+MAILADDR admin@example.com
+```
+
+```bash
+systemctl restart mdmonitor
+```
+
+**Adding a spare drive:**
+
+Adding a hot spare to an existing array provides automatic rebuild when a drive fails:
+
+```bash
+mdadm /dev/md0 --add /dev/sdc
+```
+
+**Replacing a failed drive:**
+
+When a drive fails in a RAID array, replace it as soon as possible — a RAID 1 or RAID 5 array with a failed drive is running without redundancy:
+
+```bash
+# Mark the failed drive as faulty (if not already marked)
+mdadm /dev/md0 --fail /dev/sdb
+
+# Remove it from the array
+mdadm /dev/md0 --remove /dev/sdb
+
+# Add the replacement drive
+mdadm /dev/md0 --add /dev/sdb
+```
+
+After adding the replacement, the array begins rebuilding automatically. Monitor progress:
+
+```bash
+watch -n 5 cat /proc/mdstat
+```
+
+A large array may take hours to rebuild. The system remains fully operational during the rebuild, but I/O performance is reduced as the rebuild competes for disk bandwidth.
+
+### Hardware RAID Monitoring
+
+For systems using hardware RAID controllers, the specific monitoring tool depends on the controller vendor:
+
+| Controller | Tool |
+|---|---|
+| MegaRAID (Broadcom/LSI) | `megacli` or `storcli` |
+| HP Smart Array | `ssacli` (HPE SSA CLI) |
+| Dell PERC | `perccli` |
+| Adaptec | `arcconf` |
+
+These tools are not in the standard AlmaLinux repositories — install them from the vendor's support site. Each provides commands to check array status, battery backup unit (BBU) health, and drive status. For example, with `storcli`:
+
+```bash
+storcli /c0 show
+storcli /c0/v0 show
+storcli /c0/eall/sall show
+```
+
+Integrate hardware RAID status checks into your monitoring automation — hardware RAID failures can be silent from the OS perspective because the RAID controller presents a single logical volume regardless of the underlying drive status.
+
+---
+
+## Disk Space Monitoring and Alerts
+
+### Setting Up Disk Space Alerts
+
+Disk space exhaustion is one of the most preventable causes of service disruption. A scheduled check that alerts when filesystems approach capacity gives time to act before a service fails:
+
+```bash
+nano /usr/local/sbin/check-disk-space-storage.sh
+```
+
+```bash
+#!/bin/bash
+# check-disk-space-storage.sh
+# Monitors disk usage and alerts at configurable thresholds.
+
+WARN_PCT=80
+CRIT_PCT=90
+ALERT_EMAIL="admin@example.com"
+HOSTNAME=$(hostname -s)
+
+df -lP --exclude-type=tmpfs --exclude-type=devtmpfs | tail -n +2 \
+| while read SOURCE SIZE USED AVAIL PCT MOUNT; do
+    PCT_INT=${PCT//%/}
+    if [[ "${PCT_INT}" -ge "${CRIT_PCT}" ]]; then
+        echo "CRITICAL: ${MOUNT} is ${PCT} full (${USED} of ${SIZE} used) on ${HOSTNAME}" \
+            | mail -s "CRITICAL Disk: ${HOSTNAME} ${MOUNT}" "${ALERT_EMAIL}"
+    elif [[ "${PCT_INT}" -ge "${WARN_PCT}" ]]; then
+        echo "WARNING: ${MOUNT} is ${PCT} full (${USED} of ${SIZE} used) on ${HOSTNAME}" \
+            | mail -s "Disk Warning: ${HOSTNAME} ${MOUNT}" "${ALERT_EMAIL}"
+    fi
+done
+```
+
+```bash
+chmod 700 /usr/local/sbin/check-disk-space-storage.sh
+echo "*/15 * * * *  root  /usr/local/sbin/check-disk-space-storage.sh" \
+    >> /etc/cron.d/storage-monitoring
+```
+
+### Monitoring LVM Free Space
+
+LVM free space (space available to extend logical volumes) is separate from filesystem free space. A filesystem can be 95% full while the volume group has ample free space — extending the logical volume solves the problem immediately. Monitor both:
+
+```bash
+# Check VG free space as a percentage
+VG_FREE=$(vgs --noheadings --units g -o vg_name,vg_free,vg_size almalinux \
+    | awk '{printf "%.0f\n", ($2/$3)*100}')
+echo "Volume group free: ${VG_FREE}%"
+```
+
+When VG free space drops below 20%, plan to add a new physical volume before space becomes critical.
+
+---
+
+## Storage Maintenance Schedule
+
+Storage maintenance tasks have different frequencies based on their purpose:
+
+**Daily:**
+- Disk space check (automated alert script)
+- Review `smartd` alerts in email or journal
+- Check `/proc/mdstat` for RAID degradation
+
+**Weekly:**
+- Review SMART attributes for trending changes: `smartctl -A /dev/sd*`
+- Check LVM snapshot space usage if any snapshots are present
+- Review LVM free space and project when extension will be needed
+
+**Monthly:**
+- Run a SMART long self-test on all physical disks
+- Verify RAID array state and confirm no drives are degraded
+- Check filesystem inode usage: `df -i`
+- Review disk I/O statistics for trending changes: `sar -b -f /var/log/sa/saXX`
+
+---
+
+## Summary
+
+Storage maintenance on AlmaLinux spans four layers: physical disk health through SMART monitoring, LVM volume management for flexible capacity, filesystem integrity for XFS and ext4, and RAID status monitoring for redundancy. Each layer requires different tools and attention at different intervals.
+
+Key points to remember:
+
+- SMART attributes 5 (reallocated sectors), 197 (pending sectors), and 198 (uncorrectable) — any non-zero value means the drive should be replaced soon
+- Configure `smartd` with `DEVICESCAN` and email alerts to catch drive failures automatically
+- `lvextend -l +100%FREE --resizefs` extends an LVM volume and its XFS filesystem in one command without unmounting
+- `pvmove` migrates data between physical volumes while the system is running — useful for replacing drives without downtime
+- Remove LVM snapshots promptly after backup — a full snapshot invalidates itself and can disrupt writes to the source volume
+- `cat /proc/mdstat` is the fastest way to check software RAID health; `[U_]` means a drive has failed
+- Never run a RAID array in a degraded state longer than necessary — add a replacement drive immediately
+- XFS grows with `xfs_growfs` using the mount point, not the device name; ext4 grows with `resize2fs` using the device
+
+### Related Pages
+
+- [System Cleanup](./system-cleanup) — reclaiming disk space from logs, caches, and old kernels
+- [Performance Tuning](./performance-tuning) — I/O scheduler selection and read-ahead tuning
+- [System Backup](../backup-restore/system-backup) — LVM snapshots for consistent backups
+- [Maintenance Automation](./maintenance-automation) — scheduling SMART tests and disk checks

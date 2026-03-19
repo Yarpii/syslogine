@@ -1,0 +1,460 @@
+---
+sidebar_position: 7
+title: "Security Policies | AlmaLinux"
+sidebar_label: "Security Policies"
+description: "Implement password policies, account lockout, SELinux user contexts, and enterprise security compliance on AlmaLinux."
+keywords:
+  - "almalinux security policies"
+  - "almalinux password policy"
+  - "almalinux selinux users"
+  - "almalinux account lockout"
+  - "rhel security compliance"
+tags:
+  - almalinux
+  - user-management
+  - security
+  - selinux
+  - compliance
+slug: /linux/almalinux/administration/user-management/security-policies
+---
+
+# Security Policies
+
+A security policy on AlmaLinux is more than a password rule. It covers account lockout, password aging, login restrictions, SELinux user confinement, and compliance baselines. Applied together, these controls make it significantly harder to compromise accounts — and easier to demonstrate compliance in audited environments.
+
+## Password policy with pwquality
+
+Password quality is enforced at the PAM layer via `pam_pwquality`. Configure it in `/etc/security/pwquality.conf`.
+
+```bash
+sudo nano /etc/security/pwquality.conf
+```
+
+Recommended baseline:
+
+```ini
+# Minimum password length
+minlen = 15
+
+# Do not require character class mixtures
+minclass = 0
+
+# Reject passwords containing the username
+usercheck = 1
+
+# Reject dictionary words
+dictcheck = 1
+
+# Number of characters that must differ from the previous password
+difok = 3
+
+# Reject passwords with more than 3 consecutive identical characters
+maxrepeat = 3
+
+# Reject passwords with more than 4 consecutive characters from the same class
+maxclassrepeat = 4
+```
+
+Test a password against the policy without changing it:
+
+```bash
+pwscore <<< "your-test-passphrase"
+```
+
+A score of 100 means the password passes. A non-zero exit code with output means it was rejected — and why.
+
+## Password aging with chage and login.defs
+
+Set system-wide defaults for new accounts in `/etc/login.defs`:
+
+```bash
+sudo nano /etc/login.defs
+```
+
+```ini
+# Maximum days before a password must be changed
+PASS_MAX_DAYS   90
+
+# Minimum days between password changes
+PASS_MIN_DAYS   1
+
+# Days before expiry to warn the user
+PASS_WARN_AGE   14
+
+# Lock account this many days after password expires (-1 = never)
+INACTIVE        30
+```
+
+:::note
+`/etc/login.defs` only applies to accounts created after you change it. Apply aging to existing accounts individually with `chage`.
+:::
+
+Apply aging to an existing user:
+
+```bash
+sudo chage \
+  --maxdays 90 \
+  --mindays 1 \
+  --warndays 14 \
+  --inactive 30 \
+  jdoe
+```
+
+View the current aging settings for a user:
+
+```bash
+sudo chage -l jdoe
+```
+
+Apply the same aging policy to all existing standard users in bulk:
+
+```bash
+#!/bin/bash
+# Apply password aging to all users with UID >= 1000
+while IFS=: read -r username _ uid _; do
+  if [[ "$uid" -ge 1000 ]]; then
+    chage --maxdays 90 --mindays 1 --warndays 14 --inactive 30 "$username"
+    echo "Applied aging policy to: $username"
+  fi
+done < /etc/passwd
+```
+
+## Account lockout with faillock
+
+`faillock` locks an account after too many failed login attempts. It is enabled by default on AlmaLinux and configured in `/etc/security/faillock.conf`.
+
+```bash
+sudo nano /etc/security/faillock.conf
+```
+
+Recommended settings:
+
+```ini
+# Lock after 5 failed attempts
+deny = 5
+
+# Count failures within a 15-minute window
+fail_interval = 900
+
+# Lock for 15 minutes (900 seconds). Set to 0 to require manual unlock.
+unlock_time = 900
+
+# Also apply lockout to the root account
+even_deny_root = true
+
+# Audit all lockout events
+audit = true
+
+# Log successful logins too
+silent = false
+```
+
+Apply the faillock profile via authselect:
+
+```bash
+sudo authselect select sssd with-faillock --force
+```
+
+### Check and manage locked accounts
+
+```bash
+# View failed attempts for a specific user
+faillock --user jdoe
+
+# Unlock a locked account
+sudo faillock --user jdoe --reset
+
+# List all users with recorded failures
+faillock
+```
+
+## Restrict root login
+
+Allowing direct root login over SSH is a significant risk. Disable it and require users to escalate via sudo.
+
+```bash
+sudo nano /etc/ssh/sshd_config
+```
+
+```ini
+PermitRootLogin no
+```
+
+Restart SSH:
+
+```bash
+sudo systemctl restart sshd
+```
+
+Also prevent root from logging in on local terminals by restricting `/etc/securetty`:
+
+```bash
+# Remove all entries to prevent root login on any tty
+sudo truncate -s 0 /etc/securetty
+```
+
+Or lock the root password entirely and rely on sudo for all privilege escalation:
+
+```bash
+sudo passwd --lock root
+```
+
+## Restrict su access
+
+By default, any user can attempt `su` to switch to another account. Restrict `su` to the `wheel` group only:
+
+```bash
+sudo nano /etc/pam.d/su
+```
+
+Uncomment or add:
+
+```
+auth  required  pam_wheel.so use_uid
+```
+
+This means only members of `wheel` can use `su` to become root.
+
+## SELinux user confinement
+
+SELinux maps Linux users to SELinux users, which restricts what confined users can do even if they have a shell. This adds a layer of protection that goes beyond standard Unix permissions.
+
+### View the current SELinux user mappings
+
+```bash
+sudo semanage login -l
+```
+
+Example output:
+
+```
+Login Name           SELinux User         MLS/MCS Range
+__default__          unconfined_u         s0-s0:c0.c1023
+root                 unconfined_u         s0-s0:c0.c1023
+jdoe                 staff_u              s0-s0:c0.c1023
+```
+
+### Common SELinux users
+
+| SELinux User | What it allows |
+|---|---|
+| `unconfined_u` | No SELinux restrictions — full access |
+| `staff_u` | Can use sudo, but restricted in other ways |
+| `user_u` | Standard confined user — no sudo, no su |
+| `sysadm_u` | Full system administration with SELinux awareness |
+| `guest_u` | Very restricted — no networking, no sudo |
+
+### Map a Linux user to a confined SELinux user
+
+```bash
+# Confine a standard user
+sudo semanage login -a -s user_u jdoe
+
+# Give an admin staff-level SELinux access
+sudo semanage login -a -s staff_u adminuser
+
+# Remove a custom mapping (reverts to __default__)
+sudo semanage login -d jdoe
+```
+
+### Change the default SELinux user for all new accounts
+
+```bash
+# Confine all new users by default
+sudo semanage login -m -s user_u __default__
+```
+
+:::warning
+Changing the default SELinux user affects all new logins. Test thoroughly in a non-production environment before applying to production systems.
+:::
+
+### Verify a user's SELinux context after login
+
+```bash
+# As the user
+id -Z
+
+# From root
+sudo semanage login -l | grep jdoe
+```
+
+## Umask policy
+
+The umask controls default file permissions for new files and directories. Set a restrictive default in `/etc/profile` or `/etc/bashrc`.
+
+```bash
+sudo nano /etc/profile
+```
+
+Add or update:
+
+```bash
+# Restrict new files to owner read/write only (no group or world access)
+umask 027
+```
+
+For stricter environments:
+
+```bash
+# No access for group or others
+umask 077
+```
+
+Apply it system-wide so it takes effect for all users on next login:
+
+```bash
+sudo nano /etc/bashrc
+```
+
+Add the same `umask` line at the bottom.
+
+## Limit login sessions per user
+
+Use `pam_limits` to cap how many simultaneous sessions a user can open:
+
+```bash
+sudo nano /etc/security/limits.conf
+```
+
+```ini
+# Limit standard users to 3 simultaneous sessions
+*         hard  maxlogins  3
+
+# Limit service accounts to 1
+appservice hard  maxlogins  1
+
+# No limit for wheel members
+@wheel    hard  maxlogins  unlimited
+```
+
+## Enforce a login banner
+
+A legal login banner warns users that the system is monitored and unauthorized access is prohibited. This is often required for compliance.
+
+```bash
+sudo nano /etc/issue
+```
+
+Example:
+
+```
+WARNING: Authorized users only. All activity on this system is monitored
+and logged. Unauthorized access is prohibited and will be prosecuted.
+```
+
+For SSH, point `sshd_config` to the banner file:
+
+```bash
+sudo nano /etc/ssh/sshd_config
+```
+
+```ini
+Banner /etc/issue
+```
+
+Restart SSH:
+
+```bash
+sudo systemctl restart sshd
+```
+
+## Apply a CIS or DISA STIG baseline with OpenSCAP
+
+For environments that require formal compliance — CIS benchmarks, DISA STIG, PCI-DSS — OpenSCAP automates scanning and remediation.
+
+### Install OpenSCAP
+
+```bash
+sudo dnf install -y openscap-scanner scap-security-guide
+```
+
+### List available profiles
+
+```bash
+oscap info /usr/share/xml/scap/ssg/content/ssg-almalinux9-ds.xml | grep "Profile ID"
+```
+
+### Run a compliance scan
+
+```bash
+sudo oscap xccdf eval \
+  --profile xccdf_org.ssgproject.content_profile_cis \
+  --results /tmp/scan-results.xml \
+  --report /tmp/scan-report.html \
+  /usr/share/xml/scap/ssg/content/ssg-almalinux9-ds.xml
+```
+
+Open the HTML report to review findings:
+
+```bash
+# Copy to a web-accessible location or view locally
+ls -lh /tmp/scan-report.html
+```
+
+### Generate a remediation script
+
+```bash
+sudo oscap xccdf generate fix \
+  --profile xccdf_org.ssgproject.content_profile_cis \
+  --output /tmp/remediation.sh \
+  /usr/share/xml/scap/ssg/content/ssg-almalinux9-ds.xml
+```
+
+:::warning
+Always review the remediation script before running it. Some fixes may affect services or configurations that your environment depends on.
+:::
+
+## Common mistakes
+
+### Not applying aging policy to existing users
+
+`/etc/login.defs` only affects new accounts. Use the bulk `chage` script above to bring existing accounts into compliance.
+
+### Leaving root login enabled over SSH
+
+```bash
+# Verify root login is disabled
+sudo grep PermitRootLogin /etc/ssh/sshd_config
+# PermitRootLogin no
+```
+
+### Setting unlock_time = 0 without a manual unlock process
+
+`unlock_time = 0` requires an administrator to manually reset locked accounts. Make sure your team has a clear process for handling this before applying it.
+
+```bash
+sudo faillock --user jdoe --reset
+```
+
+### Ignoring SELinux denials
+
+SELinux denials are logged to the audit log. Silently disabling SELinux hides real problems instead of solving them.
+
+```bash
+# Check for recent SELinux denials
+sudo ausearch -m AVC -ts recent
+
+# Generate a human-readable summary
+sudo aureport --avc
+```
+
+## Summary
+
+A layered security policy on AlmaLinux combines password quality, account lockout, login restrictions, SELinux confinement, and compliance scanning into a coherent defense.
+
+Key points:
+
+- configure password quality in `/etc/security/pwquality.conf`
+- set aging defaults in `/etc/login.defs` and apply them to existing users with `chage`
+- enable and tune `faillock` to protect against brute force
+- disable root SSH login and restrict `su` to the `wheel` group
+- map users to confined SELinux users for defense in depth
+- enforce a login banner for legal and compliance coverage
+- use OpenSCAP to scan and remediate against CIS or STIG baselines
+
+:::tip Related pages
+- [Authentication Systems](./authentication-systems)
+- [Sudo & Privileges](./sudo-privileges)
+- [LDAP Integration](./ldap-integration)
+- [User Auditing](./user-auditing)
+:::

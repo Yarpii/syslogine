@@ -1,0 +1,391 @@
+---
+sidebar_position: 1
+title: "Process Discovery | AlmaLinux"
+sidebar_label: "Process Discovery"
+description: "Discover and inspect processes on AlmaLinux with ps, pgrep, pstree, and systemctl for comprehensive process visibility."
+keywords:
+  - "almalinux process discovery"
+  - "almalinux ps"
+  - "almalinux pgrep"
+  - "almalinux pstree"
+  - "rhel process visibility"
+tags:
+  - almalinux
+  - process-management
+  - system-administration
+slug: /linux/almalinux/administration/process-management/process-discovery
+---
+
+# Process Discovery
+
+Before you can manage a process, you need to find it. AlmaLinux provides a rich set of tools for discovering what is running, who owns it, what resources it is consuming, and how it relates to other processes. Getting comfortable with these tools is the foundation of effective process management.
+
+## Install required tools
+
+Most tools are available by default. Install any that are missing:
+
+```bash
+sudo dnf install -y \
+  procps-ng \
+  psmisc \
+  util-linux \
+  lsof
+```
+
+## List processes with ps
+
+`ps` is the standard tool for listing processes at a point in time.
+
+```bash
+# Show all processes with full details
+ps aux
+
+# Show all processes in full format
+ps -ef
+
+# Show a process tree with full format
+ps -efH
+
+# Show only processes for the current user
+ps -u $USER
+```
+
+### Sort and filter ps output
+
+```bash
+# Sort by CPU usage
+ps aux --sort=-%cpu | head -15
+
+# Sort by memory usage
+ps aux --sort=-%mem | head -15
+
+# Sort by start time
+ps aux --sort=start_time | head -15
+
+# Show specific columns only
+ps -eo pid,ppid,user,%cpu,%mem,vsz,rss,stat,comm
+
+# Show a specific process by name
+ps aux | grep nginx | grep -v grep
+```
+
+### Useful ps output columns
+
+| Column | Meaning |
+|--------|---------|
+| `PID` | Process ID |
+| `PPID` | Parent process ID |
+| `USER` | Owner of the process |
+| `%CPU` | CPU usage since process started |
+| `%MEM` | Percentage of physical memory used |
+| `VSZ` | Virtual memory size (KB) |
+| `RSS` | Resident set size — actual RAM in use (KB) |
+| `STAT` | Process state |
+| `START` | Time the process started |
+| `CMD` | Full command that started the process |
+
+### Process states explained
+
+| State | Meaning |
+|-------|---------|
+| `R` | Running or runnable |
+| `S` | Sleeping — waiting for an event |
+| `D` | Uninterruptible sleep — usually I/O wait |
+| `Z` | Zombie — finished but not reaped by parent |
+| `T` | Stopped |
+| `I` | Idle kernel thread |
+
+:::tip
+A high number of `D` state processes usually points to a storage bottleneck. Zombie processes (`Z`) in large numbers indicate a parent process is not cleaning up after its children.
+:::
+
+## Find processes with pgrep
+
+`pgrep` searches for processes by name or attribute and returns their PIDs — much cleaner than `ps | grep`.
+
+```bash
+# Find PIDs by process name
+pgrep nginx
+
+# Find PIDs and show process names
+pgrep -a nginx
+
+# Find PIDs owned by a specific user
+pgrep -u jdoe
+
+# Find PIDs matching a pattern
+pgrep -a "php-fpm"
+
+# Count matching processes
+pgrep -c nginx
+
+# Find processes with exact name match
+pgrep -x nginx
+
+# Find processes older than 1 hour (3600 seconds)
+pgrep -O 3600
+```
+
+## View process tree with pstree
+
+`pstree` shows the parent-child relationships between processes — essential for understanding how services spawn workers and threads.
+
+```bash
+# Full process tree
+pstree
+
+# Show PIDs alongside names
+pstree -p
+
+# Show tree for a specific user
+pstree -u jdoe
+
+# Show tree rooted at a specific PID
+pstree -p 1234
+
+# Show command arguments
+pstree -a
+
+# Show thread counts
+pstree -T
+```
+
+Example output for nginx:
+
+```
+nginx(1234)─┬─nginx(1235)
+            ├─nginx(1236)
+            └─nginx(1237)
+```
+
+This shows the master process and its worker processes at a glance.
+
+## Discover processes with systemctl
+
+On AlmaLinux, most long-running processes are managed by systemd. `systemctl` gives you a service-level view that is often more useful than raw PID inspection.
+
+```bash
+# List all active services
+systemctl list-units --type=service --state=active
+
+# List all failed services
+systemctl list-units --type=service --state=failed
+
+# List all services (active, inactive, failed)
+systemctl list-units --type=service --all
+
+# Status of a specific service including its main PID
+systemctl status nginx
+
+# Show the main PID of a service
+systemctl show nginx --property=MainPID
+
+# Show all PIDs belonging to a service
+systemctl status nginx | grep "Main PID\|Tasks"
+```
+
+### Find which service owns a process
+
+```bash
+# Find the service a PID belongs to
+systemctl status $(pgrep nginx | head -1)
+
+# Or use the cgroup path
+cat /proc/$(pgrep nginx | head -1)/cgroup
+```
+
+## Find processes by file or socket
+
+```bash
+# Which process is listening on port 80
+sudo ss -tlnp | grep :80
+
+# Which process has a specific file open
+sudo lsof /var/log/nginx/access.log
+
+# Which process is using a specific directory
+sudo lsof +D /var/www/html
+
+# All files open by a specific process
+sudo lsof -p $(pgrep nginx | head -1)
+
+# All network connections for a process
+sudo lsof -i -p $(pgrep nginx | head -1)
+```
+
+## Inspect a process in /proc
+
+Every running process has a directory under `/proc` that exposes its internal state.
+
+```bash
+PID=$(pgrep nginx | head -1)
+
+# Full command line
+cat /proc/$PID/cmdline | tr '\0' ' '
+
+# Environment variables
+cat /proc/$PID/environ | tr '\0' '\n'
+
+# Current working directory
+ls -la /proc/$PID/cwd
+
+# Open file descriptors
+ls -la /proc/$PID/fd
+
+# Memory maps
+cat /proc/$PID/maps
+
+# Process status
+cat /proc/$PID/status
+
+# Resource limits
+cat /proc/$PID/limits
+
+# Cgroup membership
+cat /proc/$PID/cgroup
+```
+
+## Discover all processes for a user
+
+```bash
+# All processes owned by a user
+ps -u jdoe
+
+# With full details
+ps -u jdoe -o pid,ppid,%cpu,%mem,stat,start,cmd
+
+# All PIDs for a user
+pgrep -u jdoe
+
+# Kill all processes for a user (use with care)
+sudo pkill -u jdoe
+```
+
+## Find recently started processes
+
+```bash
+# Processes sorted by start time, most recent first
+ps -eo pid,ppid,user,start,cmd --sort=-start | head -20
+
+# Processes started in the last 5 minutes
+ps -eo pid,ppid,user,lstart,cmd | awk -v date="$(date -d '5 minutes ago' '+%b %e %H:%M')" '$0 > date'
+```
+
+## Check process resource limits
+
+```bash
+# Limits for a specific PID
+cat /proc/$(pgrep nginx | head -1)/limits
+
+# System-wide default limits
+ulimit -a
+
+# Limits for a systemd service
+systemctl show nginx | grep -E "Limit|Tasks"
+```
+
+## Scripted process discovery
+
+A script to generate a snapshot report of running processes, grouped by user and service:
+
+```bash
+#!/bin/bash
+# process-snapshot.sh — generate a process summary report
+
+OUTPUT="/tmp/process-snapshot-$(date +%F-%H%M).txt"
+
+{
+  echo "=== Process Snapshot: $(date) on $(hostname) ==="
+  echo ""
+
+  echo "--- Top 10 CPU consumers ---"
+  ps aux --sort=-%cpu | head -11
+  echo ""
+
+  echo "--- Top 10 Memory consumers ---"
+  ps aux --sort=-%mem | head -11
+  echo ""
+
+  echo "--- Process count per user ---"
+  ps aux | awk 'NR>1 {print $1}' | sort | uniq -c | sort -rn
+  echo ""
+
+  echo "--- Failed systemd services ---"
+  systemctl list-units --type=service --state=failed --no-legend
+  echo ""
+
+  echo "--- Zombie processes ---"
+  ps aux | awk '$8 == "Z" {print $0}'
+  echo ""
+
+  echo "--- D-state processes (I/O wait) ---"
+  ps aux | awk '$8 ~ /D/ {print $0}'
+  echo ""
+
+  echo "--- Listening ports and owners ---"
+  ss -tlnp
+  echo ""
+
+} | tee "$OUTPUT"
+
+echo "Report saved to $OUTPUT"
+```
+
+```bash
+chmod +x /usr/local/bin/process-snapshot.sh
+sudo bash /usr/local/bin/process-snapshot.sh
+```
+
+## Common mistakes
+
+### Using ps | grep instead of pgrep
+
+```bash
+# WRONG — also matches the grep process itself
+ps aux | grep nginx
+
+# CORRECT — clean PID list
+pgrep -a nginx
+```
+
+### Assuming %CPU in ps is a real-time figure
+
+`ps` calculates `%CPU` as an average since the process started. For current CPU usage use `top`, `htop`, or `pidstat`.
+
+### Not checking /proc for detailed process info
+
+`ps` output is a summary. `/proc/<PID>/` exposes everything — open files, memory maps, environment, limits, and cgroup membership — without any extra tools.
+
+```bash
+cat /proc/$(pgrep nginx | head -1)/status
+```
+
+### Ignoring zombie and D-state processes
+
+A handful of zombies is normal. Many zombies or many D-state processes are symptoms of real problems that need investigation.
+
+```bash
+# Quick check
+ps aux | awk '$8 ~ /Z|D/ {count[$8]++} END {for (s in count) print count[s], s " state processes"}'
+```
+
+## Summary
+
+Process discovery on AlmaLinux combines traditional Unix tools with systemd's service-level view to give you complete visibility into what is running and why.
+
+Key points:
+
+- use `ps aux --sort=-%cpu` and `--sort=-%mem` for quick sorted snapshots
+- use `pgrep -a` instead of `ps | grep` for clean PID lookups
+- use `pstree -p` to understand parent-child relationships
+- use `systemctl list-units` and `systemctl status` for service-level discovery
+- use `lsof` and `ss` to find which process owns a port or file
+- inspect `/proc/<PID>/` for deep process details without extra tools
+- watch for zombie and D-state processes as early warning signs
+
+:::tip Related pages
+- [Process Control](./process-control)
+- [Process Priority](./process-priority)
+- [Process Relationships](./process-relationships)
+- [Process Monitoring](./process-monitoring)
+:::

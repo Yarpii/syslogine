@@ -1,0 +1,490 @@
+---
+sidebar_position: 1
+title: "Resource Monitoring | AlmaLinux"
+sidebar_label: "Resource Monitoring"
+description: "Monitor CPU, memory, and disk usage on AlmaLinux with htop, sar, iostat, vmstat, and systemd resource tracking."
+keywords:
+  - "almalinux resource monitoring"
+  - "almalinux htop"
+  - "almalinux sar"
+  - "almalinux iostat"
+  - "rhel performance monitoring"
+tags:
+  - almalinux
+  - system-monitoring
+  - performance
+  - cpu
+  - memory
+slug: /linux/almalinux/administration/system-monitoring/resource-monitoring
+---
+
+# Resource Monitoring
+
+Knowing what your system is doing with CPU, memory, and disk at any given moment is the foundation of good operations. AlmaLinux provides a range of tools — from quick interactive overviews to detailed historical analysis — that give you the visibility you need to catch problems early and plan capacity effectively.
+
+## Install monitoring tools
+
+Most tools are available from the default AlmaLinux repositories:
+
+```bash
+sudo dnf install -y \
+  htop \
+  sysstat \
+  procps-ng \
+  util-linux \
+  dstat \
+  glances
+```
+
+The `sysstat` package provides `sar`, `iostat`, `mpstat`, and `pidstat`. Enable its collection service so historical data is available:
+
+```bash
+sudo systemctl enable --now sysstat
+```
+
+## CPU monitoring
+
+### Quick CPU overview with top
+
+```bash
+top
+```
+
+Useful `top` keybindings while running:
+
+| Key | Action |
+|-----|--------|
+| `1` | Show per-core CPU usage |
+| `M` | Sort by memory usage |
+| `P` | Sort by CPU usage |
+| `k` | Kill a process by PID |
+| `q` | Quit |
+
+### Interactive monitoring with htop
+
+`htop` gives a colour-coded, easier-to-read view of CPU, memory, and processes:
+
+```bash
+htop
+```
+
+To filter by user:
+
+```bash
+htop -u jdoe
+```
+
+### CPU usage per core with mpstat
+
+```bash
+# Snapshot of all CPU cores
+mpstat -P ALL
+
+# Update every 2 seconds, 5 times
+mpstat -P ALL 2 5
+```
+
+### Historical CPU usage with sar
+
+`sar` reads from the sysstat collection files to show historical data:
+
+```bash
+# CPU usage for today
+sar -u
+
+# CPU usage every 5 minutes for the last hour
+sar -u 300 12
+
+# CPU usage from a specific date
+sar -u -f /var/log/sa/sa$(date +%d)
+
+# Average CPU usage broken down by user, system, iowait
+sar -u ALL
+```
+
+### Check CPU info
+
+```bash
+# Number of CPUs and cores
+lscpu
+
+# Quick core count
+nproc
+
+# Detailed CPU flags and features
+cat /proc/cpuinfo | grep "model name" | head -1
+cat /proc/cpuinfo | grep "cpu cores" | head -1
+```
+
+### Monitor CPU load averages
+
+Load average shows how many processes are waiting for CPU time. On a system with 4 cores, a load average above 4.0 means the CPU is saturated.
+
+```bash
+# Current load average (1, 5, 15 minute averages)
+uptime
+
+# Continuous load average updates
+watch -n 1 uptime
+
+# Load average from /proc
+cat /proc/loadavg
+```
+
+## Memory monitoring
+
+### Current memory usage
+
+```bash
+# Human-readable overview
+free -h
+
+# Update every 2 seconds
+watch -n 2 free -h
+```
+
+Example output:
+
+```
+              total        used        free      shared  buff/cache   available
+Mem:           15Gi       3.2Gi       8.1Gi       512Mi       4.1Gi        11Gi
+Swap:           3Gi          0B        3Gi
+```
+
+:::tip
+The `available` column is more useful than `free`. It shows how much memory is actually available for new processes, including what can be reclaimed from buffers and cache.
+:::
+
+### Detailed memory usage with vmstat
+
+```bash
+# Snapshot
+vmstat
+
+# Update every 2 seconds
+vmstat 2
+
+# Show memory stats in megabytes
+vmstat -S M 2
+```
+
+Key vmstat columns:
+
+| Column | Meaning |
+|--------|---------|
+| `swpd` | Swap in use (KB) |
+| `free` | Free memory (KB) |
+| `buff` | Buffer memory (KB) |
+| `cache` | Cache memory (KB) |
+| `si` | Swap in (KB/s) |
+| `so` | Swap out (KB/s) |
+| `wa` | CPU time waiting for I/O (%) |
+
+### Historical memory usage with sar
+
+```bash
+# Memory usage for today
+sar -r
+
+# Memory usage every 5 minutes
+sar -r 300 12
+
+# Include huge pages
+sar -R
+```
+
+### Check swap usage
+
+```bash
+# Current swap usage
+swapon --show
+
+# Detailed swap stats
+cat /proc/swaps
+
+# Processes using the most swap
+for file in /proc/*/status; do
+  awk '/VmSwap|Name/{printf $2 " " $3 "\n"}' "$file"
+done | sort -k 2 -n -r | head -10
+```
+
+### Memory usage per process
+
+```bash
+# Top memory consumers
+ps aux --sort=-%mem | head -15
+
+# Resident set size for a specific process
+ps -p $(pgrep nginx) -o pid,rss,vsz,comm
+```
+
+## Disk usage monitoring
+
+### Check filesystem usage
+
+```bash
+# All mounted filesystems
+df -h
+
+# Show inode usage (important for email servers and containers)
+df -i
+
+# Show a specific mount point
+df -h /var
+```
+
+### Find large files and directories
+
+```bash
+# Top 10 largest directories under /var
+du -h /var --max-depth=2 | sort -rh | head -10
+
+# Find files larger than 500MB
+sudo find / -type f -size +500M -exec ls -lh {} \; 2>/dev/null
+
+# Find the largest files in /var/log
+du -ah /var/log | sort -rh | head -20
+```
+
+### Disk I/O with iostat
+
+```bash
+# Snapshot of disk I/O
+iostat
+
+# Extended stats, update every 2 seconds
+iostat -x 2
+
+# Stats for a specific device
+iostat -x sda 2
+```
+
+Key iostat columns:
+
+| Column | Meaning |
+|--------|---------|
+| `r/s` | Reads per second |
+| `w/s` | Writes per second |
+| `rMB/s` | MB read per second |
+| `wMB/s` | MB written per second |
+| `await` | Average wait time for I/O (ms) |
+| `%util` | Percentage of time the device was busy |
+
+A `%util` consistently above 80% suggests the disk is becoming a bottleneck.
+
+### Historical I/O with sar
+
+```bash
+# Block device I/O for today
+sar -b
+
+# Per-device I/O
+sar -d
+
+# I/O every 5 minutes
+sar -b 300 12
+```
+
+## Combined resource overview with dstat
+
+`dstat` shows CPU, memory, disk, and network in a single rolling view:
+
+```bash
+# Default combined view
+dstat
+
+# Add timestamp and top process columns
+dstat -cdngy --top-cpu --top-mem 2
+
+# Write output to a CSV file for later analysis
+dstat --output /tmp/dstat-$(date +%F).csv 2 60
+```
+
+## System-wide overview with glances
+
+`glances` gives a comprehensive dashboard view in the terminal:
+
+```bash
+glances
+```
+
+Run as a web server for remote access:
+
+```bash
+glances -w
+# Access at http://serverip:61208
+```
+
+## systemd resource tracking with systemd-cgtop
+
+`systemd-cgtop` shows resource usage broken down by systemd service and cgroup:
+
+```bash
+# Live view of resource usage per service
+systemd-cgtop
+
+# Sort by memory usage
+systemd-cgtop -m
+
+# Sort by CPU usage
+systemd-cgtop -c
+```
+
+Check resource usage for a specific service:
+
+```bash
+# CPU and memory for a unit
+systemctl status nginx
+
+# Detailed cgroup stats
+systemd-cgls /system.slice/nginx.service
+
+# Memory usage via cgroup directly
+cat /sys/fs/cgroup/system.slice/nginx.service/memory.current
+```
+
+## Set resource limits on services
+
+Use systemd unit overrides to cap CPU and memory for a service:
+
+```bash
+sudo systemctl edit nginx
+```
+
+Add:
+
+```ini
+[Service]
+# Cap memory at 512MB
+MemoryMax=512M
+
+# Limit to 50% of one CPU core
+CPUQuota=50%
+
+# Set CPU scheduling weight (default 100, lower = less priority)
+CPUWeight=50
+```
+
+Reload and restart:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl restart nginx
+```
+
+Verify the limits are applied:
+
+```bash
+systemctl show nginx | grep -E "Memory|CPU"
+```
+
+## Automate resource checks with a script
+
+A basic script to alert when CPU, memory, or disk exceed thresholds:
+
+```bash
+#!/bin/bash
+# resource-check.sh — alert when resources exceed thresholds
+
+CPU_THRESHOLD=85
+MEM_THRESHOLD=90
+DISK_THRESHOLD=85
+ALERT_EMAIL="ops@example.com"
+
+HOSTNAME=$(hostname)
+ALERTS=()
+
+# CPU load average check (compare 1-min avg against core count)
+CORES=$(nproc)
+LOAD=$(awk '{print $1}' /proc/loadavg)
+LOAD_PCT=$(awk "BEGIN {printf \"%d\", ($LOAD / $CORES) * 100}")
+
+if [[ "$LOAD_PCT" -gt "$CPU_THRESHOLD" ]]; then
+  ALERTS+=("CPU load at ${LOAD_PCT}% (load avg: ${LOAD}, cores: ${CORES})")
+fi
+
+# Memory check
+MEM_USED_PCT=$(free | awk '/Mem:/ {printf "%d", ($3/$2)*100}')
+if [[ "$MEM_USED_PCT" -gt "$MEM_THRESHOLD" ]]; then
+  ALERTS+=("Memory usage at ${MEM_USED_PCT}%")
+fi
+
+# Disk check — all mounted filesystems
+while read -r line; do
+  USE=$(echo "$line" | awk '{print $5}' | tr -d '%')
+  MOUNT=$(echo "$line" | awk '{print $6}')
+  if [[ "$USE" -gt "$DISK_THRESHOLD" ]]; then
+    ALERTS+=("Disk ${MOUNT} at ${USE}%")
+  fi
+done < <(df -h | tail -n +2)
+
+# Send alert if any threshold was exceeded
+if [[ "${#ALERTS[@]}" -gt 0 ]]; then
+  MESSAGE="Resource alert on ${HOSTNAME}:\n\n$(printf '%s\n' "${ALERTS[@]}")"
+  echo -e "$MESSAGE" | mail -s "Resource Alert: ${HOSTNAME}" "$ALERT_EMAIL"
+  echo -e "$MESSAGE"
+fi
+```
+
+Schedule it with cron to run every 5 minutes:
+
+```bash
+sudo crontab -e
+```
+
+```
+*/5 * * * * /usr/local/bin/resource-check.sh >> /var/log/resource-check.log 2>&1
+```
+
+## Common mistakes
+
+### Confusing free memory with available memory
+
+`free` in the `free -h` output does not include reclaimable cache. Use the `available` column to judge how much memory is actually free for new workloads.
+
+### Treating high load average without checking core count
+
+A load average of 8.0 is fine on a 16-core machine but severe on a 2-core machine. Always compare load average against `nproc`.
+
+```bash
+nproc && uptime
+```
+
+### Not enabling the sysstat service
+
+Without the sysstat collection service running, `sar` has no historical data to query.
+
+```bash
+sudo systemctl enable --now sysstat
+```
+
+### Ignoring iowait
+
+High `wa` (iowait) in `top`, `mpstat`, or `vmstat` means the CPU is waiting for disk I/O. The bottleneck is not CPU — it is storage.
+
+```bash
+# Check iowait
+mpstat 1 5 | awk '/Average/ {print "iowait: " $6 "%"}'
+```
+
+## Summary
+
+Effective resource monitoring on AlmaLinux combines real-time tools for immediate visibility with historical data collection for trend analysis and capacity planning.
+
+Key points:
+
+- use `htop` or `top` for a quick interactive overview
+- use `mpstat` for per-core CPU breakdown
+- use `free -h` and watch the `available` column, not just `free`
+- use `iostat -x` to identify disk I/O bottlenecks
+- use `sar` for historical data — but only after enabling the sysstat service
+- use `systemd-cgtop` to see resource usage broken down by service
+- set `MemoryMax` and `CPUQuota` in systemd unit overrides to cap runaway services
+- script threshold checks and schedule them with cron for proactive alerting
+
+:::tip Related pages
+- [Process Monitoring](./process-monitoring)
+- [Storage Monitoring](./storage-monitoring)
+- [Performance Analysis](./performance-analysis)
+- [Metrics Collection](./metrics-collection)
+:::

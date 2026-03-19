@@ -1,0 +1,479 @@
+---
+sidebar_position: 7
+title: "System Auditing | AlmaLinux"
+sidebar_label: "System Auditing"
+description: "Implement compliance auditing on AlmaLinux using auditd, OpenSCAP, and configuration management tools. Track system changes, verify compliance, and generate audit reports."
+keywords:
+  - "almalinux system auditing"
+  - "almalinux auditd"
+  - "almalinux openscap"
+  - "almalinux compliance"
+  - "rhel system auditing"
+tags:
+  - almalinux
+  - system-maintenance
+  - auditing
+  - compliance
+  - openscap
+slug: /linux/almalinux/administration/system-maintenance/system-auditing
+---
+
+# System Auditing on AlmaLinux
+
+System auditing is the practice of systematically examining a system's configuration, activity, and state against a defined standard — whether that standard is a security framework like CIS or DISA STIG, an internal policy, or a regulatory requirement like PCI DSS or HIPAA. Auditing answers two related questions: is the system configured correctly right now, and has it been used correctly over time?
+
+On AlmaLinux, auditing is served by three complementary tools: `auditd` for continuous kernel-level event recording, OpenSCAP for policy-based configuration compliance scanning, and the `rpm` verification system for detecting unauthorized package file modifications. Together they provide a comprehensive audit capability covering both configuration state and runtime activity.
+
+This page focuses on the maintenance and operational aspects of auditing — running scans, generating reports, reviewing findings, and tracking remediation — rather than initial setup, which is covered in the [Audit Logging](../log-management/audit-logging) and [Security Automation](../task-scheduling/security-automation) pages.
+
+---
+
+## The Scope of System Auditing
+
+A complete system audit covers three distinct areas:
+
+**Configuration auditing** verifies that the system is configured according to policy. Examples: is SSH root login disabled, are unnecessary services stopped, are file permissions on sensitive files correct, are kernel parameters set to required values. OpenSCAP is the primary tool for this.
+
+**Activity auditing** records what users and processes have done on the system over time. Examples: which users logged in and from where, which commands were run with elevated privileges, which files were modified. `auditd` is the primary tool for this.
+
+**Integrity auditing** detects unauthorized changes to files, particularly system binaries, configuration files, and security-relevant data. Examples: has a system binary been replaced, has a configuration file been modified outside of a change management process. AIDE and `rpm -V` are the primary tools for this.
+
+---
+
+## Configuration Auditing with OpenSCAP
+
+### Understanding SCAP and Profiles
+
+SCAP (Security Content Automation Protocol) provides a standardized framework for expressing security policies as machine-readable rules. The `scap-security-guide` package ships with profiles aligned to common frameworks. Each profile is a collection of rules — checks that test specific configuration items — along with automated remediation scripts.
+
+Profiles available for AlmaLinux 9:
+
+```bash
+oscap info /usr/share/xml/scap/ssg/content/ssg-almalinux9-ds.xml \
+    | grep "Profile ID" | head -20
+```
+
+### Running a Compliance Scan
+
+A full compliance scan evaluates the system against every rule in the selected profile:
+
+```bash
+oscap xccdf eval \
+    --profile xccdf_org.ssgproject.content_profile_cis \
+    --results /var/log/audit/oscap-results-$(date +%Y%m%d).xml \
+    --report /var/log/audit/oscap-report-$(date +%Y%m%d).html \
+    /usr/share/xml/scap/ssg/content/ssg-almalinux9-ds.xml
+```
+
+The exit code indicates the overall result:
+- `0` — all rules passed
+- `1` — some rules failed
+- `2` — a runtime error occurred during the scan
+
+The HTML report is the most useful output for human review — it presents each rule's result, the rationale for the rule, and remediation guidance. Store the XML results for programmatic analysis and trend tracking.
+
+### Understanding Scan Results
+
+Each rule in the report has one of several results:
+
+| Result | Meaning |
+|---|---|
+| `pass` | The system satisfies this requirement |
+| `fail` | The system does not satisfy this requirement |
+| `notapplicable` | The rule does not apply to this system configuration |
+| `notchecked` | The rule requires manual verification |
+| `error` | The check encountered an error during evaluation |
+
+`notchecked` rules require human review — they test aspects of the system that cannot be evaluated automatically, such as whether a documented security policy exists or whether physical access controls are in place. Do not count them as passes in a compliance report.
+
+### Automated Remediation
+
+OpenSCAP can generate remediation scripts that address failing rules. This is a powerful capability but should be used with care in production — automated remediation makes changes to the running system and can break applications that depend on non-compliant configurations.
+
+Generate a bash remediation script without applying it:
+
+```bash
+oscap xccdf generate fix \
+    --profile xccdf_org.ssgproject.content_profile_cis \
+    --result-id "" \
+    --fix-type bash \
+    /usr/share/xml/scap/ssg/content/ssg-almalinux9-ds.xml \
+    > /root/oscap-remediation-$(date +%Y%m%d).sh
+```
+
+Review the generated script carefully before running it. Each remediation action is commented with the rule it addresses. Apply remediations selectively — fix rules that are safe to remediate automatically and address the rest manually.
+
+Generate an Ansible playbook instead of a bash script for environments using Ansible for configuration management:
+
+```bash
+oscap xccdf generate fix \
+    --profile xccdf_org.ssgproject.content_profile_cis \
+    --fix-type ansible \
+    /usr/share/xml/scap/ssg/content/ssg-almalinux9-ds.xml \
+    > /root/oscap-remediation-$(date +%Y%m%d).yml
+```
+
+### Tracking Compliance Over Time
+
+Running a single scan tells you the current compliance posture. Running scans periodically and comparing results tells you whether the posture is improving or drifting. Store scan results with the date in the filename and compare the failure counts:
+
+```bash
+# Count failures in today's scan
+grep -c 'result>fail<' /var/log/audit/oscap-results-$(date +%Y%m%d).xml
+
+# Count failures from last week's scan
+grep -c 'result>fail<' /var/log/audit/oscap-results-$(date -d "7 days ago" +%Y%m%d).xml
+```
+
+A rising failure count indicates configuration drift — changes to the system are moving it away from the desired state. A decreasing count indicates remediation efforts are working.
+
+---
+
+## Activity Auditing with auditd
+
+### Verifying auditd Is Active
+
+```bash
+auditctl -s | grep "enabled"
+```
+
+`enabled 2` means auditing is active and the ruleset is locked (the `-e 2` directive is in effect). `enabled 1` means auditing is active but the ruleset can be modified. `enabled 0` means auditing is disabled.
+
+### Reviewing the Audit Configuration
+
+```bash
+auditctl -l
+```
+
+This lists all currently active audit rules. Compare against the expected rules from your security policy to detect whether any have been dropped or modified.
+
+### Generating Daily Audit Reports
+
+`aureport` generates structured summary reports from the audit log. A daily report covering the previous day's activity gives administrators a consistent view of security-relevant events without reading raw audit records:
+
+```bash
+DATE_START=$(date -d yesterday '+%m/%d/%Y 00:00:01')
+DATE_END=$(date -d yesterday '+%m/%d/%Y 23:59:59')
+
+aureport --start "${DATE_START}" --end "${DATE_END}"
+```
+
+For a report focused on authentication events:
+
+```bash
+aureport -au --start "${DATE_START}" --end "${DATE_END}"
+```
+
+For a report focused on elevated privilege use:
+
+```bash
+aureport -c --start "${DATE_START}" --end "${DATE_END}"
+```
+
+For anomalies and unusual events:
+
+```bash
+aureport -a --start "${DATE_START}" --end "${DATE_END}"
+```
+
+### Querying Specific Audit Events
+
+`ausearch` retrieves specific events from the audit log. Key queries for routine audit review:
+
+To find all successful logins in the past 24 hours:
+
+```bash
+ausearch -m USER_LOGIN --success yes --start "24 hours ago" -i
+```
+
+To find all sudo command executions:
+
+```bash
+ausearch -k sudo_exec --start "24 hours ago" -i
+```
+
+To find modifications to the `/etc/passwd` file:
+
+```bash
+ausearch -k identity --start "24 hours ago" -i
+```
+
+To find all events from a specific user:
+
+```bash
+ausearch -ua alice --start "24 hours ago" -i
+```
+
+The `-i` flag interprets numeric values (UIDs, syscall numbers) into human-readable names.
+
+### Audit Log Retention
+
+The audit log must be retained for a period that satisfies compliance requirements. Configure retention in `/etc/audit/auditd.conf`:
+
+```bash
+nano /etc/audit/auditd.conf
+```
+
+```ini
+max_log_file = 50
+max_log_file_action = ROTATE
+num_logs = 20
+```
+
+With these settings, auditd maintains 20 rotated log files of up to 50 MB each, providing up to 1 GB of audit history. For compliance frameworks requiring 12 months of audit logs, ensure the total log volume is sufficient for the log generation rate, or forward logs to a central log server for long-term storage.
+
+To verify current audit log usage:
+
+```bash
+ls -lh /var/log/audit/
+du -sh /var/log/audit/
+```
+
+---
+
+## Integrity Auditing
+
+### Package File Verification with rpm -V
+
+The RPM database records the expected state of every file installed by a package — its permissions, ownership, size, and MD5 hash. `rpm -V` compares the current state of package files against this record:
+
+```bash
+rpm -V nginx
+```
+
+Each line of output represents a file that differs from the expected state. The format is an 8-character string of flags followed by the file type and path:
+
+```
+S.5....T. c /etc/nginx/nginx.conf
+```
+
+The flags indicate what changed:
+
+| Flag | Meaning |
+|---|---|
+| `S` | File size differs |
+| `M` | File permissions or type differ |
+| `5` | MD5 checksum differs |
+| `D` | Device major/minor number mismatch |
+| `L` | Symlink path differs |
+| `U` | File user (owner) differs |
+| `G` | File group differs |
+| `T` | Modification time differs |
+
+The `c` after the flags indicates the file is a configuration file — changes to configuration files are expected and do not necessarily indicate a problem. Changes to non-configuration files (binaries, libraries) are more significant.
+
+To verify all installed packages at once:
+
+```bash
+rpm -Va 2>/dev/null | grep -v "^....c" | head -50
+```
+
+The `grep -v "^....c"` filter excludes configuration file changes, showing only changes to non-configuration files. In a healthy system this output is empty or minimal. Unexpected entries — particularly for files in `/bin/`, `/sbin/`, `/usr/bin/`, or `/usr/sbin/` — warrant immediate investigation.
+
+### Scheduled Package Integrity Checks
+
+Run `rpm -Va` on a schedule and alert on unexpected changes:
+
+```bash
+nano /usr/local/sbin/rpm-integrity-check.sh
+```
+
+```bash
+#!/bin/bash
+# rpm-integrity-check.sh
+# Checks RPM package file integrity and alerts on unexpected changes.
+
+ALERT_EMAIL="security@example.com"
+LOGFILE="/var/log/audit/rpm-integrity.log"
+HOSTNAME=$(hostname -s)
+
+mkdir -p "$(dirname "${LOGFILE}")"
+log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "${LOGFILE}"; }
+
+log "RPM integrity check started"
+
+# Check all packages, exclude expected config file changes
+CHANGES=$(rpm -Va 2>/dev/null | grep -v "^....c")
+
+if [[ -n "${CHANGES}" ]]; then
+    log "Unexpected file changes detected"
+    {
+        echo "RPM integrity check found unexpected file changes on ${HOSTNAME} at $(date)"
+        echo ""
+        echo "${CHANGES}"
+        echo ""
+        echo "Changes to non-configuration files may indicate unauthorized modification."
+        echo "Full log: ${LOGFILE}"
+    } | mail -s "RPM Integrity Alert: ${HOSTNAME}" "${ALERT_EMAIL}"
+else
+    log "No unexpected changes detected"
+fi
+
+echo "${CHANGES}" >> "${LOGFILE}"
+log "RPM integrity check completed"
+```
+
+```bash
+chmod 700 /usr/local/sbin/rpm-integrity-check.sh
+```
+
+Schedule weekly — `rpm -Va` is slow on large systems and weekly frequency is sufficient for most environments:
+
+```bash
+echo "0 2 * * 0  root  /usr/local/sbin/rpm-integrity-check.sh" \
+    >> /etc/cron.d/auditing
+```
+
+### Reinstalling Packages with Modified Files
+
+When `rpm -V` reveals unexpected changes to a package's non-configuration files, the cleanest resolution is reinstalling the package to restore the expected state:
+
+```bash
+dnf reinstall nginx
+```
+
+This replaces all package-owned files with the versions from the repository, leaving configuration files unchanged. After reinstalling, run `rpm -V nginx` again to confirm the changes were resolved.
+
+---
+
+## Configuration Change Tracking
+
+Tracking what configuration changed, when, and by whom is a core audit requirement. Without this, investigating incidents requires reconstructing changes from imperfect evidence.
+
+### Using auditd to Track Configuration Changes
+
+Audit rules that watch `/etc/` for write and attribute changes record every modification to configuration files with the user who made the change, the process that made it, and the exact timestamp:
+
+```bash
+auditctl -w /etc/ -p wa -k etc_changes
+```
+
+To query these events:
+
+```bash
+ausearch -k etc_changes --start "7 days ago" -i | head -100
+```
+
+### Version Control for Configuration Files
+
+For environments where configuration files are managed as code, storing `/etc/` in a version control repository provides automatic tracking of every change with commit messages explaining the reason:
+
+```bash
+dnf install git
+cd /etc
+git init
+git add .
+git commit -m "Initial configuration baseline $(date +%Y-%m-%d)"
+```
+
+After each configuration change:
+
+```bash
+cd /etc
+git diff
+git add <changed-files>
+git commit -m "Change description — ticket YYYY-NNNN"
+```
+
+The git log then provides a complete history of every configuration change with its timestamp and explanation. This is a practice borrowed from infrastructure-as-code and is particularly valuable for systems subject to compliance audits where change history must be demonstrated.
+
+---
+
+## Generating Compliance Reports
+
+### Producing an Audit Report Package
+
+For compliance audits, a comprehensive report package typically includes:
+
+1. OpenSCAP scan results (HTML and XML)
+2. Audit log summary for the audit period
+3. Package integrity verification results
+4. A list of identified findings and their remediation status
+
+Generate each component:
+
+```bash
+REPORT_DIR="/var/log/audit/compliance-$(date +%Y%m)"
+mkdir -p "${REPORT_DIR}"
+
+# OpenSCAP scan
+oscap xccdf eval \
+    --profile xccdf_org.ssgproject.content_profile_cis \
+    --results "${REPORT_DIR}/oscap-results.xml" \
+    --report "${REPORT_DIR}/oscap-report.html" \
+    /usr/share/xml/scap/ssg/content/ssg-almalinux9-ds.xml
+
+# Audit summary for the current month
+aureport --start "$(date +%m/01/%Y) 00:00:01" \
+    > "${REPORT_DIR}/audit-summary.txt"
+
+# Package integrity check
+rpm -Va 2>/dev/null | grep -v "^....c" \
+    > "${REPORT_DIR}/rpm-integrity.txt"
+
+# System information
+{
+    echo "Hostname: $(hostname -f)"
+    echo "OS: $(cat /etc/almalinux-release)"
+    echo "Kernel: $(uname -r)"
+    echo "Report date: $(date)"
+    echo "Uptime: $(uptime -p)"
+} > "${REPORT_DIR}/system-info.txt"
+
+echo "Compliance report package: ${REPORT_DIR}"
+ls -lh "${REPORT_DIR}"
+```
+
+### Summarizing Compliance Posture
+
+For a quick summary of compliance posture suitable for a management dashboard or email:
+
+```bash
+PASS=$(grep -c 'result>pass<' "${REPORT_DIR}/oscap-results.xml" 2>/dev/null || echo 0)
+FAIL=$(grep -c 'result>fail<' "${REPORT_DIR}/oscap-results.xml" 2>/dev/null || echo 0)
+TOTAL=$(( PASS + FAIL ))
+PCT=$(( PASS * 100 / TOTAL ))
+
+echo "Compliance summary: ${PASS}/${TOTAL} rules passing (${PCT}%)"
+echo "Failing rules: ${FAIL}"
+```
+
+---
+
+## Audit Findings Management
+
+An audit that produces findings but does not track their resolution provides limited value. Each finding should be:
+
+1. **Documented** with the specific control that failed, the current state, and the required state
+2. **Prioritized** based on severity (Critical findings require faster resolution than Informational)
+3. **Assigned** to a responsible owner
+4. **Tracked** with a remediation deadline
+5. **Verified** after remediation with a re-scan of the specific control
+6. **Accepted** if remediation is not possible, with documented compensating controls and management sign-off
+
+For environments without a dedicated vulnerability management platform, a simple spreadsheet or ticketing system entry for each finding is sufficient as long as it captures these elements. The key is that findings do not simply disappear — they are tracked until either remediated or formally accepted with a compensating control.
+
+---
+
+## Summary
+
+System auditing on AlmaLinux combines configuration compliance scanning with OpenSCAP, continuous activity recording with auditd, and file integrity verification with AIDE and `rpm -V`. Together these tools answer whether the system is configured correctly, what has happened on it, and whether its files remain in their expected state.
+
+Key points to remember:
+
+- OpenSCAP HTML reports are the most human-readable compliance output; XML results enable programmatic trend analysis
+- `notchecked` rules require manual verification — do not count them as passed in compliance reports
+- Review generated remediation scripts carefully before applying in production — automated remediation can break applications
+- `rpm -Va | grep -v "^....c"` highlights non-configuration file changes that may indicate tampering
+- `rpm` reinstallation resolves unexpected file changes by restoring the package's expected state
+- Track compliance posture over time by storing scan results with dates and comparing failure counts between scans
+- Every audit finding needs an owner, a deadline, and a resolution — untracked findings accumulate into compliance debt
+- Store audit logs for the full retention period required by your compliance framework
+
+### Related Pages
+
+- [Audit Logging](../log-management/audit-logging) — configuring auditd rules and understanding audit records
+- [Security Patching](./security-patching) — applying security updates to address audit findings
+- [Package Management](./package-management) — reinstalling packages to restore file integrity
+- [Security Automation](../task-scheduling/security-automation) — scheduling automated compliance scans
+- [Maintenance Automation](./maintenance-automation) — integrating auditing into the maintenance cycle

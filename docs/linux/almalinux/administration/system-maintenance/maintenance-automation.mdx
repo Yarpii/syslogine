@@ -1,0 +1,518 @@
+---
+sidebar_position: 8
+title: "Maintenance Automation | AlmaLinux"
+sidebar_label: "Maintenance Automation"
+description: "Automate system maintenance on AlmaLinux with dnf-automatic, maintenance windows, systemd timers, and enterprise automation tools for consistent, reliable upkeep."
+keywords:
+  - "almalinux maintenance automation"
+  - "almalinux dnf-automatic"
+  - "almalinux maintenance windows"
+  - "almalinux automated maintenance"
+  - "rhel maintenance automation"
+tags:
+  - almalinux
+  - system-maintenance
+  - automation
+  - dnf-automatic
+  - systemd
+slug: /linux/almalinux/administration/system-maintenance/maintenance-automation
+---
+
+# Maintenance Automation on AlmaLinux
+
+Manual maintenance is inconsistent by nature — tasks get skipped when the team is busy, performed at inconvenient times, or done differently by different administrators. Automation enforces consistency: the same checks run on the same schedule, in the same way, on every system. The result is a more predictable maintenance posture and a smaller gap between what the maintenance policy says should happen and what actually happens.
+
+This page brings together the maintenance tasks covered across this section — package updates, security patching, system cleanup, performance verification, storage checks, service health, and compliance auditing — into a coordinated automation framework. The goal is a system where the majority of routine maintenance happens automatically, with humans involved only when something requires a decision or when automation detects a condition that warrants attention.
+
+---
+
+## Designing a Maintenance Automation Framework
+
+Before writing scripts and scheduling timers, design the framework on paper. A maintenance automation framework has four components:
+
+**Scheduled tasks** — the actual maintenance operations that run automatically: package updates, log rotation, disk checks, compliance scans.
+
+**Health checks** — lightweight checks that verify the system is in the expected state: services running, disk space below threshold, recent backups present.
+
+**Alerting** — notifications sent when a scheduled task fails or a health check detects a problem. Alerts should be actionable — they should tell the recipient what happened and what to do about it.
+
+**Reporting** — periodic summaries of system state delivered on a schedule, giving administrators a regular overview without requiring them to log in and check manually.
+
+Separating these concerns makes the framework easier to maintain. A failed health check sends an alert; a scheduled task logs its own result; a reporting job aggregates results and delivers them on a schedule.
+
+---
+
+## Automated Package Updates with dnf-automatic
+
+The most impactful maintenance automation on most systems is ensuring security updates are applied without manual intervention. `dnf-automatic` handles this on AlmaLinux.
+
+### Installation and Configuration
+
+```bash
+dnf install dnf-automatic
+```
+
+Configure `/etc/dnf/automatic.conf` for security-focused production use:
+
+```bash
+nano /etc/dnf/automatic.conf
+```
+
+```ini
+[commands]
+# Apply security updates only — feature updates require manual review
+upgrade_type = security
+
+# Download updates automatically
+download_updates = yes
+
+# Apply updates automatically — set to no for change-controlled environments
+apply_updates = yes
+
+# Never reboot automatically — schedule reboots explicitly in maintenance windows
+reboot = never
+
+[emitters]
+emit_via = email
+
+[email]
+email_from = dnf-automatic@yourhostname.example.com
+email_to = admin@example.com
+email_host = localhost
+
+[base]
+debuglevel = 1
+```
+
+### Enabling the Right Timer
+
+Several `dnf-automatic` timer variants exist. Enable the one that matches the configured behavior:
+
+```bash
+# For apply_updates = yes (applies security updates automatically)
+systemctl enable --now dnf-automatic.timer
+
+# For apply_updates = no (downloads only, for manual review)
+systemctl enable --now dnf-automatic-download.timer
+```
+
+Verify the timer is scheduled:
+
+```bash
+systemctl list-timers dnf-automatic.timer
+```
+
+### Monitoring dnf-automatic Results
+
+Check the journal after each run to confirm updates were applied correctly:
+
+```bash
+journalctl -u dnf-automatic.service -n 30
+```
+
+For a history of applied updates:
+
+```bash
+dnf history list | head -20
+```
+
+---
+
+## Defining Maintenance Windows
+
+A maintenance window is a defined time period during which changes to production systems are permitted. Maintenance automation should respect these windows — running potentially disruptive tasks (kernel updates, service restarts, filesystem checks) within the window rather than at arbitrary times.
+
+### Maintenance Window Design
+
+A typical maintenance window for a production server might be:
+
+- **Daily window:** 02:00–04:00 for routine maintenance (log rotation, cache cleanup, health checks)
+- **Weekly window:** Sunday 01:00–05:00 for more intensive tasks (full backups, compliance scans, kernel updates)
+- **Monthly window:** First Sunday of the month 00:00–06:00 for significant changes (major package updates, storage maintenance, performance review)
+
+Schedule all automated maintenance tasks to fall within these windows. Tasks that overrun their window should be monitored — a backup that regularly takes longer than its allotted time needs to be optimized or given a larger window.
+
+### Coordinating Tasks Within a Window
+
+Within a maintenance window, task sequencing matters. Some tasks must complete before others can start:
+
+```
+01:00  ReaR full backup (long, must finish before other tasks need the disk)
+02:00  Security updates (dnf upgrade --security)
+02:30  System cleanup (old kernels, DNF cache, log archives)
+03:00  Compliance scan (OpenSCAP, read-only — can run alongside other tasks)
+03:30  RPM integrity check (read-only — can run concurrently)
+04:00  Health verification (confirm all services running post-update)
+04:30  Maintenance summary report (email with results of all tasks)
+```
+
+Tasks that write heavily to disk (backups, package updates) should not overlap. Read-only tasks (compliance scans, integrity checks) can run concurrently with each other but should not overlap with write-intensive tasks on I/O-constrained systems.
+
+---
+
+## The Weekly Maintenance Script
+
+A single orchestration script that runs during the weekly maintenance window coordinates all the individual tasks, logs results, and sends a summary report:
+
+```bash
+nano /usr/local/sbin/weekly-maintenance.sh
+```
+
+```bash
+#!/bin/bash
+# weekly-maintenance.sh
+# Orchestrates weekly system maintenance tasks.
+# Designed to run during the weekly maintenance window (Sunday 01:00).
+
+HOSTNAME=$(hostname -s)
+LOGFILE="/var/log/maintenance/weekly-$(date +%Y%m%d).log"
+REPORT_EMAIL="admin@example.com"
+MAINTENANCE_DATE=$(date '+%Y-%m-%d %H:%M')
+RESULTS=()
+
+mkdir -p "$(dirname "${LOGFILE}")"
+
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "${LOGFILE}"
+}
+
+run_task() {
+    local TASK_NAME="$1"
+    local TASK_CMD="$2"
+    log "Starting: ${TASK_NAME}"
+    eval "${TASK_CMD}" >> "${LOGFILE}" 2>&1
+    local EXIT_CODE=$?
+    if [[ "${EXIT_CODE}" -eq 0 ]]; then
+        log "Completed: ${TASK_NAME} (OK)"
+        RESULTS+=("OK  ${TASK_NAME}")
+    else
+        log "Failed: ${TASK_NAME} (exit code: ${EXIT_CODE})"
+        RESULTS+=("FAIL ${TASK_NAME} (exit code: ${EXIT_CODE})")
+    fi
+    return "${EXIT_CODE}"
+}
+
+log "======================================================"
+log "Weekly maintenance started: ${MAINTENANCE_DATE}"
+log "======================================================"
+
+# ── Package maintenance ───────────────────────────────────────────────────────
+run_task "Security updates" \
+    "dnf upgrade --security -y --quiet"
+
+run_task "Remove old kernels" \
+    "dnf remove --oldinstallonly --setopt installonly_limit=2 -y --quiet"
+
+run_task "Clean DNF package cache" \
+    "dnf clean packages --quiet"
+
+# ── System cleanup ────────────────────────────────────────────────────────────
+run_task "Remove old log archives (90 days)" \
+    "find /var/log -name '*.gz' -mtime +90 -delete"
+
+run_task "Vacuum systemd journal" \
+    "journalctl --vacuum-size=1G --quiet"
+
+run_task "Clean temporary files" \
+    "systemd-tmpfiles --clean"
+
+# ── Storage verification ──────────────────────────────────────────────────────
+run_task "Disk space check" \
+    "/usr/local/sbin/check-disk-space.sh"
+
+run_task "SMART health check" \
+    "smartctl -H /dev/sda"
+
+# ── Security and compliance ───────────────────────────────────────────────────
+run_task "RPM integrity check" \
+    "/usr/local/sbin/rpm-integrity-check.sh"
+
+run_task "OpenSCAP compliance scan" \
+    "oscap xccdf eval \
+        --profile xccdf_org.ssgproject.content_profile_cis \
+        --results /var/log/audit/oscap-results-\$(date +%Y%m%d).xml \
+        --report /var/log/audit/oscap-report-\$(date +%Y%m%d).html \
+        /usr/share/xml/scap/ssg/content/ssg-almalinux9-ds.xml"
+
+# ── Service verification ──────────────────────────────────────────────────────
+run_task "Critical service check" \
+    "/usr/local/sbin/check-services.sh"
+
+# ── Summary report ────────────────────────────────────────────────────────────
+log "======================================================"
+log "Weekly maintenance completed"
+log "======================================================"
+
+FAILED_COUNT=$(printf '%s\n' "${RESULTS[@]}" | grep -c "^FAIL")
+PASSED_COUNT=$(printf '%s\n' "${RESULTS[@]}" | grep -c "^OK")
+
+{
+    echo "Weekly Maintenance Report: ${HOSTNAME}"
+    echo "Date: ${MAINTENANCE_DATE}"
+    echo ""
+    echo "Results: ${PASSED_COUNT} tasks succeeded, ${FAILED_COUNT} tasks failed"
+    echo ""
+    printf '%s\n' "${RESULTS[@]}"
+    echo ""
+    echo "System Status:"
+    echo "  Uptime:   $(uptime -p)"
+    echo "  Disk:     $(df -h / | awk 'NR==2{print $3 " used of " $2 " (" $5 ")"}')"
+    echo "  Memory:   $(free -h | awk '/^Mem:/{print $3 " used of " $2}')"
+    echo "  Services: $(systemctl --failed --no-legend | wc -l) failed"
+    echo ""
+    echo "Full log: ${LOGFILE}"
+} | mail -s "Weekly Maintenance: ${HOSTNAME} (${FAILED_COUNT} failures)" "${REPORT_EMAIL}"
+```
+
+```bash
+chmod 700 /usr/local/sbin/weekly-maintenance.sh
+```
+
+### Scheduling the Weekly Maintenance Script
+
+```bash
+nano /etc/systemd/system/weekly-maintenance.service
+```
+
+```ini
+[Unit]
+Description=Weekly system maintenance
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/weekly-maintenance.sh
+TimeoutStartSec=6h
+StandardOutput=append:/var/log/maintenance/systemd-weekly.log
+StandardError=append:/var/log/maintenance/systemd-weekly.log
+```
+
+```bash
+nano /etc/systemd/system/weekly-maintenance.timer
+```
+
+```ini
+[Unit]
+Description=Run weekly maintenance every Sunday at 01:00
+
+[Timer]
+OnCalendar=Sun *-*-* 01:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+```
+
+```bash
+systemctl daemon-reload
+systemctl enable --now weekly-maintenance.timer
+```
+
+---
+
+## Daily Automated Checks
+
+Lightweight daily checks run more frequently to catch problems that should not wait for the weekly window:
+
+```bash
+nano /etc/cron.d/daily-maintenance
+```
+
+```
+# Daily health checks — staggered to avoid simultaneous I/O
+
+# Disk space check every 15 minutes
+*/15 * * * *  root  /usr/local/sbin/check-disk-space.sh
+
+# Service health check every 5 minutes
+*/5 * * * *   root  /usr/local/sbin/check-services.sh
+
+# Daily security update check at 07:00
+0 7 * * *     root  /usr/local/sbin/check-security-updates.sh
+
+# Daily audit report at 06:00 (covers previous day's activity)
+0 6 * * *     root  /usr/local/sbin/audit-daily-report.sh
+
+# Daily backup freshness check at 08:00
+0 8 * * *     root  /usr/local/sbin/check-backup-schedule.sh
+```
+
+---
+
+## Maintenance Verification
+
+Running maintenance tasks is only valuable if they completed correctly. Each task should leave a verifiable record of success.
+
+### Post-Update Verification
+
+After a `dnf upgrade --security` run, verify the updates were applied:
+
+```bash
+dnf updateinfo list security 2>/dev/null | wc -l
+```
+
+A count of zero means no outstanding security advisories remain. Check that no services failed as a result of the update:
+
+```bash
+systemctl --failed
+```
+
+If the update included a kernel update, check whether a reboot is needed:
+
+```bash
+needs-restarting -r
+echo "Reboot required exit code: $?"
+```
+
+### Maintenance Log Retention
+
+Retain maintenance logs for 90 days to provide a history for incident investigation and compliance evidence:
+
+```bash
+nano /etc/logrotate.d/maintenance-logs
+```
+
+```
+/var/log/maintenance/*.log {
+    weekly
+    rotate 13
+    compress
+    missingok
+    notifempty
+}
+```
+
+---
+
+## Handling Maintenance Failures
+
+When an automated maintenance task fails, the response depends on the task and the failure mode.
+
+### Transient Failures
+
+Network timeouts, temporary resource unavailability, and brief service disruptions are transient — retrying succeeds without human intervention. For tasks where transient failures are expected, build retry logic into the task script rather than alerting immediately on the first failure. The retry wrapper pattern from the [Enterprise Scheduling](../task-scheduling/enterprise-scheduling) page applies here directly.
+
+### Persistent Failure Escalation
+
+For critical maintenance tasks (security updates, backups), failing silently for too long creates real risk. Track how long a task has been failing and escalate when the threshold is exceeded:
+
+```bash
+nano /usr/local/sbin/check-maintenance-currency.sh
+```
+
+```bash
+#!/bin/bash
+# check-maintenance-currency.sh
+# Alerts if maintenance tasks have not completed successfully within expected windows.
+
+ALERT_EMAIL="admin@example.com"
+HOSTNAME=$(hostname -s)
+
+check_task() {
+    local LABEL="$1"
+    local STATE_FILE="$2"
+    local MAX_HOURS="$3"
+
+    LAST_SUCCESS=$(cat "${STATE_FILE}" 2>/dev/null || echo 0)
+    HOURS_SINCE=$(( ( $(date +%s) - LAST_SUCCESS ) / 3600 ))
+
+    if [[ "${HOURS_SINCE}" -gt "${MAX_HOURS}" ]]; then
+        echo "OVERDUE: ${LABEL} last succeeded ${HOURS_SINCE}h ago (max: ${MAX_HOURS}h) on ${HOSTNAME}" \
+            | mail -s "Maintenance Overdue: ${HOSTNAME}" "${ALERT_EMAIL}"
+    fi
+}
+
+check_task "Security updates"  "/var/lib/maintenance/security-update.state"  48
+check_task "Weekly backup"     "/var/lib/maintenance/backup.state"           200
+check_task "Compliance scan"   "/var/lib/maintenance/oscap.state"            200
+```
+
+```bash
+chmod 700 /usr/local/sbin/check-maintenance-currency.sh
+echo "0 9 * * *  root  /usr/local/sbin/check-maintenance-currency.sh" \
+    >> /etc/cron.d/daily-maintenance
+```
+
+Each maintenance task writes a timestamp to its state file on successful completion:
+
+```bash
+date +%s > /var/lib/maintenance/security-update.state
+```
+
+Add this line at the end of each task script, after verifying success.
+
+---
+
+## Multi-System Maintenance Coordination
+
+When managing multiple systems, coordinating maintenance windows prevents all systems from rebooting or running intensive maintenance simultaneously.
+
+### Staggering Maintenance Windows
+
+For a fleet of web servers behind a load balancer, stagger their maintenance windows so no more than one server is in maintenance at any time:
+
+```
+web01: Sunday 01:00 — 03:00
+web02: Sunday 03:00 — 05:00
+web03: Sunday 05:00 — 07:00
+```
+
+Each server's `weekly-maintenance.timer` uses a different `OnCalendar` time. The load balancer continues serving traffic from the servers not currently in maintenance.
+
+### Using RandomizedDelaySec for Fleet-Wide Timers
+
+When all servers in a fleet should run the same maintenance task but not simultaneously — for example, refreshing the DNF metadata cache — `RandomizedDelaySec` spreads the load across a time window:
+
+```ini
+[Timer]
+OnCalendar=*-*-* 03:00:00
+RandomizedDelaySec=3600
+```
+
+With a 3600-second random delay, a 100-host fleet spreads its cache refreshes across a full hour rather than all hitting the repository simultaneously at 03:00.
+
+---
+
+## The Complete Maintenance Picture
+
+Across all the pages in this section, the maintenance tasks that should be automated form a layered picture. Organizing them by frequency makes the full schedule visible:
+
+**Every few minutes:** disk space alerts, service health checks.
+
+**Hourly:** database dumps (if applicable), security audit event checks.
+
+**Daily:** security update availability check, audit report generation, backup freshness verification.
+
+**Weekly:** security update application, old kernel removal, DNF cache cleanup, log archive pruning, journal vacuum, SMART health checks, RPM integrity verification, OpenSCAP compliance scan, full service health sweep, weekly maintenance summary report.
+
+**Monthly:** full DNF cache cleanup (`dnf clean all`), review orphaned packages (`dnf autoremove --assumeno`), SMART long self-tests, LVM free space review, maintenance compliance review — are all tasks running, are all state files current, are all alerts being delivered.
+
+**Quarterly:** full system restore test in a VM, review and refresh audit rules, review enabled services for any that are no longer needed, review patching exception list.
+
+This schedule does not happen by accident — it is the result of deliberately automating each task and monitoring the automation itself.
+
+---
+
+## Summary
+
+Maintenance automation on AlmaLinux is not a single script or tool — it is a framework of scheduled tasks, health checks, alerting, and reporting that together ensure the system is maintained consistently without relying on human memory or discipline. `dnf-automatic` handles continuous security patching; a weekly orchestration script coordinates intensive tasks within a defined window; daily checks catch problems between windows; state files and currency checks detect when automation itself has stopped working.
+
+Key points to remember:
+
+- Design the framework before implementing it: separate scheduled tasks, health checks, alerting, and reporting
+- `dnf-automatic` with `upgrade_type = security` is the baseline — it ensures security patches are applied even between maintenance windows
+- The weekly orchestration script should run all tasks in dependency order and report results in a single summary email
+- Use `run_task()` wrappers that capture exit codes — the summary report is only useful if it accurately reflects what succeeded and what failed
+- Track task completion with state files and alert when tasks become overdue — a maintenance script that stops running silently is as bad as no maintenance at all
+- Stagger fleet maintenance windows to maintain service availability; use `RandomizedDelaySec` for tasks that should be spread across a time window
+- Retain maintenance logs for 90 days for incident investigation and compliance evidence
+
+### Related Pages
+
+- [Package Management](./package-management) — DNF operations and history rollback
+- [Security Patching](./security-patching) — security advisory management and patch verification
+- [System Cleanup](./system-cleanup) — disk space reclamation and cache management
+- [System Auditing](./system-auditing) — compliance scanning and integrity verification
+- [Cron Scheduling](../task-scheduling/cron-scheduling) — crontab syntax for scheduling maintenance tasks
+- [Systemd Timers](../task-scheduling/systemd-timers) — timer units for maintenance automation
+- [Enterprise Scheduling](../task-scheduling/enterprise-scheduling) — retry logic and job coordination patterns

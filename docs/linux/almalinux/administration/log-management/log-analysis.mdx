@@ -1,0 +1,576 @@
+---
+sidebar_position: 3
+title: "Log Analysis | AlmaLinux"
+sidebar_label: "Log Analysis"
+description: "Analyze system logs effectively on AlmaLinux using journalctl, grep, awk, sed, and specialized tools to extract insights and troubleshoot issues."
+keywords:
+  - "almalinux log analysis"
+  - "almalinux journalctl"
+  - "almalinux grep logs"
+  - "almalinux log parsing"
+  - "rhel log analysis"
+tags:
+  - almalinux
+  - log-management
+  - journald
+  - log-analysis
+slug: /linux/almalinux/administration/log-management/log-analysis
+---
+
+# Log Analysis on AlmaLinux
+
+Collecting logs is only half the work — the real value lies in being able to read, filter, and understand them. On AlmaLinux, logs come from two main sources: the systemd journal (queried via `journalctl`) and traditional text-based log files under `/var/log/`. Knowing how to work with both, and when to use which tool, is an essential skill for any system administrator.
+
+This page covers the techniques and tools you need to analyze logs efficiently: from basic filtering with `journalctl` to parsing log files with `grep`, `awk`, and `sed`, to identifying patterns and summarizing large volumes of log data.
+
+---
+
+## Understanding Where Logs Live
+
+Before analyzing logs, it helps to know where they are stored and in what format.
+
+The systemd journal stores logs in a binary format under `/run/log/journal/` (volatile) or `/var/log/journal/` (persistent). These logs are structured and include metadata such as unit name, PID, hostname, and priority. You always access them through `journalctl`.
+
+Traditional log files are plain text and live under `/var/log/`. Common examples include:
+
+| File | Contents |
+|---|---|
+| `/var/log/messages` | General system messages |
+| `/var/log/secure` | Authentication and authorization events |
+| `/var/log/cron` | Cron job execution records |
+| `/var/log/boot.log` | Boot-time messages |
+| `/var/log/dnf.log` | Package manager activity |
+| `/var/log/audit/audit.log` | Audit subsystem events |
+| `/var/log/httpd/` | Apache web server logs (if installed) |
+
+Understanding this split helps you choose the right tool. For system services managed by systemd, `journalctl` is the best starting point. For application-specific logs that write directly to files, standard text processing tools are more appropriate.
+
+---
+
+## Querying the Journal with journalctl
+
+`journalctl` is the primary interface to the systemd journal. Without any arguments it shows all available journal entries from oldest to newest, which is rarely useful on a busy system. Instead, you almost always want to filter by time, unit, priority, or a combination.
+
+### Viewing Recent Entries
+
+The most common starting point is viewing the most recent log entries. The `-n` flag limits output to the last N lines:
+
+```bash
+journalctl -n 50
+```
+
+This shows the 50 most recent journal entries across all sources. To follow the journal in real time (similar to `tail -f`), add the `-f` flag:
+
+```bash
+journalctl -f
+```
+
+Press `Ctrl+C` to stop following.
+
+### Filtering by Time
+
+Time-based filtering is one of the most powerful features of `journalctl`. The `--since` and `--until` flags accept natural language expressions as well as explicit timestamps.
+
+To view logs from the last hour:
+
+```bash
+journalctl --since "1 hour ago"
+```
+
+To view logs from a specific date range:
+
+```bash
+journalctl --since "2024-06-01 08:00:00" --until "2024-06-01 10:00:00"
+```
+
+To view logs since the system last booted:
+
+```bash
+journalctl --since today
+```
+
+These filters can be combined with any other `journalctl` option, making them a versatile first step when narrowing down an incident window.
+
+### Filtering by Unit (Service)
+
+When troubleshooting a specific service, filter by its systemd unit name using the `-u` flag:
+
+```bash
+journalctl -u sshd
+```
+
+This shows all log entries produced by the `sshd` service. You can combine this with a time filter to focus on a specific period:
+
+```bash
+journalctl -u sshd --since "2024-06-01" --until "2024-06-02"
+```
+
+To follow a specific service's logs in real time during troubleshooting or deployment:
+
+```bash
+journalctl -f -u nginx
+```
+
+### Filtering by Priority
+
+The systemd journal uses syslog severity levels, numbered 0 through 7. The `-p` flag filters by priority:
+
+| Level | Name | Meaning |
+|---|---|---|
+| 0 | emerg | System is unusable |
+| 1 | alert | Action must be taken immediately |
+| 2 | crit | Critical conditions |
+| 3 | err | Error conditions |
+| 4 | warning | Warning conditions |
+| 5 | notice | Normal but significant events |
+| 6 | info | Informational messages |
+| 7 | debug | Debug-level messages |
+
+To view only errors and more critical messages:
+
+```bash
+journalctl -p err
+```
+
+This is equivalent to `-p 3` and shows messages at priority 3 (err) and below (i.e., more severe). To see warnings and above:
+
+```bash
+journalctl -p warning
+```
+
+Priority filtering is particularly useful when reviewing logs for a first-pass health check — you can quickly surface all error-level messages across the entire system without being buried in informational noise.
+
+### Viewing Boot Logs
+
+The journal tracks which log entries belong to which boot session. To view logs from the current boot only:
+
+```bash
+journalctl -b
+```
+
+To list all recorded boot sessions:
+
+```bash
+journalctl --list-boots
+```
+
+The output shows a boot index (0 for the current boot, -1 for the previous, etc.), a boot ID, and timestamps. To view logs from the previous boot — useful when investigating a crash or unexpected reboot:
+
+```bash
+journalctl -b -1
+```
+
+You can combine this with unit and priority filters:
+
+```bash
+journalctl -b -1 -u kernel -p err
+```
+
+### Kernel Messages
+
+To view only kernel messages (equivalent to `dmesg` but from the journal):
+
+```bash
+journalctl -k
+```
+
+This is useful when diagnosing hardware issues, driver failures, or filesystem errors that are reported at the kernel level.
+
+### Output Format
+
+By default `journalctl` outputs a human-readable format. For scripting or programmatic analysis, the JSON output format is particularly useful:
+
+```bash
+journalctl -u sshd -n 10 -o json-pretty
+```
+
+Other useful output formats:
+
+| Format | Description |
+|---|---|
+| `short` | Default, human-readable |
+| `verbose` | All fields for each entry |
+| `json` | One JSON object per line |
+| `json-pretty` | Formatted JSON |
+| `cat` | Message text only, no metadata |
+| `export` | Binary export format for forwarding |
+
+The `cat` format is useful when piping journal output to text processing tools:
+
+```bash
+journalctl -u sshd --since "1 hour ago" -o cat
+```
+
+---
+
+## Analyzing Traditional Log Files
+
+For plain-text log files in `/var/log/`, the standard Unix text processing toolkit applies. `grep`, `awk`, `sed`, and `sort` are your primary instruments.
+
+### Searching with grep
+
+`grep` searches for lines matching a pattern and is the most direct tool for finding specific events in a log file.
+
+To find all failed SSH login attempts in the secure log:
+
+```bash
+grep "Failed password" /var/log/secure
+```
+
+To search case-insensitively (useful when log formatting is inconsistent):
+
+```bash
+grep -i "error" /var/log/messages
+```
+
+To show the line number alongside each match — helpful for locating entries in a large file:
+
+```bash
+grep -n "kernel" /var/log/messages
+```
+
+To search recursively through a directory of log files:
+
+```bash
+grep -r "Connection refused" /var/log/httpd/
+```
+
+To invert the match and show lines that do *not* contain a pattern:
+
+```bash
+grep -v "INFO" /var/log/messages
+```
+
+To count the number of matching lines rather than displaying them:
+
+```bash
+grep -c "Failed password" /var/log/secure
+```
+
+Combining flags is common in practice. To count case-insensitive matches of "error" across all files in `/var/log/`:
+
+```bash
+grep -ri "error" /var/log/ | wc -l
+```
+
+### Extended Patterns with grep -E
+
+For more complex matching patterns, the `-E` flag enables extended regular expressions. To find lines containing either "error" or "warning":
+
+```bash
+grep -E "error|warning" /var/log/messages
+```
+
+To find lines that start with a date pattern followed by a specific hostname:
+
+```bash
+grep -E "^Jun [0-9]+ [0-9:]+ myhost" /var/log/messages
+```
+
+### Using awk for Structured Log Parsing
+
+`awk` is well-suited for logs where fields are separated by a consistent delimiter (spaces, colons, pipes). It lets you extract specific columns, filter on field values, and compute summaries.
+
+A typical syslog line looks like this:
+
+```
+Jun  1 08:23:11 myhost sshd[1234]: Failed password for root from 192.168.1.5 port 54321 ssh2
+```
+
+To extract just the timestamp (fields 1–3), hostname (field 4), and message (everything from field 6 onward):
+
+```bash
+awk '{print $1, $2, $3, $4, substr($0, index($0,$6))}' /var/log/secure
+```
+
+To count how many times each unique username appears in failed SSH logins:
+
+```bash
+grep "Failed password" /var/log/secure | awk '{print $9}' | sort | uniq -c | sort -rn
+```
+
+Breaking this down: `grep` isolates the relevant lines, `awk '{print $9}'` extracts the username field, `sort` puts them in order so `uniq -c` can count consecutive duplicates, and the final `sort -rn` orders by count descending. This gives you a ranked list of the most targeted usernames.
+
+To find the top 10 source IP addresses attempting failed logins:
+
+```bash
+grep "Failed password" /var/log/secure | awk '{print $11}' | sort | uniq -c | sort -rn | head -10
+```
+
+This kind of pipeline — `grep` to filter, `awk` to extract, `sort | uniq -c | sort -rn` to rank — is a pattern you will use repeatedly for log analysis.
+
+### Viewing Log Context with grep -B and -A
+
+When a matching line alone isn't sufficient and you need the surrounding context, `-B` (before) and `-A` (after) show additional lines:
+
+```bash
+grep -B 2 -A 5 "segfault" /var/log/messages
+```
+
+This shows 2 lines before and 5 lines after each `segfault` match, which is often essential for understanding what led to and followed an error.
+
+### Monitoring Log Files in Real Time
+
+To watch a log file as it grows — useful during troubleshooting when you're triggering events and watching for their log output:
+
+```bash
+tail -f /var/log/messages
+```
+
+To follow multiple files simultaneously:
+
+```bash
+tail -f /var/log/messages /var/log/secure
+```
+
+`tail -f` exits only when interrupted with `Ctrl+C`. For a version that handles log rotation correctly (continuing to follow the file even after it's rotated), use:
+
+```bash
+tail -F /var/log/messages
+```
+
+The capital `-F` re-opens the file by name if it disappears and reappears, which is exactly what happens during log rotation.
+
+---
+
+## Summarizing and Aggregating Log Data
+
+Raw log lines are often too numerous to read directly. Summarization tools help you understand patterns across large volumes of log data.
+
+### Counting and Ranking Events
+
+The `sort | uniq -c | sort -rn` pattern produces a frequency-ranked list of any repeating value. Combined with `awk` to extract the right field, you can answer questions like "what are the most common log messages?" or "which hosts are generating the most errors?"
+
+To find the most frequently occurring log messages in `/var/log/messages`:
+
+```bash
+awk '{$1=$2=$3=$4=""; print $0}' /var/log/messages | sort | uniq -c | sort -rn | head -20
+```
+
+This strips the timestamp and hostname fields (columns 1–4) and then counts and ranks the remaining message text.
+
+### Summarizing Journal Output by Unit
+
+To get a count of log entries per service since the last boot:
+
+```bash
+journalctl -b -o json | python3 -c "
+import sys, json, collections
+units = collections.Counter()
+for line in sys.stdin:
+    try:
+        entry = json.loads(line)
+        units[entry.get('_SYSTEMD_UNIT', '(kernel/other)')] += 1
+    except:
+        pass
+for unit, count in units.most_common(20):
+    print(f'{count:6d}  {unit}')
+"
+```
+
+This pipes journal output in JSON format to a small Python script that counts entries per unit and displays the top 20. It's a quick way to see which services are the noisiest log producers.
+
+:::tip
+For one-off analysis like the example above, using Python directly in a pipeline is fine. For anything you plan to run regularly, consider writing a proper script with comments so the logic is clear when you return to it later.
+:::
+
+### Using journalctl with Field Filters
+
+The systemd journal stores structured key-value metadata alongside each log entry. You can filter directly on these fields. For example, to see log entries from a specific PID:
+
+```bash
+journalctl _PID=1234
+```
+
+To see all entries from a specific executable:
+
+```bash
+journalctl _EXE=/usr/sbin/sshd
+```
+
+To see entries logged by a specific user (by UID):
+
+```bash
+journalctl _UID=1000
+```
+
+You can list all available journal fields with:
+
+```bash
+journalctl -F _SYSTEMD_UNIT
+```
+
+This lists all distinct values of the `_SYSTEMD_UNIT` field that appear in the journal — useful for discovering what unit names are available before filtering.
+
+---
+
+## Disk Usage and Journal Size
+
+On a busy system, journal files can consume significant disk space. To check current journal disk usage:
+
+```bash
+journalctl --disk-usage
+```
+
+This reports the total size of all journal files. If you need to understand which time periods are represented, `--list-boots` gives a useful overview.
+
+To check the size of individual log files in `/var/log/`:
+
+```bash
+du -sh /var/log/*
+```
+
+For a more detailed breakdown sorted by size:
+
+```bash
+du -sh /var/log/**/* 2>/dev/null | sort -rh | head -20
+```
+
+Understanding which logs are largest helps prioritize rotation and retention configuration — covered in the Log Rotation page.
+
+---
+
+## Searching Compressed Log Archives
+
+When log rotation is configured with compression (the default on AlmaLinux), older logs are stored as `.gz` files. Standard `grep` does not work on compressed files, but `zgrep` and `zcat` do.
+
+To search a compressed log file:
+
+```bash
+zgrep "Failed password" /var/log/secure-20240601.gz
+```
+
+To search across all compressed secure logs at once:
+
+```bash
+zgrep "Failed password" /var/log/secure*.gz
+```
+
+To view the contents of a compressed file page by page:
+
+```bash
+zcat /var/log/messages-20240601.gz | less
+```
+
+This is important to remember: if you're investigating an incident that occurred before the current log file was created, the evidence is in the compressed archives — not in the live file.
+
+---
+
+## Practical Analysis Workflows
+
+### Investigating a Failed Service
+
+When a service fails to start or crashes unexpectedly, the journal is the first place to look:
+
+```bash
+journalctl -u myservice --since "30 minutes ago"
+```
+
+If the service generates a lot of noise, filter for errors:
+
+```bash
+journalctl -u myservice -p err --since "30 minutes ago"
+```
+
+To see the state of the service and recent log output in one command:
+
+```bash
+systemctl status myservice
+```
+
+`systemctl status` shows the last 10 journal lines for the unit by default, which is often enough to identify the immediate cause of a failure.
+
+### Investigating Unauthorized Access Attempts
+
+To get a picture of SSH brute-force activity:
+
+```bash
+grep "Failed password" /var/log/secure | awk '{print $11}' | sort | uniq -c | sort -rn | head -20
+```
+
+To see successful logins by user:
+
+```bash
+grep "Accepted password\|Accepted publickey" /var/log/secure | awk '{print $9}' | sort | uniq -c | sort -rn
+```
+
+To check if any logins occurred from unexpected IP addresses:
+
+```bash
+grep "Accepted" /var/log/secure | awk '{print $9, $11}' | sort | uniq
+```
+
+This extracts username and source IP for every accepted authentication, giving you a concise list of who logged in from where.
+
+### Investigating System Reboots
+
+Unexpected reboots can be identified by looking at boot boundaries in the journal:
+
+```bash
+journalctl --list-boots
+```
+
+To see what was logged just before a previous reboot (the last entries of boot session -1):
+
+```bash
+journalctl -b -1 -n 50
+```
+
+If the system experienced a kernel panic or hardware fault, kernel messages just before shutdown are often the most informative:
+
+```bash
+journalctl -b -1 -k -p err
+```
+
+---
+
+## Useful Tools Worth Knowing
+
+Beyond the core Unix tools, several utilities can make log analysis faster for specific use cases.
+
+`lnav` (Log Navigator) is a curses-based log viewer that understands common log formats automatically, provides syntax highlighting, and allows interactive searching and filtering. Install it with:
+
+```bash
+dnf install lnav
+```
+
+Then open it with one or more log files:
+
+```bash
+lnav /var/log/messages /var/log/secure
+```
+
+`multitail` lets you view multiple log files in a split terminal window, with optional color highlighting based on patterns. Install it with:
+
+```bash
+dnf install multitail
+```
+
+These tools are not replacements for `journalctl` and `grep`, but they can significantly reduce friction during interactive troubleshooting sessions.
+
+:::warning
+Be cautious with third-party log analysis tools that require sending logs to external services. On systems handling sensitive data, logs may contain personally identifiable information, credentials, or security-relevant details. Analyze logs locally whenever possible.
+:::
+
+---
+
+## Summary
+
+Log analysis on AlmaLinux relies on two complementary approaches: querying the structured systemd journal with `journalctl`, and processing traditional text log files with tools like `grep`, `awk`, and `sort`. Understanding which logs live where and which tool is appropriate for each type is the foundation of effective analysis.
+
+Key points to remember:
+
+- Use `journalctl -u`, `--since`, `-p`, and `-b` to narrow journal queries before reading output
+- The `sort | uniq -c | sort -rn` pattern is the fastest way to rank frequent events in any log file
+- Use `zgrep` and `zcat` to search compressed log archives from previous rotation cycles
+- `tail -F` (uppercase) correctly handles rotated files during live monitoring
+- `systemctl status <unit>` combines service state and recent log output in one view
+- Combine `grep` field extraction with frequency ranking to surface brute-force patterns quickly
+
+### Related Pages
+
+- [System Logging](./system-logging) — configuring rsyslog and the systemd journal
+- [Log Rotation](./log-rotation) — managing log retention with logrotate and journald
+- [Centralized Logging](./centralized-logging) — forwarding logs to a central server
+- [Audit Logging](./audit-logging) — tracking security-relevant events with auditd
+- [Log Monitoring](./log-monitoring) — alerting on log patterns with automated tools

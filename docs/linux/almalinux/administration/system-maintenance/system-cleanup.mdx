@@ -1,0 +1,452 @@
+---
+sidebar_position: 3
+title: "System Cleanup | AlmaLinux"
+sidebar_label: "System Cleanup"
+description: "Clean AlmaLinux systems by removing old kernels, clearing DNF cache, managing log files, purging temporary files, and reclaiming disk space safely."
+keywords:
+  - "almalinux system cleanup"
+  - "almalinux disk space"
+  - "almalinux remove old kernels"
+  - "almalinux dnf clean"
+  - "rhel system cleanup"
+tags:
+  - almalinux
+  - system-maintenance
+  - cleanup
+  - disk-space
+  - dnf
+slug: /linux/almalinux/administration/system-maintenance/system-cleanup
+---
+
+# System Cleanup on AlmaLinux
+
+Over time, production systems accumulate data that is no longer needed: old kernel versions that have been superseded, cached package files that were downloaded for past updates, log archives that predate the retention window, temporary files left by applications, and orphaned packages whose dependents have long been removed. Left unattended, this accumulation consumes disk space, slows down package operations, and can obscure the actual state of the system.
+
+System cleanup is a regular maintenance task, not a one-time event. Understanding what can be safely removed, what should be left alone, and how to automate cleanup without accidentally deleting important data is the foundation of a healthy, long-running system.
+
+---
+
+## Assessing Disk Space Usage
+
+Before removing anything, understand where disk space is being consumed. Cleaning the wrong location wastes effort; missing a large accumulation wastes an opportunity.
+
+### Filesystem-Level Overview
+
+To see disk usage across all mounted filesystems:
+
+```bash
+df -h
+```
+
+Focus on filesystems that are above 70–80% — these are candidates for cleanup. The most common culprits on AlmaLinux systems are `/var/log/`, `/var/cache/`, `/boot/`, and `/tmp/`.
+
+### Directory-Level Breakdown
+
+To drill into a specific filesystem and find the largest subdirectories:
+
+```bash
+du -sh /var/* 2>/dev/null | sort -rh | head -20
+```
+
+This lists the 20 largest entries in `/var/`, sorted by size. Repeat for any filesystem that appears full. To drill deeper into a specific directory:
+
+```bash
+du -sh /var/log/* 2>/dev/null | sort -rh | head -20
+```
+
+### Finding Large Files
+
+To find files above a specific size threshold anywhere on the system:
+
+```bash
+find / -xdev -type f -size +100M -printf '%s\t%p\n' 2>/dev/null \
+    | sort -rn | head -20 | awk '{printf "%.1fG\t%s\n", $1/1073741824, $2}'
+```
+
+The `-xdev` flag prevents `find` from crossing filesystem boundaries, which keeps the search within the current filesystem. This helps find unexpectedly large files — core dumps, unrotated logs, large database exports — that might not be obvious from directory-level analysis.
+
+---
+
+## Cleaning the DNF Cache
+
+The DNF package cache in `/var/cache/dnf/` stores downloaded package metadata and RPM files. It grows with every package operation and is not cleaned automatically between operations.
+
+### Checking Cache Size
+
+```bash
+du -sh /var/cache/dnf/
+```
+
+On actively managed systems, this can reach several gigabytes.
+
+### Removing Cached Package Files
+
+To remove downloaded RPM files while keeping repository metadata (which speeds up future operations):
+
+```bash
+dnf clean packages
+```
+
+### Removing All Cached Data
+
+To remove all cached metadata and package files, forcing DNF to redownload everything on the next operation:
+
+```bash
+dnf clean all
+```
+
+This frees the most space but makes the next `dnf` operation slower because all metadata must be redownloaded. It is appropriate when disk space is critical; otherwise, `dnf clean packages` is usually sufficient.
+
+### Removing Expired Metadata Only
+
+```bash
+dnf clean expire-cache
+```
+
+This marks all cached metadata as expired without deleting it, causing DNF to check for fresher metadata on the next operation. It frees no disk space but ensures the next run fetches current repository data.
+
+---
+
+## Removing Old Kernels
+
+AlmaLinux installs new kernels without removing old ones, keeping previous versions as a fallback. The `installonly_limit` setting in `/etc/dnf/dnf.conf` (default: 3) controls how many kernel versions are retained. On systems that have been running for a long time without cleanup, more kernels than the limit may have accumulated.
+
+### Listing Installed Kernels
+
+```bash
+rpm -q kernel --last
+```
+
+The most recently installed kernel appears first. The currently running kernel can be identified with:
+
+```bash
+uname -r
+```
+
+Never remove the currently running kernel — it is in use and cannot be safely uninstalled while the system is running.
+
+### Removing Old Kernels with DNF
+
+The safest way to remove old kernels is through DNF, which manages the removal within the package database:
+
+```bash
+dnf remove --oldinstallonly --setopt installonly_limit=2
+```
+
+This removes all kernels except the two most recently installed ones, regardless of the system's `installonly_limit` setting. Keeping two kernels — the current and one previous — provides a reliable fallback without accumulating unnecessary versions.
+
+:::warning
+Always keep at least two kernel versions: the currently running kernel and one previous version. If the current kernel has a problem that only appears after a reboot (a common scenario with kernel regressions), the previous kernel provides a recovery path. Removing all but the current kernel eliminates this safety net.
+:::
+
+### Preventing Kernel Accumulation
+
+Set `installonly_limit` to a low but safe value:
+
+```bash
+nano /etc/dnf/dnf.conf
+```
+
+```ini
+[main]
+installonly_limit=2
+```
+
+With this setting, DNF automatically removes the oldest kernel when installing a new one, keeping exactly two versions. The cleanup happens automatically as part of the `dnf upgrade` transaction — no manual intervention needed.
+
+---
+
+## Removing Orphaned and Unnecessary Packages
+
+### Removing Packages No Longer Required
+
+When a package is removed but its dependencies remain installed, those dependencies become orphaned — installed but not required by any other package. DNF removes them automatically when `clean_requirements_on_remove = True` (the default), but in some cases they accumulate.
+
+To list packages that were installed as dependencies but are no longer required:
+
+```bash
+dnf autoremove --assumeno
+```
+
+The `--assumeno` flag shows what would be removed without actually removing it. Review the list carefully before proceeding — `autoremove` can sometimes suggest removing packages that you installed intentionally but that happen to have no declared dependents.
+
+To actually remove the orphaned packages:
+
+```bash
+dnf autoremove
+```
+
+### Finding Packages from Disabled or Removed Repositories
+
+Packages installed from a repository that has since been removed or disabled are still present on the system but can no longer be updated. These are sometimes called "extras" or "obsoletes":
+
+```bash
+dnf list extras
+```
+
+These packages warrant review — they may be safe to keep, but they will never receive updates from any configured repository, which creates a security risk for packages that handle sensitive operations.
+
+### Listing Duplicate Packages
+
+Duplicate package entries in the RPM database — multiple versions of the same package installed simultaneously — occasionally occur after failed transactions or manual RPM operations:
+
+```bash
+dnf list --duplicates
+```
+
+To clean up duplicates, keeping only the newest version:
+
+```bash
+dnf remove --duplicates
+```
+
+---
+
+## Log File Cleanup
+
+Log files are the most common cause of unexpected disk full conditions on production servers. While logrotate handles regular rotation automatically, certain situations require manual cleanup: a service that logged excessively before being configured, old rotated archives outside the retention window, or application logs that logrotate is not configured to manage.
+
+### Checking Log Directory Size
+
+```bash
+du -sh /var/log/
+du -sh /var/log/* 2>/dev/null | sort -rh | head -20
+```
+
+### Removing Old Rotated Log Archives
+
+Logrotate names rotated files with numeric suffixes (`.1`, `.2`) or date suffixes, and compresses them with `.gz`. To find and list compressed log archives older than 30 days:
+
+```bash
+find /var/log/ -name "*.gz" -mtime +30 -ls
+```
+
+After reviewing the list to confirm these are safe to remove:
+
+```bash
+find /var/log/ -name "*.gz" -mtime +30 -delete
+```
+
+### Truncating an Active Log File
+
+Never delete an active log file that a running service is writing to — the service holds the file open, and deleting it frees no disk space while the process is still running. The file descriptor remains valid and the service continues writing to the now-deleted inode. The space is not reclaimed until the service closes the file (typically on restart).
+
+Instead, truncate the active file to zero length:
+
+```bash
+truncate -s 0 /var/log/myapp/application.log
+```
+
+This immediately reclaims the disk space while the file remains accessible to the running service, which will continue writing to it from the beginning.
+
+After truncating an active log file, consider why it grew so large and whether logrotate is properly configured for it. Truncation is a stopgap — logrotate configuration is the permanent solution.
+
+### Cleaning the systemd Journal
+
+The systemd journal can grow substantially on busy systems. To vacuum it to a size limit:
+
+```bash
+journalctl --vacuum-size=500M
+```
+
+To remove journal entries older than a specific period:
+
+```bash
+journalctl --vacuum-time=30days
+```
+
+To see the current journal disk usage before vacuuming:
+
+```bash
+journalctl --disk-usage
+```
+
+For long-term journal size management, configure limits in `/etc/systemd/journald.conf` rather than relying on manual vacuuming — this prevents the journal from growing beyond the configured limit automatically.
+
+---
+
+## Temporary File Cleanup
+
+### /tmp and /var/tmp
+
+AlmaLinux manages `/tmp/` and `/var/tmp/` through `systemd-tmpfiles`. By default:
+
+- Files in `/tmp/` are removed after 10 days of inactivity
+- Files in `/var/tmp/` are removed after 30 days
+
+To trigger the cleanup immediately without waiting for the scheduled run:
+
+```bash
+systemd-tmpfiles --clean
+```
+
+For systems where applications leave large files in `/tmp/` that do not get cleaned up through normal means:
+
+```bash
+# Find large files in /tmp older than 7 days
+find /tmp -type f -size +10M -mtime +7 -ls
+```
+
+Review the output before deleting — some applications use `/tmp/` for active working files. If the files are genuinely stale, delete them:
+
+```bash
+find /tmp -type f -size +10M -mtime +7 -delete
+```
+
+### Application Cache Directories
+
+Many applications maintain their own cache directories. Common locations include `/var/cache/`, `/home/*/.cache/`, and application-specific paths under `/opt/` or `/srv/`. Review each with `du` before removing to confirm they are genuinely cache data rather than application state:
+
+```bash
+du -sh /var/cache/*
+```
+
+For well-known caches that are safe to clear:
+
+```bash
+# Fontconfig cache (regenerated automatically)
+fc-cache --force
+
+# Icon cache (regenerated automatically)
+gtk-update-icon-cache /usr/share/icons/hicolor/
+```
+
+---
+
+## Core Dump Cleanup
+
+Core dumps are generated when processes crash and can be very large — easily several gigabytes for a crashed database server. On production systems, core dumps should be collected for diagnosis and then removed.
+
+### Finding Core Dumps
+
+Core dumps are typically written to the current working directory of the crashed process, `/var/lib/systemd/coredump/`, or to the path specified in `/proc/sys/kernel/core_pattern`:
+
+```bash
+cat /proc/sys/kernel/core_pattern
+```
+
+To find core dump files across the system:
+
+```bash
+find / -xdev -name "core" -o -name "core.*" 2>/dev/null | head -20
+```
+
+For systemd-managed core dumps, use `coredumpctl`:
+
+```bash
+coredumpctl list
+```
+
+### Removing Core Dumps
+
+After collecting and analyzing a core dump (or if no analysis is needed):
+
+```bash
+# Remove a specific coredump by PID
+coredumpctl clean <pid>
+
+# Remove all stored coredumps older than 7 days
+find /var/lib/systemd/coredump/ -mtime +7 -delete
+```
+
+---
+
+## Cleaning User Home Directories
+
+On systems with many users, home directories accumulate browser caches, application caches, and downloaded files. For shared systems or servers where user accounts represent service accounts rather than interactive users, these can grow substantially.
+
+To find the largest home directories:
+
+```bash
+du -sh /home/* 2>/dev/null | sort -rh | head -10
+```
+
+For service accounts that should not have large home directories, investigate unexpectedly large sizes. Common culprits include misconfigured application logging, forgotten large file downloads, and pip/npm/gem cache directories:
+
+```bash
+du -sh /home/serviceuser/.cache/
+du -sh /home/serviceuser/.local/
+```
+
+Cache directories for package managers used by the service account are generally safe to remove:
+
+```bash
+pip cache purge --user
+```
+
+---
+
+## Automating Cleanup
+
+Cleanup tasks should run automatically on a schedule rather than being performed only when disk space becomes critical. The [Maintenance Automation](./maintenance-automation) page covers scheduling in detail; the cleanup-specific automation that belongs in a maintenance schedule includes:
+
+**Daily:** Journal vacuum, tmpfiles cleanup (handled by systemd automatically), log file size monitoring.
+
+**Weekly:** DNF package cache cleanup (`dnf clean packages`), find and list large files above threshold.
+
+**Monthly:** DNF full cache cleanup (`dnf clean all`), review and remove old log archives beyond retention period, check for orphaned packages with `dnf autoremove --assumeno`.
+
+A simple monthly cleanup cron job that covers the most important tasks:
+
+```bash
+nano /etc/cron.monthly/system-cleanup
+```
+
+```bash
+#!/bin/bash
+# Monthly system cleanup
+# Runs as root via /etc/cron.monthly
+
+LOGFILE="/var/log/maintenance/cleanup.log"
+mkdir -p "$(dirname "${LOGFILE}")"
+log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "${LOGFILE}"; }
+
+log "Monthly cleanup started"
+
+# Clean DNF package cache
+log "Cleaning DNF package cache"
+dnf clean packages -q
+
+# Remove old compressed log archives beyond 90 days
+log "Removing log archives older than 90 days"
+find /var/log/ -name "*.gz" -mtime +90 -delete
+
+# Vacuum the journal to 1 GB
+log "Vacuuming systemd journal"
+journalctl --vacuum-size=1G --quiet
+
+# Report disk usage after cleanup
+log "Post-cleanup disk usage:"
+df -h | tee -a "${LOGFILE}"
+
+log "Monthly cleanup completed"
+```
+
+```bash
+chmod 755 /etc/cron.monthly/system-cleanup
+```
+
+Note the absence of a file extension — scripts in `/etc/cron.monthly/` must not have extensions to be picked up by `run-parts`.
+
+---
+
+## Summary
+
+System cleanup on AlmaLinux prevents disk space exhaustion and keeps the system in a manageable state. The key principle is understanding what each type of accumulated data is before removing it — DNF cache is safe to clear, old kernel versions beyond the minimum two are safe to remove, but active log files must be truncated rather than deleted.
+
+Key points to remember:
+
+- Use `du -sh /var/* | sort -rh` to identify the largest disk consumers before starting cleanup
+- Keep at least two kernel versions — current and one fallback — even after cleanup
+- Set `installonly_limit=2` in `dnf.conf` to prevent kernel accumulation going forward
+- Truncate active log files with `truncate -s 0` rather than deleting them — deletion does not free space while the process holds the file open
+- Use `journalctl --vacuum-size=` to reclaim journal space; set `SystemMaxUse=` in `journald.conf` for permanent control
+- Review `dnf autoremove --assumeno` before committing — some suggested removals may be packages you want to keep
+- Automate monthly cleanup with a script in `/etc/cron.monthly/` to prevent accumulation between maintenance cycles
+
+### Related Pages
+
+- [Package Management](./package-management) — DNF cache, orphaned packages, and package queries
+- [Log Rotation](../log-management/log-rotation) — configuring logrotate for automatic log management
+- [Maintenance Automation](./maintenance-automation) — scheduling cleanup tasks automatically
+- [Storage Maintenance](./storage-maintenance) — filesystem health, LVM management, and disk monitoring

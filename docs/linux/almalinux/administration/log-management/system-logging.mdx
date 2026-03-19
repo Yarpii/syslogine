@@ -1,0 +1,495 @@
+---
+sidebar_position: 1
+title: "System Logging | AlmaLinux"
+sidebar_label: "System Logging"
+description: "Configure systemd journal and rsyslog, manage system logs, and understand AlmaLinux's dual logging architecture."
+keywords:
+  - "almalinux system logging"
+  - "almalinux journald"
+  - "almalinux rsyslog"
+  - "almalinux journal configuration"
+  - "rhel system logging"
+tags:
+  - almalinux
+  - log-management
+  - journald
+  - rsyslog
+slug: /linux/almalinux/administration/log-management/system-logging
+---
+
+# System Logging
+
+AlmaLinux uses two logging systems that work alongside each other. **systemd-journald** captures structured logs from every service, the kernel, and the boot process. **rsyslog** reads from journald and writes traditional text log files, and can forward logs to remote destinations. Understanding both — and how they interact — gives you complete control over what gets logged, where it goes, and how long it is kept.
+
+## The dual logging architecture
+
+```
+Kernel / Services / Applications
+            │
+     systemd-journald
+            │
+    ┌───────┴────────┐
+    │                │
+/var/log/journal/   rsyslog
+(binary, structured) │
+                     ├── /var/log/messages
+                     ├── /var/log/secure
+                     ├── /var/log/cron
+                     └── Remote syslog / SIEM
+```
+
+journald is always running. rsyslog reads from journald via the `imjournal` input module and writes text files under `/var/log/`.
+
+## journald configuration
+
+journald is configured in `/etc/systemd/journald.conf`.
+
+```bash
+# View current configuration
+cat /etc/systemd/journald.conf
+
+# View effective configuration including defaults
+systemd-analyze cat-config systemd/journald.conf
+```
+
+### Enable persistent storage
+
+By default, journald stores logs in memory (`/run/log/journal/`) and loses them on reboot. Enable persistent storage so logs survive reboots.
+
+```bash
+sudo mkdir -p /var/log/journal
+sudo systemd-tmpfiles --create --prefix /var/log/journal
+sudo systemctl restart systemd-journald
+```
+
+Or configure it in `journald.conf`:
+
+```bash
+sudo nano /etc/systemd/journald.conf
+```
+
+```ini
+[Journal]
+# Persist logs to disk
+Storage=persistent
+
+# Maximum disk space for the journal
+SystemMaxUse=2G
+
+# Keep at least this much free disk space
+SystemKeepFree=1G
+
+# Maximum size of a single journal file
+SystemMaxFileSize=200M
+
+# Maximum number of journal files to keep
+SystemMaxFiles=20
+
+# Keep logs for up to 30 days
+MaxRetentionSec=30day
+
+# Compress journal files
+Compress=yes
+
+# Maximum size of log entries (protects against log injection)
+MaxLevelStore=debug
+LineMax=48K
+```
+
+Restart journald after changes:
+
+```bash
+sudo systemctl restart systemd-journald
+```
+
+### Forward kernel messages to /dev/console
+
+Useful for servers where you need to see kernel messages on the console during boot or crashes:
+
+```ini
+[Journal]
+ForwardToConsole=no
+ForwardToKMsg=no
+ForwardToSyslog=yes
+ForwardToWall=yes
+```
+
+## Read logs with journalctl
+
+```bash
+# All logs (most recent last)
+journalctl
+
+# Follow in real time
+journalctl -f
+
+# Logs since last boot
+journalctl -b
+
+# Logs from a previous boot
+journalctl -b -1
+
+# List available boots
+journalctl --list-boots
+
+# Logs in a time range
+journalctl --since "2026-03-19 08:00:00" --until "2026-03-19 12:00:00"
+journalctl --since "1 hour ago"
+journalctl --since today
+```
+
+### Filter by service, priority, and process
+
+```bash
+# Logs for a specific service
+journalctl -u nginx
+journalctl -u nginx -f
+
+# Logs for multiple services
+journalctl -u nginx -u php-fpm
+
+# Only errors and above
+journalctl -p err
+
+# Errors for a specific service since last boot
+journalctl -u nginx -b -p err
+
+# Logs from a specific binary
+journalctl /usr/sbin/sshd
+
+# Logs from a specific PID
+journalctl _PID=1234
+
+# Logs from a specific user
+journalctl _UID=1001
+```
+
+### Output formats
+
+```bash
+# Default short format
+journalctl -u nginx
+
+# Verbose with all metadata fields
+journalctl -u nginx -o verbose
+
+# JSON output (one entry per line)
+journalctl -u nginx -o json-short
+
+# No paging
+journalctl -u nginx --no-pager
+
+# Last N lines
+journalctl -u nginx -n 50
+```
+
+## Manage journal disk usage
+
+```bash
+# Check current disk usage
+journalctl --disk-usage
+
+# Vacuum logs older than 30 days
+sudo journalctl --vacuum-time=30d
+
+# Vacuum until total size is under 1GB
+sudo journalctl --vacuum-size=1G
+
+# Vacuum keeping only the last 5 boots
+sudo journalctl --vacuum-files=5
+
+# Verify journal integrity
+sudo journalctl --verify
+```
+
+## rsyslog configuration
+
+rsyslog writes traditional text log files and forwards logs to remote destinations. Its main configuration is in `/etc/rsyslog.conf`, with drop-in files in `/etc/rsyslog.d/`.
+
+```bash
+# View the main config
+cat /etc/rsyslog.conf
+
+# View drop-in configs
+ls /etc/rsyslog.d/
+
+# Test rsyslog config for syntax errors
+sudo rsyslogd -N1
+
+# Restart rsyslog
+sudo systemctl restart rsyslog
+```
+
+### Key log files written by rsyslog
+
+| File | Contents |
+|------|---------|
+| `/var/log/messages` | General system messages |
+| `/var/log/secure` | Authentication, sudo, and SSH events |
+| `/var/log/cron` | Cron job output |
+| `/var/log/maillog` | Mail server logs |
+| `/var/log/boot.log` | Boot process messages |
+| `/var/log/dnf.log` | Package manager activity |
+| `/var/log/audit/audit.log` | Auditd events |
+
+### Configure rsyslog to receive from journald
+
+By default, rsyslog reads from journald via `imjournal`. Verify it is configured:
+
+```bash
+grep -r "imjournal\|imuxsock" /etc/rsyslog.conf /etc/rsyslog.d/
+```
+
+The default AlmaLinux configuration includes:
+
+```bash
+# /etc/rsyslog.conf
+module(load="imjournal"
+       StateFile="imjournal.state"
+       IgnorePreviousMessages="off"
+       Ratelimit.Interval="600"
+       Ratelimit.Burst="20000")
+```
+
+### Write custom log routing rules
+
+Route specific facilities and priorities to specific files:
+
+```bash
+sudo nano /etc/rsyslog.d/99-custom.conf
+```
+
+```bash
+# Route all auth messages to a dedicated file
+authpriv.*                    /var/log/auth.log
+
+# Route all errors to a separate error log
+*.err                         /var/log/errors.log
+
+# Route nginx logs separately
+if $programname == 'nginx' then /var/log/nginx/rsyslog.log
+& stop
+
+# Discard noisy debug messages
+*.debug                       ~
+
+# Route everything to messages except auth
+*.*;authpriv.none             /var/log/messages
+```
+
+Restart rsyslog after changes:
+
+```bash
+sudo systemctl restart rsyslog
+```
+
+### Send a test message
+
+```bash
+# Send a test syslog message
+logger "Test message from $(hostname) at $(date)"
+
+# Specify facility and priority
+logger -p auth.info "Test auth message"
+logger -p local0.err "Test application error"
+
+# Verify it arrived
+tail -5 /var/log/messages
+journalctl -n 5
+```
+
+## Configure rate limiting
+
+Both journald and rsyslog have rate limiting to prevent log floods from overwhelming storage.
+
+### journald rate limiting
+
+```bash
+sudo nano /etc/systemd/journald.conf
+```
+
+```ini
+[Journal]
+# Allow 10000 messages per 30 seconds per service
+RateLimitIntervalSec=30s
+RateLimitBurst=10000
+```
+
+### rsyslog rate limiting
+
+```bash
+sudo nano /etc/rsyslog.d/00-ratelimit.conf
+```
+
+```bash
+# Global rate limit settings
+module(load="imjournal"
+       Ratelimit.Interval="600"
+       Ratelimit.Burst="20000")
+```
+
+## Log permissions and security
+
+```bash
+# Check permissions on key log files
+ls -la /var/log/messages /var/log/secure /var/log/audit/audit.log
+
+# /var/log/messages — readable by root and adm group
+# /var/log/secure — readable by root only
+# /var/log/audit/audit.log — readable by root only
+
+# Add a user to the adm group to allow reading /var/log/messages
+sudo usermod --append --groups adm jdoe
+```
+
+## Configure application logging to the journal
+
+Applications can write directly to the journal using the `systemd-cat` command or the sd-journal API.
+
+```bash
+# Write a message to the journal from a script
+echo "Backup completed successfully" | systemd-cat -t backup -p info
+
+# Write an error
+echo "Backup failed — disk full" | systemd-cat -t backup -p err
+
+# Pipe a command's output to the journal
+/usr/local/bin/backup.sh 2>&1 | systemd-cat -t backup -p info
+```
+
+In a systemd unit file, stdout and stderr go to the journal automatically:
+
+```ini
+[Service]
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=myapp
+```
+
+## Scripted log health check
+
+A script to verify logging is working correctly:
+
+```bash
+#!/bin/bash
+# logging-health.sh — verify journal and rsyslog are healthy
+
+ALERTS=()
+HOSTNAME=$(hostname)
+
+# Check journald is running
+if ! systemctl is-active --quiet systemd-journald; then
+  ALERTS+=("CRITICAL: systemd-journald is not running")
+fi
+
+# Check journal disk usage
+USAGE=$(journalctl --disk-usage 2>/dev/null | grep -oP '[\d.]+[KMGT]?B(?= taken)')
+echo "Journal disk usage: ${USAGE:-unknown}"
+
+# Check rsyslog is running
+if ! systemctl is-active --quiet rsyslog; then
+  ALERTS+=("CRITICAL: rsyslog is not running")
+fi
+
+# Check key log files exist and are being written to
+for logfile in /var/log/messages /var/log/secure; do
+  if [[ ! -f "$logfile" ]]; then
+    ALERTS+=("WARNING: $logfile does not exist")
+  else
+    AGE=$(( $(date +%s) - $(stat -c %Y "$logfile") ))
+    if [[ "$AGE" -gt 3600 ]]; then
+      ALERTS+=("WARNING: $logfile has not been updated in over 1 hour")
+    fi
+  fi
+done
+
+# Check journal storage mode
+STORAGE=$(grep "^Storage=" /etc/systemd/journald.conf 2>/dev/null | cut -d= -f2)
+if [[ "$STORAGE" != "persistent" ]]; then
+  ALERTS+=("INFO: Journal storage is not persistent — logs will be lost on reboot")
+fi
+
+# Report
+if [[ "${#ALERTS[@]}" -gt 0 ]]; then
+  echo ""
+  echo "Logging health issues on ${HOSTNAME}:"
+  printf '%s\n' "${ALERTS[@]}"
+  exit 1
+else
+  echo "Logging is healthy on ${HOSTNAME}"
+fi
+```
+
+```bash
+sudo bash /usr/local/bin/logging-health.sh
+```
+
+## Common mistakes
+
+### Not enabling persistent journal storage
+
+Without persistent storage, all logs are lost on reboot — making post-incident analysis impossible.
+
+```bash
+sudo mkdir -p /var/log/journal
+sudo systemctl restart systemd-journald
+journalctl --list-boots | wc -l  # Should show more than 1 boot
+```
+
+### Not setting SystemMaxUse
+
+An unconfigured journal can grow very large on busy systems. Always set a size limit.
+
+```ini
+[Journal]
+SystemMaxUse=2G
+SystemKeepFree=1G
+```
+
+### Editing /etc/rsyslog.conf directly for custom rules
+
+Place custom rules in `/etc/rsyslog.d/` so they survive package updates.
+
+```bash
+# WRONG
+sudo nano /etc/rsyslog.conf
+
+# CORRECT
+sudo nano /etc/rsyslog.d/99-custom.conf
+```
+
+### Not testing rsyslog config after changes
+
+```bash
+sudo rsyslogd -N1
+sudo systemctl restart rsyslog
+logger "Test after config change"
+tail -3 /var/log/messages
+```
+
+### Forgetting to restart journald after journald.conf changes
+
+```bash
+sudo systemctl restart systemd-journald
+```
+
+## Summary
+
+AlmaLinux's dual logging architecture gives you the best of both worlds — structured binary logs via journald for powerful filtering and querying, and traditional text files via rsyslog for compatibility, forwarding, and long-term storage.
+
+Key points:
+
+- enable persistent journal storage immediately — logs must survive reboots
+- set `SystemMaxUse` and `SystemKeepFree` to prevent journal from filling the disk
+- use `journalctl -u servicename -b -p err` for fast post-incident log review
+- place custom rsyslog rules in `/etc/rsyslog.d/` — not in the main config file
+- test rsyslog config with `rsyslogd -N1` before restarting
+- use `systemd-cat` to write application output directly to the journal
+- always restart the relevant daemon after configuration changes
+
+:::tip Related pages
+- [Log Rotation](./log-rotation)
+- [Log Analysis](./log-analysis)
+- [Centralized Logging](./centralized-logging)
+- [Secure Logging](./secure-logging)
+:::

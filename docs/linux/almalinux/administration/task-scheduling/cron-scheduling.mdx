@@ -1,0 +1,474 @@
+---
+sidebar_position: 1
+title: "Cron Scheduling | AlmaLinux"
+sidebar_label: "Cron Scheduling"
+description: "Configure crond, manage crontabs, and implement reliable task scheduling on AlmaLinux. Covers syntax, user and system crontabs, environment variables, and troubleshooting."
+keywords:
+  - "almalinux cron"
+  - "almalinux crond"
+  - "almalinux crontab"
+  - "almalinux cron scheduling"
+  - "rhel cron"
+tags:
+  - almalinux
+  - task-scheduling
+  - cron
+  - automation
+slug: /linux/almalinux/administration/task-scheduling/cron-scheduling
+---
+
+# Cron Scheduling on AlmaLinux
+
+Cron is the traditional Unix task scheduler. It has been running scheduled jobs on Linux systems for decades and remains one of the most widely understood and relied-upon tools in system administration. On AlmaLinux, the `crond` daemon reads job definitions from a set of configuration files and runs them at the specified times, handling everything from nightly backups to hourly log rotation to weekly report generation.
+
+Despite the emergence of systemd timers as an alternative, cron remains the default choice for many administrators because its syntax is familiar, its behavior is predictable, and it requires no additional configuration to get started. Understanding cron thoroughly — its file structure, environment behavior, logging, and failure modes — is a foundational skill for managing AlmaLinux systems.
+
+---
+
+## How crond Works
+
+The `crond` daemon starts at boot and runs continuously in the background. Every minute, it wakes up, reads all crontab files, and checks whether any scheduled job is due to run. If a job's time specification matches the current minute, crond forks a child process to execute it.
+
+crond reads job definitions from several locations, which together form the complete set of scheduled tasks:
+
+- `/etc/crontab` — the system crontab, which includes a user field in each entry
+- `/etc/cron.d/` — a directory of additional system crontab files, also with a user field
+- `/var/spool/cron/` — per-user crontab files managed with the `crontab` command
+- `/etc/cron.hourly/`, `/etc/cron.daily/`, `/etc/cron.weekly/`, `/etc/cron.monthly/` — directories of scripts run at fixed intervals by `run-parts`
+
+Understanding the difference between these locations — particularly the presence or absence of a user field, and when to use which — prevents many common misconfiguration mistakes.
+
+### Checking crond Status
+
+Verify that crond is running and enabled at boot:
+
+```bash
+systemctl status crond
+```
+
+If it is not running:
+
+```bash
+systemctl enable --now crond
+```
+
+---
+
+## Crontab Syntax
+
+A cron entry consists of five time fields, an optional user field (in system crontabs), and the command to run. The time fields specify when the job runs; the command is executed by `/bin/sh` when the time matches.
+
+```
+┌───────────── minute (0–59)
+│  ┌──────────── hour (0–23)
+│  │  ┌─────────── day of month (1–31)
+│  │  │  ┌────────── month (1–12 or jan–dec)
+│  │  │  │  ┌─────── day of week (0–7, where 0 and 7 are Sunday, or sun–sat)
+│  │  │  │  │
+*  *  *  *  *  command
+```
+
+In system crontabs (`/etc/crontab` and files in `/etc/cron.d/`), a username field appears between the time fields and the command:
+
+```
+*  *  *  *  *  username  command
+```
+
+### Special Characters
+
+Beyond simple numeric values, cron time fields support several special characters that make scheduling more expressive:
+
+| Character | Meaning | Example |
+|---|---|---|
+| `*` | Every value | `*` in hour = every hour |
+| `,` | List of values | `1,15,30` in minute = at minutes 1, 15, and 30 |
+| `-` | Range of values | `9-17` in hour = hours 9 through 17 |
+| `/` | Step value | `*/15` in minute = every 15 minutes |
+
+These can be combined. `0-30/5` in the minute field means every 5 minutes from minute 0 to minute 30. `1,3,5` in the day-of-week field means Monday, Wednesday, and Friday.
+
+### Special Strings
+
+Cron also accepts shorthand strings in place of the five time fields:
+
+| String | Equivalent | Meaning |
+|---|---|---|
+| `@reboot` | — | Run once at startup |
+| `@yearly` | `0 0 1 1 *` | Once a year, on January 1st at midnight |
+| `@monthly` | `0 0 1 * *` | Once a month, on the 1st at midnight |
+| `@weekly` | `0 0 * * 0` | Once a week, on Sunday at midnight |
+| `@daily` | `0 0 * * *` | Once a day at midnight |
+| `@hourly` | `0 * * * *` | Once an hour, at the start of the hour |
+
+### Reading Cron Expressions
+
+A few examples help build intuition for reading and writing cron expressions:
+
+`30 2 * * *` — runs at 02:30 every day
+
+`0 */4 * * *` — runs at the top of every 4th hour: 00:00, 04:00, 08:00, 12:00, 16:00, 20:00
+
+`15 10 * * 1-5` — runs at 10:15 on weekdays (Monday through Friday)
+
+`0 0 1,15 * *` — runs at midnight on the 1st and 15th of each month
+
+`*/5 8-18 * * 1-5` — runs every 5 minutes between 08:00 and 18:00 on weekdays
+
+### Day of Month and Day of Week Interaction
+
+When both the day-of-month and day-of-week fields are specified (neither is `*`), cron runs the job when either condition is true — not when both are true simultaneously. For example, `0 0 1 * 5` runs at midnight on the 1st of every month AND at midnight every Friday. This often surprises people who expect it to mean "the first Friday of every month". If you need the first Friday of every month, that logic must be implemented inside the script rather than in the cron expression itself.
+
+---
+
+## Managing User Crontabs
+
+Each user on the system can have their own crontab, stored in `/var/spool/cron/<username>`. User crontabs do not include a user field — the job runs as the owner of the crontab automatically.
+
+### Editing a Crontab
+
+The `crontab -e` command opens the current user's crontab in the editor defined by the `EDITOR` or `VISUAL` environment variable (defaulting to `vi`):
+
+```bash
+crontab -e
+```
+
+For root's crontab:
+
+```bash
+sudo crontab -e
+```
+
+For another user's crontab (as root):
+
+```bash
+crontab -e -u alice
+```
+
+The `crontab` command validates the file when you save it. If there are syntax errors, it will warn you and offer to re-edit before saving.
+
+### Listing a Crontab
+
+To view the current user's crontab without editing it:
+
+```bash
+crontab -l
+```
+
+To view another user's crontab:
+
+```bash
+crontab -l -u alice
+```
+
+### Removing a Crontab
+
+To delete the current user's crontab entirely:
+
+```bash
+crontab -r
+```
+
+:::warning
+`crontab -r` removes the entire crontab without confirmation. There is no undo. If you meant to edit rather than remove, use `crontab -e`. The similarity between `-e` (edit) and `-r` (remove) has caught many administrators off guard. Some distributions add a confirmation prompt for `-r`, but AlmaLinux does not by default.
+:::
+
+### A Practical User Crontab Example
+
+The following crontab for a developer user runs a project build check every weekday morning and cleans up temporary files weekly:
+
+```bash
+crontab -e
+```
+
+```
+# Check project build status every weekday at 08:00
+0 8 * * 1-5 /home/alice/scripts/check-build.sh >> /home/alice/logs/build-check.log 2>&1
+
+# Clean up temp files every Sunday at 03:00
+0 3 * * 0 find /home/alice/tmp -mtime +7 -delete
+```
+
+---
+
+## System Crontabs
+
+System-wide scheduled tasks belong in `/etc/crontab` or in files under `/etc/cron.d/`. These files include a username field between the time specification and the command, allowing different jobs to run as different users without creating per-user crontabs.
+
+### /etc/crontab
+
+The system crontab at `/etc/crontab` is reserved for the operating system's own scheduled tasks on AlmaLinux. It drives the `run-parts` calls that execute scripts in `/etc/cron.hourly/`, `/etc/cron.daily/`, `/etc/cron.weekly/`, and `/etc/cron.monthly/`. It is best to leave this file as-is and use `/etc/cron.d/` for your own system jobs.
+
+### /etc/cron.d/
+
+Drop-in crontab files in `/etc/cron.d/` are read by crond exactly like `/etc/crontab`, including the user field requirement. They are the correct location for system-level scheduled tasks that are not managed by a package:
+
+```bash
+nano /etc/cron.d/myapp-maintenance
+```
+
+```
+# Run myapp database cleanup as the myapp user every night at 03:00
+0 3 * * *  myapp  /opt/myapp/bin/db-cleanup.sh
+
+# Generate weekly usage report as root on Monday at 06:00
+0 6 * * 1  root   /opt/myapp/bin/weekly-report.sh >> /var/log/myapp/weekly-report.log 2>&1
+```
+
+Files in `/etc/cron.d/` must be owned by root and must not be world-writable. crond silently ignores files that do not meet these requirements — a common source of confusion when a job that should be running is not.
+
+Verify file permissions after creating a cron drop-in:
+
+```bash
+ls -la /etc/cron.d/myapp-maintenance
+```
+
+The output should show `root root` ownership and permissions no more permissive than `644`.
+
+### /etc/cron.{hourly,daily,weekly,monthly}/
+
+These directories contain executable scripts (not crontab entries) that are run at fixed intervals by `run-parts`, called from `/etc/crontab`. Drop a script into the appropriate directory and it will be executed at that interval:
+
+```bash
+# A script that runs daily
+nano /etc/cron.daily/clean-old-sessions
+```
+
+```bash
+#!/bin/bash
+# Remove session files older than 7 days
+find /var/lib/php/session/ -name "sess_*" -mtime +7 -delete
+```
+
+```bash
+chmod 755 /etc/cron.daily/clean-old-sessions
+```
+
+Scripts in these directories must be executable and must not have a file extension — `run-parts` by default skips files with extensions. A script named `myjob.sh` in `/etc/cron.daily/` will never run; it must be named `myjob`.
+
+To test that `run-parts` would include your script:
+
+```bash
+run-parts --test /etc/cron.daily/
+```
+
+This lists the scripts that would be executed without actually running them.
+
+---
+
+## Environment Variables in Cron
+
+Cron jobs run in a minimal environment that is very different from an interactive shell session. This causes many jobs that work fine when run manually to fail when run by cron. Understanding cron's environment behavior prevents these failures.
+
+### The Cron Environment
+
+By default, cron sets only a small number of environment variables:
+
+- `HOME` — the user's home directory from `/etc/passwd`
+- `LOGNAME` / `USER` — the username
+- `SHELL` — `/bin/sh` (not bash)
+- `PATH` — a minimal path, typically `/usr/bin:/bin`
+
+Notably absent from the cron environment: `JAVA_HOME`, `PYTHON_PATH`, `NVM_DIR`, `GOPATH`, custom `PATH` extensions set in `.bashrc` or `.bash_profile`, and any other variable set in shell initialization files. A script that relies on any of these will fail silently when run by cron.
+
+### Setting Environment Variables in a Crontab
+
+Variables can be set directly in the crontab file, before any job entries:
+
+```
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+MAILTO=admin@example.com
+
+# Jobs below use the environment defined above
+0 2 * * *  /usr/local/sbin/system-backup.sh
+```
+
+`SHELL=/bin/bash` changes the shell used to execute jobs from `/bin/sh` to bash, which is important if any scripts use bash-specific syntax. `PATH` sets a broader path that includes `/usr/local/bin` and `/usr/local/sbin` where many installed tools live. `MAILTO` controls where cron sends job output (more on this below).
+
+### Using Absolute Paths
+
+The most reliable approach is to use absolute paths for all commands and scripts in cron jobs, regardless of `PATH` settings:
+
+```
+0 2 * * *  /usr/local/sbin/system-backup.sh
+0 3 * * *  /usr/bin/find /tmp -mtime +1 -delete
+```
+
+This eliminates any dependency on `PATH` and makes it immediately clear which binary is being executed.
+
+### Sourcing the User Environment
+
+For jobs that genuinely need the user's full environment — for example, a job running a language runtime that was installed with a version manager — source the user's environment explicitly at the start of the script:
+
+```bash
+#!/bin/bash
+# Source the user's environment for language runtime paths
+source /home/alice/.bash_profile
+
+# Now language-specific tools are available
+cd /home/alice/myproject && npm run build
+```
+
+This is more reliable than trying to replicate the environment in the crontab file itself.
+
+---
+
+## Handling Cron Output
+
+By default, cron captures both standard output and standard error from each job and emails them to the local mailbox of the user who owns the crontab (or to root for system crontabs). On most servers, this local mail is never read, which means job output — including error messages — disappears unnoticed.
+
+### Configuring Email Delivery
+
+To redirect cron email to an external address, set `MAILTO` in the crontab:
+
+```
+MAILTO=admin@example.com
+```
+
+This requires a working mail transfer agent (such as Postfix) configured to relay mail externally. Test mail delivery before relying on it:
+
+```bash
+echo "Cron mail test" | mail -s "Test" admin@example.com
+```
+
+To suppress all email output for a specific job (useful for jobs that produce expected output that does not need to be read):
+
+```
+0 * * * *  /usr/local/sbin/routine-check.sh > /dev/null 2>&1
+```
+
+Redirecting both stdout and stderr to `/dev/null` silences the job completely. Use this only for jobs where you have another mechanism to detect failures — a job that fails silently is worse than one that sends too much email.
+
+### Redirecting Output to a Log File
+
+A better approach than either email or silence is directing job output to a log file:
+
+```
+0 2 * * *  /usr/local/sbin/system-backup.sh >> /var/log/backup/cron.log 2>&1
+```
+
+The `>>` appends to the log file rather than overwriting it. `2>&1` redirects stderr to stdout so both streams go to the same file. Add a logrotate configuration for any cron log files to prevent them from growing indefinitely.
+
+---
+
+## Controlling Access to Cron
+
+On a multi-user system, it may be appropriate to restrict which users can use cron. crond respects two control files:
+
+- `/etc/cron.allow` — if this file exists, only users listed in it can use cron
+- `/etc/cron.deny` — if this file exists (and `cron.allow` does not), users listed in it are denied cron access
+
+If neither file exists, the behavior depends on the crond implementation — on AlmaLinux, all users are allowed by default.
+
+To allow only specific users:
+
+```bash
+nano /etc/cron.allow
+```
+
+```
+root
+alice
+bob
+```
+
+To deny specific users while allowing everyone else:
+
+```bash
+nano /etc/cron.deny
+```
+
+```
+charlie
+```
+
+---
+
+## Troubleshooting Cron Jobs
+
+When a cron job is not running as expected, a systematic approach to troubleshooting resolves most issues quickly.
+
+### Checking crond Logs
+
+crond logs job execution to the system journal. Check for recent cron activity:
+
+```bash
+journalctl -u crond --since "1 hour ago"
+```
+
+Each job execution appears as a line like:
+
+```
+Jun 01 02:00:01 web01 crond[1234]: (root) CMD (/usr/local/sbin/system-backup.sh)
+```
+
+If the job is listed here, crond attempted to run it. If it is not listed, the job is either not scheduled correctly or crond is not running.
+
+### Verifying the Job Schedule
+
+Use `crontab -l` to verify the crontab contains the expected entry. For system crontabs, check `/etc/cron.d/` and `/etc/crontab` directly.
+
+To confirm that the time expression fires when expected, calculate the next few times manually or use an online cron expression evaluator. A common mistake is expecting `*/15` in the hour field to mean "every 15 hours" when it actually means "every hour divisible by 15" — which is hours 0 and 15 only.
+
+### Testing the Command Manually
+
+Run the exact command from the crontab entry manually as the user who owns the crontab, with a minimal environment matching what cron provides:
+
+```bash
+sudo -u alice env -i HOME=/home/alice LOGNAME=alice USER=alice \
+    SHELL=/bin/bash PATH=/usr/bin:/bin \
+    /bin/bash -c '/home/alice/scripts/check-build.sh'
+```
+
+The `env -i` flag starts with an empty environment, and the variables that follow replicate what cron provides. If the command fails in this environment but succeeds in a normal shell, the cause is almost certainly a missing environment variable — most likely `PATH`.
+
+### Checking File Permissions
+
+Cron drop-in files must meet strict permission requirements. crond silently ignores files that are world-writable or not owned by root:
+
+```bash
+ls -la /etc/cron.d/
+```
+
+Scripts called by cron must be executable by the user running them:
+
+```bash
+ls -la /usr/local/sbin/system-backup.sh
+```
+
+### Common Cron Mistakes
+
+A few mistakes account for the majority of cron problems:
+
+**Relative paths in commands.** A script that calls `./helper.sh` assumes the current directory is the script's directory. Cron sets the working directory to the user's home directory, not the script's location. Always use absolute paths within scripts called by cron.
+
+**Missing newline at end of crontab.** Some implementations of cron do not run the last job in a crontab if the file does not end with a newline. The `crontab -e` command usually handles this, but files written directly may not.
+
+**% characters in commands.** In cron, an unescaped `%` in a command is interpreted as a newline. A date command like `date +%Y-%m-%d` must be written as `date +\%Y-\%m-\%d` in a crontab entry, or wrapped in a script that handles the `%` normally.
+
+**File extension on scripts in cron.d directories.** Scripts in `/etc/cron.hourly/`, `/etc/cron.daily/`, etc. must not have a file extension. A file named `cleanup.sh` is silently skipped.
+
+---
+
+## Summary
+
+Cron scheduling on AlmaLinux is built around the `crond` daemon reading job definitions from `/etc/crontab`, `/etc/cron.d/`, per-user crontabs in `/var/spool/cron/`, and the fixed-interval script directories. Understanding the distinction between user crontabs (no user field) and system crontabs (with user field), handling the minimal cron environment correctly, and directing output to log files rather than local mail are the foundations of reliable cron usage.
+
+Key points to remember:
+
+- Use `/etc/cron.d/` for system-level scheduled tasks; avoid editing `/etc/crontab` directly
+- Scripts in `/etc/cron.daily/` and similar directories must be executable and must not have a file extension
+- cron runs jobs with a minimal `PATH` — use absolute paths in commands or set `PATH` explicitly in the crontab
+- Set `SHELL=/bin/bash` in crontabs that use bash-specific syntax
+- Redirect job output to log files with `>> /var/log/... 2>&1` rather than relying on local mail delivery
+- `crontab -r` removes the entire crontab without confirmation — use with care
+- When a job is not running, check `journalctl -u crond` first to confirm whether crond attempted to execute it
+- Test commands manually with `env -i` to replicate the minimal cron environment
+
+### Related Pages
+
+- [Systemd Timers](./systemd-timers) — modern scheduling with systemd timer units
+- [At Commands](./at-commands) — one-time and deferred job scheduling with at and batch
+- [Maintenance Automation](./maintenance-automation) — scheduling system maintenance tasks
+- [Backup Scheduling](./backup-scheduling) — automating backup jobs with cron
+- [Enterprise Scheduling](./enterprise-scheduling) — complex job dependencies and patterns

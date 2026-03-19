@@ -1,0 +1,480 @@
+---
+sidebar_position: 5
+title: "Log Monitoring | AlmaLinux"
+sidebar_label: "Log Monitoring"
+description: "Monitor logs with journalctl, rsyslog, and integrate with centralized logging solutions on AlmaLinux."
+keywords:
+  - "almalinux log monitoring"
+  - "almalinux journalctl"
+  - "almalinux rsyslog"
+  - "almalinux centralized logging"
+  - "rhel log management"
+tags:
+  - almalinux
+  - system-monitoring
+  - logging
+  - journald
+  - rsyslog
+slug: /linux/almalinux/administration/system-monitoring/log-monitoring
+---
+
+# Log Monitoring
+
+Logs are your primary source of truth when something goes wrong. AlmaLinux uses two logging systems that work alongside each other — **systemd-journald** for structured in-memory and persistent logs, and **rsyslog** for traditional text-based log files and forwarding to centralized systems. Understanding both gives you complete visibility into what your system is doing.
+
+## How logging works on AlmaLinux
+
+```
+Services / Kernel
+       │
+  systemd-journald  ──►  /var/log/journal/  (binary, structured)
+       │
+    rsyslog         ──►  /var/log/          (text files)
+       │
+  Remote syslog / SIEM
+```
+
+journald captures everything from systemd units, the kernel, and the boot process. rsyslog reads from journald and writes traditional text log files, and can forward to remote destinations.
+
+## journalctl basics
+
+```bash
+# Show all logs (most recent last)
+journalctl
+
+# Follow logs in real time
+journalctl -f
+
+# Show logs since last boot
+journalctl -b
+
+# Show logs from a previous boot
+journalctl -b -1
+
+# List available boots
+journalctl --list-boots
+```
+
+## Filter by time
+
+```bash
+# Logs from the last hour
+journalctl --since "1 hour ago"
+
+# Logs from today
+journalctl --since today
+
+# Logs in a specific time range
+journalctl --since "2026-03-19 08:00:00" --until "2026-03-19 12:00:00"
+
+# Logs from the last 10 minutes
+journalctl --since "10 minutes ago"
+```
+
+## Filter by unit and service
+
+```bash
+# Logs for a specific service
+journalctl -u nginx
+journalctl -u sshd
+journalctl -u postgresql
+
+# Follow a service log in real time
+journalctl -u nginx -f
+
+# Logs for multiple services
+journalctl -u nginx -u php-fpm
+
+# Logs for a service since last boot
+journalctl -u nginx -b
+```
+
+## Filter by priority
+
+journald uses syslog priority levels:
+
+| Level | Name | Meaning |
+|-------|------|---------|
+| 0 | `emerg` | System is unusable |
+| 1 | `alert` | Immediate action required |
+| 2 | `crit` | Critical condition |
+| 3 | `err` | Error condition |
+| 4 | `warning` | Warning condition |
+| 5 | `notice` | Normal but significant |
+| 6 | `info` | Informational |
+| 7 | `debug` | Debug-level messages |
+
+```bash
+# Show only errors and above
+journalctl -p err
+
+# Show warnings and above
+journalctl -p warning
+
+# Show errors for a specific service
+journalctl -u nginx -p err
+
+# Show critical and above since last boot
+journalctl -b -p crit
+```
+
+## Filter by process and PID
+
+```bash
+# Logs from a specific binary
+journalctl /usr/sbin/sshd
+
+# Logs from a specific PID
+journalctl _PID=1234
+
+# Logs from a specific user
+journalctl _UID=1001
+```
+
+## Output formats
+
+```bash
+# Short format (default)
+journalctl -u nginx
+
+# Show full metadata fields
+journalctl -u nginx -o verbose
+
+# JSON output for parsing
+journalctl -u nginx -o json
+
+# JSON with one entry per line
+journalctl -u nginx -o json-short
+
+# Output without paging
+journalctl -u nginx --no-pager
+```
+
+## Kernel and boot logs
+
+```bash
+# Kernel messages only
+journalctl -k
+
+# Kernel messages since last boot
+journalctl -k -b
+
+# Boot process messages
+journalctl -b | head -100
+
+# Previous boot errors
+journalctl -b -1 -p err
+```
+
+## Manage journal disk usage
+
+```bash
+# Check journal disk usage
+journalctl --disk-usage
+
+# Vacuum logs older than 30 days
+sudo journalctl --vacuum-time=30d
+
+# Vacuum until total size is under 2GB
+sudo journalctl --vacuum-size=2G
+
+# Vacuum keeping only the last 5 boots
+sudo journalctl --vacuum-files=5
+```
+
+### Persistent journal configuration
+
+By default journald stores logs in memory and loses them on reboot. Enable persistent storage:
+
+```bash
+sudo mkdir -p /var/log/journal
+sudo systemd-tmpfiles --create --prefix /var/log/journal
+sudo systemctl restart systemd-journald
+```
+
+Configure retention in `/etc/systemd/journald.conf`:
+
+```bash
+sudo nano /etc/systemd/journald.conf
+```
+
+```ini
+[Journal]
+# Store logs persistently
+Storage=persistent
+
+# Maximum disk space for journal
+SystemMaxUse=2G
+
+# Maximum size of a single journal file
+SystemMaxFileSize=200M
+
+# Keep logs for 30 days
+MaxRetentionSec=30day
+
+# Compress journal files
+Compress=yes
+```
+
+Restart journald:
+
+```bash
+sudo systemctl restart systemd-journald
+```
+
+## rsyslog configuration
+
+rsyslog writes traditional text log files under `/var/log/`. These are human-readable and work with standard Unix tools.
+
+### Key log files
+
+| File | Contents |
+|------|---------|
+| `/var/log/messages` | General system messages |
+| `/var/log/secure` | Authentication and sudo events |
+| `/var/log/cron` | Cron job output |
+| `/var/log/maillog` | Mail server logs |
+| `/var/log/boot.log` | Boot process messages |
+| `/var/log/audit/audit.log` | Auditd events |
+| `/var/log/nginx/` | Nginx access and error logs |
+
+### View and follow text logs
+
+```bash
+# View the last 100 lines
+tail -100 /var/log/messages
+
+# Follow in real time
+tail -f /var/log/secure
+
+# Follow multiple files at once
+tail -f /var/log/messages /var/log/secure
+
+# Search for a pattern
+grep "Failed password" /var/log/secure | tail -20
+
+# Count occurrences
+grep -c "Failed password" /var/log/secure
+```
+
+## Configure rsyslog log forwarding
+
+Forward logs to a centralized syslog server or SIEM.
+
+```bash
+sudo nano /etc/rsyslog.d/99-forward.conf
+```
+
+Forward over UDP (less reliable, lower overhead):
+
+```bash
+# Forward all logs via UDP
+*.* @siem.example.com:514
+```
+
+Forward over TCP (reliable, recommended):
+
+```bash
+# Forward all logs via TCP
+*.* @@siem.example.com:514
+
+# Forward only auth and error logs
+authpriv.*    @@siem.example.com:514
+*.err         @@siem.example.com:514
+```
+
+Restart rsyslog:
+
+```bash
+sudo systemctl restart rsyslog
+```
+
+### Forward with TLS encryption
+
+For production log forwarding, encrypt the stream with TLS:
+
+```bash
+sudo dnf install -y rsyslog-gnutls
+```
+
+```bash
+sudo nano /etc/rsyslog.d/99-forward-tls.conf
+```
+
+```bash
+# TLS settings
+global(
+  DefaultNetstreamDriver="gtls"
+  DefaultNetstreamDriverCAFile="/etc/pki/tls/certs/ca-bundle.crt"
+)
+
+# Forward all logs over TLS
+action(
+  type="omfwd"
+  target="siem.example.com"
+  port="6514"
+  protocol="tcp"
+  StreamDriver="gtls"
+  StreamDriverMode="1"
+  StreamDriverAuthMode="x509/name"
+)
+```
+
+```bash
+sudo systemctl restart rsyslog
+```
+
+## Log rotation with logrotate
+
+`logrotate` prevents log files from filling the disk by rotating, compressing, and removing old logs.
+
+```bash
+# View the main logrotate config
+cat /etc/logrotate.conf
+
+# View service-specific configs
+ls /etc/logrotate.d/
+
+# Test logrotate without making changes
+sudo logrotate -d /etc/logrotate.conf
+
+# Force a rotation now
+sudo logrotate -f /etc/logrotate.conf
+```
+
+### Add a custom logrotate config
+
+```bash
+sudo nano /etc/logrotate.d/myapp
+```
+
+```bash
+/var/log/myapp/*.log {
+    daily
+    rotate 14
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0640 myapp myapp
+    postrotate
+        systemctl reload myapp > /dev/null 2>&1 || true
+    endscript
+}
+```
+
+## Watch logs for patterns with a script
+
+A script to tail logs and alert on specific patterns:
+
+```bash
+#!/bin/bash
+# log-alert.sh — watch logs and alert on critical patterns
+
+LOG_FILE="/var/log/secure"
+ALERT_EMAIL="ops@example.com"
+HOSTNAME=$(hostname)
+STATE_FILE="/var/run/log-alert.pos"
+
+# Patterns to alert on
+PATTERNS=(
+  "Failed password"
+  "authentication failure"
+  "POSSIBLE BREAK-IN ATTEMPT"
+  "sudo: .* COMMAND"
+)
+
+# Get the last read position
+LAST_POS=0
+[[ -f "$STATE_FILE" ]] && LAST_POS=$(cat "$STATE_FILE")
+CURRENT_SIZE=$(wc -c < "$LOG_FILE")
+
+# Save current position
+echo "$CURRENT_SIZE" > "$STATE_FILE"
+
+# Read new lines since last check
+NEW_LINES=$(tail -c +"$((LAST_POS + 1))" "$LOG_FILE" 2>/dev/null)
+[[ -z "$NEW_LINES" ]] && exit 0
+
+ALERTS=()
+for pattern in "${PATTERNS[@]}"; do
+  MATCHES=$(echo "$NEW_LINES" | grep -c "$pattern" || true)
+  if [[ "$MATCHES" -gt 0 ]]; then
+    ALERTS+=("$MATCHES matches for pattern: '$pattern'")
+  fi
+done
+
+if [[ "${#ALERTS[@]}" -gt 0 ]]; then
+  DETAIL=$(echo "$NEW_LINES" | grep -E "$(IFS='|'; echo "${PATTERNS[*]}")")
+  MESSAGE="Log alert on ${HOSTNAME}:\n\n$(printf '%s\n' "${ALERTS[@]}")\n\nDetail:\n${DETAIL}"
+  echo -e "$MESSAGE" | mail -s "Log Alert: ${HOSTNAME}" "$ALERT_EMAIL"
+  echo -e "$MESSAGE"
+fi
+```
+
+Schedule with cron:
+
+```bash
+sudo crontab -e
+```
+
+```
+*/5 * * * * /usr/local/bin/log-alert.sh >> /var/log/log-alert.log 2>&1
+```
+
+## Common mistakes
+
+### Not enabling persistent journal storage
+
+Without persistent storage, logs are lost on every reboot — making post-incident analysis much harder.
+
+```bash
+sudo mkdir -p /var/log/journal
+sudo systemctl restart systemd-journald
+```
+
+### Not setting journal size limits
+
+An unconfigured journal can grow very large on busy systems. Always set `SystemMaxUse` in `journald.conf`.
+
+### Forwarding logs without encryption
+
+Logs often contain sensitive information — usernames, IPs, error details. Always use TLS for remote forwarding in production.
+
+### Not testing logrotate configs
+
+A broken logrotate config silently stops rotating logs. Test with `-d` before deploying.
+
+```bash
+sudo logrotate -d /etc/logrotate.d/myapp
+```
+
+### Grepping large log files without filtering by time
+
+On busy servers, `/var/log/messages` can grow very large. Use `journalctl --since` or `awk` to limit the search range before grepping.
+
+```bash
+# More efficient than grepping the whole file
+journalctl -u nginx --since "1 hour ago" | grep "error"
+```
+
+## Summary
+
+Effective log monitoring on AlmaLinux combines journald for structured real-time access with rsyslog for text files, rotation, and forwarding to centralized systems.
+
+Key points:
+
+- use `journalctl -f -u servicename` for real-time service log tailing
+- use `journalctl -p err -b` to quickly find errors since last boot
+- enable persistent journal storage so logs survive reboots
+- set `SystemMaxUse` in `journald.conf` to prevent disk exhaustion
+- configure rsyslog to forward logs to a centralized server over TLS
+- use `logrotate` with `compress` and `rotate` to manage text log file size
+- script pattern matching against key log files and alert on suspicious activity
+
+:::tip Related pages
+- [Network Monitoring](./network-monitoring)
+- [Enterprise Alerting](./enterprise-alerting)
+- [Metrics Collection](./metrics-collection)
+- [User Auditing](/linux/almalinux/administration/user-management/user-auditing)
+:::

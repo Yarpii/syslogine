@@ -1,0 +1,516 @@
+---
+sidebar_position: 6
+title: "Service Maintenance | AlmaLinux"
+sidebar_label: "Service Maintenance"
+description: "Maintain systemd services on AlmaLinux by managing unit files, handling dependencies, optimizing startup, performing service updates, and monitoring service health."
+keywords:
+  - "almalinux service maintenance"
+  - "almalinux systemd"
+  - "almalinux service management"
+  - "almalinux unit files"
+  - "rhel service maintenance"
+tags:
+  - almalinux
+  - system-maintenance
+  - systemd
+  - services
+  - unit-files
+slug: /linux/almalinux/administration/system-maintenance/service-maintenance
+---
+
+# Service Maintenance on AlmaLinux
+
+Services are the runtime components of a system — the daemons, workers, and background processes that deliver the functionality the system exists to provide. Keeping services healthy over time requires more than just starting them and hoping for the best. Unit file configurations drift from best practice as the system evolves. Dependencies between services can become implicit and fragile. Startup times creep up as more services are added. Services that fail are not always restarted correctly or quickly enough.
+
+Systemd is the service manager on AlmaLinux, and understanding how to maintain services through it — reviewing unit configurations, managing dependencies explicitly, optimizing the boot sequence, handling failures gracefully, and monitoring service health — is central to keeping a production system reliable.
+
+---
+
+## Reviewing Service Status
+
+The starting point for any service maintenance task is understanding the current state of services on the system.
+
+### Listing All Services
+
+To see all service units and their current state:
+
+```bash
+systemctl list-units --type=service
+```
+
+To include inactive and failed services:
+
+```bash
+systemctl list-units --type=service --all
+```
+
+### Identifying Failed Services
+
+To see only services that have failed:
+
+```bash
+systemctl --failed
+```
+
+This is the most important daily health check for service maintenance. Any service appearing here warrants investigation. Failed services do not restart automatically unless the unit file is configured with a restart policy.
+
+### Checking a Specific Service
+
+To see the full status of a service, including recent log output:
+
+```bash
+systemctl status nginx
+```
+
+The output shows the service state, the PID if running, memory usage, the last 10 lines of journal output, and how long it has been running. The journal excerpt is often enough to identify why a service failed without a separate `journalctl` query.
+
+### Viewing All Service Logs
+
+For deeper investigation beyond the status output:
+
+```bash
+journalctl -u nginx
+```
+
+To see only errors:
+
+```bash
+journalctl -u nginx -p err
+```
+
+To follow output in real time while restarting or reloading a service:
+
+```bash
+journalctl -f -u nginx
+```
+
+---
+
+## Managing Unit Files
+
+### Understanding Unit File Locations
+
+Systemd reads unit files from multiple directories with a defined precedence order:
+
+| Location | Purpose | Precedence |
+|---|---|---|
+| `/etc/systemd/system/` | Administrator-defined units and overrides | Highest |
+| `/run/systemd/system/` | Runtime units (temporary, lost on reboot) | Second |
+| `/usr/lib/systemd/system/` | Package-installed units | Lowest |
+
+Never edit files in `/usr/lib/systemd/system/` directly. Package updates overwrite these files, destroying any changes. Always override using `/etc/systemd/system/`.
+
+### Viewing the Effective Unit Configuration
+
+To see the full effective configuration of a unit, including any overrides that have been applied:
+
+```bash
+systemctl cat nginx
+```
+
+The output shows each file contributing to the unit's configuration, with their paths. Lines from override files are shown after the original unit content, making it easy to see what has been customized.
+
+### Creating Drop-In Overrides
+
+Drop-in files override specific directives of a package-provided unit without replacing the whole file. Use `systemctl edit` to create one:
+
+```bash
+systemctl edit nginx
+```
+
+This opens an editor for a drop-in file at `/etc/systemd/system/nginx.service.d/override.conf`. Add only the directives you want to change:
+
+```ini
+[Service]
+# Increase the number of open file descriptors for high-traffic nginx
+LimitNOFILE=65536
+
+# Restart nginx automatically if it fails
+Restart=on-failure
+RestartSec=5s
+```
+
+Save and close. Systemd reloads the configuration automatically. Verify the override is applied:
+
+```bash
+systemctl cat nginx | grep -A5 "override.conf"
+```
+
+### Creating Custom Service Units
+
+For services not managed by a package — application daemons, custom scripts, third-party tools — create a unit file in `/etc/systemd/system/`:
+
+```bash
+nano /etc/systemd/system/myapp.service
+```
+
+```ini
+[Unit]
+Description=MyApp Application Server
+Documentation=https://docs.myapp.example.com
+After=network-online.target postgresql.service
+Requires=postgresql.service
+
+[Service]
+Type=notify
+User=myapp
+Group=myapp
+WorkingDirectory=/opt/myapp
+EnvironmentFile=/etc/myapp/environment
+ExecStart=/opt/myapp/bin/myapp --config /etc/myapp/config.yaml
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=10s
+StartLimitIntervalSec=60s
+StartLimitBurst=3
+TimeoutStartSec=30s
+TimeoutStopSec=30s
+
+# Security hardening
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/myapp /var/log/myapp
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Key directives in this unit:
+
+- `After=` and `Requires=` — explicit dependency ordering; the service starts after postgresql and fails if postgresql is not running
+- `Type=notify` — the application signals systemd when it is ready; use `Type=simple` if the application does not support this
+- `EnvironmentFile=` — loads environment variables from a file rather than embedding them in the unit
+- `Restart=on-failure` — automatically restarts if the process exits with a non-zero status
+- `StartLimitBurst=3` — prevents a crash-looping service from restarting indefinitely (limits to 3 restarts within `StartLimitIntervalSec`)
+- `NoNewPrivileges`, `PrivateTmp`, `ProtectSystem` — security hardening directives that sandbox the service
+
+After creating the file, reload systemd and enable the service:
+
+```bash
+systemctl daemon-reload
+systemctl enable --now myapp.service
+```
+
+---
+
+## Managing Service Dependencies
+
+### Understanding Dependency Directives
+
+Systemd provides several dependency directives with subtly different semantics:
+
+| Directive | Meaning |
+|---|---|
+| `Requires=` | Hard dependency; if the dependency fails, this unit fails too |
+| `Wants=` | Soft dependency; if the dependency fails, this unit continues |
+| `After=` | Ordering; this unit starts after the named unit (no dependency implied) |
+| `Before=` | Ordering; this unit starts before the named unit |
+| `BindsTo=` | Like Requires, but also stops this unit if the dependency stops |
+| `PartOf=` | This unit is part of a group; stopping the group stops this unit |
+| `Conflicts=` | This unit cannot run at the same time as the named unit |
+
+`Requires=` and `After=` are usually combined — `Requires=` ensures the dependency is active, `After=` ensures ordering. Without `After=`, systemd may start both units simultaneously even when `Requires=` is set.
+
+### Checking Current Dependencies
+
+To see what a unit requires and what it is ordered after:
+
+```bash
+systemctl show nginx --property=Requires,After,Wants
+```
+
+To see the full dependency tree for a unit:
+
+```bash
+systemd-analyze critical-chain nginx.service
+```
+
+This shows the chain of units that nginx depends on, with the time each unit took to start. It is useful for both dependency debugging and startup time optimization.
+
+### Visualizing the Dependency Graph
+
+For a visual representation of all service dependencies (useful when debugging complex dependency relationships):
+
+```bash
+systemd-analyze dot --to-pattern=*.service | dot -Tsvg > /tmp/service-deps.svg
+```
+
+This requires `graphviz`:
+
+```bash
+dnf install graphviz
+```
+
+The resulting SVG can be opened in a browser and shows the full service dependency graph. Filter it to specific services of interest to reduce complexity:
+
+```bash
+systemd-analyze dot nginx.service postgresql.service | dot -Tsvg > /tmp/app-deps.svg
+```
+
+---
+
+## Startup Time Optimization
+
+Boot time accumulates from the startup time of every service that must complete before the system is ready. On systems with many services, this can extend boot times significantly. Analyzing and optimizing the startup sequence improves both boot time and understanding of which services are critical path.
+
+### Analyzing Boot Time
+
+```bash
+systemd-analyze
+```
+
+This shows total boot time split into firmware, bootloader, kernel, and userspace phases. The userspace phase is what systemd controls.
+
+To see how long each unit took to start:
+
+```bash
+systemd-analyze blame
+```
+
+This lists all units ordered by their initialization time. Services at the top of the list are the best candidates for optimization.
+
+### Finding the Critical Path
+
+```bash
+systemd-analyze critical-chain
+```
+
+This shows the chain of units that determined the total boot time — the critical path. Reducing the startup time of any unit on the critical chain directly reduces overall boot time; optimizing units off the critical chain has no effect on total boot time.
+
+### Common Startup Optimizations
+
+**Disabling unused services.** Services that start at boot but are not needed waste startup time and consume memory:
+
+```bash
+# List all enabled services
+systemctl list-unit-files --type=service --state=enabled
+
+# Disable a service that is not needed
+systemctl disable bluetooth.service
+```
+
+**Delaying non-critical services.** Services that do not need to be available immediately can be delayed using a timer unit that activates them after the system is otherwise ready:
+
+```bash
+nano /etc/systemd/system/delayed-reporting.timer
+```
+
+```ini
+[Unit]
+Description=Delay reporting service startup
+
+[Timer]
+OnBootSec=2min
+
+[Install]
+WantedBy=timers.target
+```
+
+**Using socket activation.** Services that are accessed occasionally can use socket activation — systemd opens the socket and starts the service only when a connection arrives. This means the service does not need to be running continuously, reducing idle resource consumption:
+
+```bash
+systemctl cat cups.socket
+```
+
+`cups.socket` is an example of socket activation — the CUPS printing service starts only when a connection to the print socket is made.
+
+---
+
+## Service Restart Policies
+
+Production services should restart automatically when they fail. The restart policy in the unit file defines when and how this happens.
+
+### Restart Directives
+
+```ini
+[Service]
+# When to restart:
+# no: never restart (default)
+# on-failure: restart only on non-zero exit, signal, timeout, or watchdog
+# on-abnormal: restart on signal, timeout, or watchdog (not on non-zero exit)
+# always: restart regardless of exit status
+Restart=on-failure
+
+# How long to wait before restarting
+RestartSec=10s
+
+# Limit restart attempts to prevent crash loops:
+# Allow 3 restarts within 60 seconds; if exceeded, the service enters failed state
+StartLimitBurst=3
+StartLimitIntervalSec=60s
+```
+
+`Restart=on-failure` is appropriate for production services — it restarts on crashes and signals but not on intentional stops (`systemctl stop`). `Restart=always` restarts even after intentional stops, which is appropriate only for services that should genuinely never be stopped during normal operation.
+
+### Resetting the Failure Counter
+
+After too many restarts within the `StartLimitIntervalSec` window, a service enters a failed state and stops being restarted. To manually reset the counter and allow the service to try again:
+
+```bash
+systemctl reset-failed nginx
+systemctl start nginx
+```
+
+This is appropriate after the underlying cause of the crash has been addressed — resetting without fixing the root cause just restarts the crash loop.
+
+---
+
+## Service Updates and Configuration Reloads
+
+### Updating Service Configuration
+
+When a package update changes a unit file, systemd does not automatically use the new version. After updating a package that includes a service unit, reload the systemd configuration:
+
+```bash
+dnf upgrade nginx
+systemctl daemon-reload
+systemctl restart nginx
+```
+
+`daemon-reload` causes systemd to re-read all unit files. Without it, systemd continues using the old unit configuration from memory even though the file on disk has changed.
+
+### Reloading vs. Restarting
+
+Many services support configuration reloads — applying new configuration without interrupting existing connections. This is preferable to a full restart for services handling live traffic:
+
+```bash
+# Reload configuration without dropping connections
+systemctl reload nginx
+
+# Full restart (drops connections)
+systemctl restart nginx
+```
+
+Not all services support reload. Check whether a service's unit file defines `ExecReload=`:
+
+```bash
+systemctl show nginx --property=ExecReload
+```
+
+If `ExecReload` is empty, the service does not support reloads and a full restart is required.
+
+### Zero-Downtime Restarts
+
+For services that cannot tolerate any interruption, zero-downtime restart strategies depend on the specific service:
+
+- **nginx:** `systemctl reload nginx` (graceful reload, reuses existing worker processes)
+- **HAProxy:** `systemctl reload haproxy` (passes existing connections to new process)
+- **PostgreSQL:** configuration reloads via `pg_ctl reload` or `systemctl reload postgresql`
+
+For custom services, implement reload support by handling `SIGHUP` in the application and defining `ExecReload=/bin/kill -HUP $MAINPID` in the unit file.
+
+---
+
+## Resource Limits for Services
+
+Systemd can apply resource limits to individual services, preventing a runaway service from consuming all system resources. These limits are enforced by the kernel's cgroup mechanism.
+
+### Setting CPU and Memory Limits
+
+Add resource limits to a service override:
+
+```bash
+systemctl edit myapp.service
+```
+
+```ini
+[Service]
+# Limit to 2 CPU cores
+CPUQuota=200%
+
+# Soft memory limit: kernel starts reclaiming memory at this point
+MemoryHigh=2G
+
+# Hard memory limit: OOM killer activates if this is exceeded
+MemoryMax=3G
+
+# Prevent the OOM killer from targeting this service
+OOMScoreAdjust=-500
+```
+
+`CPUQuota=200%` limits the service to the equivalent of 2 CPU cores across all threads, regardless of how many cores the system has. `MemoryHigh` causes memory reclaim before the hard limit is reached, reducing the chance of an OOM kill.
+
+### Setting File Descriptor Limits
+
+Services with high connection counts (web servers, databases, proxies) often need more file descriptors than the default:
+
+```bash
+systemctl edit nginx.service
+```
+
+```ini
+[Service]
+LimitNOFILE=65536
+```
+
+### Viewing Current Resource Usage
+
+To see current resource consumption for all running services:
+
+```bash
+systemctl status
+```
+
+For a continuously updated view sorted by CPU or memory usage:
+
+```bash
+systemd-cgtop
+```
+
+`systemd-cgtop` shows CPU, memory, and I/O usage per cgroup (per service), updated in real time. It is the systemd equivalent of `top` at the service level rather than the process level.
+
+---
+
+## Auditing Enabled Services
+
+Regularly reviewing which services are enabled prevents the accumulation of services that are no longer needed. Each unnecessary service is an attack surface, a potential source of resource consumption, and something else that can fail.
+
+### Listing All Enabled Services
+
+```bash
+systemctl list-unit-files --type=service --state=enabled
+```
+
+Review this list periodically against what the system is actually supposed to be running. Services that were installed for a one-off task and never disabled are common findings.
+
+### Checking for Services from Removed Packages
+
+When a package is removed, its service unit file is deleted, but the service may still appear as enabled because the symlink in the target directory remains. Systemd calls these "dangling" or "orphaned" unit files:
+
+```bash
+systemctl --all | grep "not-found"
+```
+
+Clean up any listed units:
+
+```bash
+systemctl disable <orphaned-service>
+rm -f /etc/systemd/system/<orphaned-service>.service
+systemctl daemon-reload
+```
+
+---
+
+## Summary
+
+Service maintenance on AlmaLinux is built around systemd's unit file system, dependency model, and logging integration. Keeping services healthy requires understanding how to override package unit files safely, how to express dependencies explicitly rather than assuming them, how to set restart policies and resource limits, and how to analyze startup performance.
+
+Key points to remember:
+
+- Never edit unit files in `/usr/lib/systemd/system/` — use `systemctl edit` to create drop-in overrides in `/etc/systemd/system/`
+- Always run `systemctl daemon-reload` after modifying or creating unit files
+- `systemctl cat <unit>` shows the full effective configuration including all overrides
+- Use both `Requires=` and `After=` together — `Requires=` establishes dependency, `After=` ensures ordering
+- `Restart=on-failure` with `StartLimitBurst=` prevents crash loops from consuming resources indefinitely
+- Use `systemctl reload` instead of `restart` when the service supports it — reload keeps existing connections alive
+- `systemd-analyze blame` and `critical-chain` identify startup bottlenecks
+- `systemd-cgtop` gives a real-time view of per-service resource consumption
+- Audit enabled services periodically — every unnecessary service is an avoidable risk
+
+### Related Pages
+
+- [Package Management](./package-management) — updating packages that include service units
+- [Performance Tuning](./performance-tuning) — system-wide resource management
+- [System Auditing](./system-auditing) — auditing service configuration for compliance
+- [Maintenance Automation](./maintenance-automation) — automating service health checks and restarts

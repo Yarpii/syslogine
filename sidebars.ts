@@ -182,14 +182,126 @@ const sidebars: SidebarsConfig = {
           label: 'Administration',
           link: {type: 'doc', id: 'linux/almalinux/administration/index'},
           items: [
-            'linux/almalinux/administration/user-management/index',
-            'linux/almalinux/administration/system-monitoring/index',
-            'linux/almalinux/administration/process-management/index',
-            'linux/almalinux/administration/service-management/index',
-            'linux/almalinux/administration/log-management/index',
-            'linux/almalinux/administration/backup-restore/index',
-            'linux/almalinux/administration/task-scheduling/index',
-            'linux/almalinux/administration/system-maintenance/index',
+{
+  type: 'category',
+  label: 'User Management',
+  link: {type: 'doc', id: 'linux/almalinux/administration/user-management/index'},
+  items: [
+    'linux/almalinux/administration/user-management/creating-users',
+    'linux/almalinux/administration/user-management/removing-users',
+    'linux/almalinux/administration/user-management/group-management',
+    'linux/almalinux/administration/user-management/sudo-privileges',
+    'linux/almalinux/administration/user-management/authentication-systems',
+    'linux/almalinux/administration/user-management/ldap-integration',
+    'linux/almalinux/administration/user-management/security-policies',
+    'linux/almalinux/administration/user-management/user-auditing',
+  ],
+},
+{
+  type: 'category',
+  label: 'System Monitoring',
+  link: {type: 'doc', id: 'linux/almalinux/administration/system-monitoring/index'},
+  items: [
+    'linux/almalinux/administration/system-monitoring/resource-monitoring',
+    'linux/almalinux/administration/system-monitoring/process-monitoring',
+    'linux/almalinux/administration/system-monitoring/storage-monitoring',
+    'linux/almalinux/administration/system-monitoring/network-monitoring',
+    'linux/almalinux/administration/system-monitoring/log-monitoring',
+    'linux/almalinux/administration/system-monitoring/enterprise-alerting',
+    'linux/almalinux/administration/system-monitoring/metrics-collection',
+    'linux/almalinux/administration/system-monitoring/performance-analysis',
+  ],
+},
+{
+  type: 'category',
+  label: 'Process Management',
+  link: {type: 'doc', id: 'linux/almalinux/administration/process-management/index'},
+  items: [
+    'linux/almalinux/administration/process-management/process-discovery',
+    'linux/almalinux/administration/process-management/process-control',
+    'linux/almalinux/administration/process-management/resource-controls',
+    'linux/almalinux/administration/process-management/service-management',
+    'linux/almalinux/administration/process-management/process-priority',
+    'linux/almalinux/administration/process-management/process-relationships',
+    'linux/almalinux/administration/process-management/process-monitoring',
+    'linux/almalinux/administration/process-management/process-debugging',
+  ],
+},
+{
+  type: 'category',
+  label: 'Service Management',
+  link: {type: 'doc', id: 'linux/almalinux/administration/service-management/index'},
+  items: [
+    'linux/almalinux/administration/service-management/starting-services',
+    'linux/almalinux/administration/service-management/stopping-services',
+    'linux/almalinux/administration/service-management/service-configuration',
+    'linux/almalinux/administration/service-management/custom-unit-files',
+    'linux/almalinux/administration/service-management/service-status',
+    'linux/almalinux/administration/service-management/systemd-targets',
+    'linux/almalinux/administration/service-management/service-dependencies',
+    'linux/almalinux/administration/service-management/service-automation',
+  ],
+},
+{
+  type: 'category',
+  label: 'Log Management',
+  link: {type: 'doc', id: 'linux/almalinux/administration/log-management/index'},
+  items: [
+    'linux/almalinux/administration/log-management/system-logging',
+    'linux/almalinux/administration/log-management/log-rotation',
+    'linux/almalinux/administration/log-management/log-analysis',
+    'linux/almalinux/administration/log-management/centralized-logging',
+    'linux/almalinux/administration/log-management/audit-logging',
+    'linux/almalinux/administration/log-management/error-logging',
+    'linux/almalinux/administration/log-management/log-monitoring',
+    'linux/almalinux/administration/log-management/secure-logging',
+  ],
+},
+{
+  type: 'category',
+  label: 'Backup & Restore',
+  link: {type: 'doc', id: 'linux/almalinux/administration/backup-restore/index'},
+  items: [
+    'linux/almalinux/administration/backup-restore/system-backup',
+    'linux/almalinux/administration/backup-restore/filesystem-backup',
+    'linux/almalinux/administration/backup-restore/rear-backup',
+    'linux/almalinux/administration/backup-restore/enterprise-backup',
+    'linux/almalinux/administration/backup-restore/restore-procedures',
+    'linux/almalinux/administration/backup-restore/automated-backup',
+    'linux/almalinux/administration/backup-restore/remote-backup',
+    'linux/almalinux/administration/backup-restore/backup-verification',
+  ],
+},
+{
+  type: 'category',
+  label: 'Task Scheduling',
+  link: {type: 'doc', id: 'linux/almalinux/administration/task-scheduling/index'},
+  items: [
+    'linux/almalinux/administration/task-scheduling/cron-scheduling',
+    'linux/almalinux/administration/task-scheduling/systemd-timers',
+    'linux/almalinux/administration/task-scheduling/maintenance-automation',
+    'linux/almalinux/administration/task-scheduling/monitoring-automation',
+    'linux/almalinux/administration/task-scheduling/backup-scheduling',
+    'linux/almalinux/administration/task-scheduling/security-automation',
+    'linux/almalinux/administration/task-scheduling/at-commands',
+    'linux/almalinux/administration/task-scheduling/enterprise-scheduling',
+  ],
+},
+{
+  type: 'category',
+  label: 'System Maintenance',
+  link: {type: 'doc', id: 'linux/almalinux/administration/system-maintenance/index'},
+  items: [
+    'linux/almalinux/administration/system-maintenance/package-management',
+    'linux/almalinux/administration/system-maintenance/security-patching',
+    'linux/almalinux/administration/system-maintenance/system-cleanup',
+    'linux/almalinux/administration/system-maintenance/performance-tuning',
+    'linux/almalinux/administration/system-maintenance/storage-maintenance',
+    'linux/almalinux/administration/system-maintenance/service-maintenance',
+    'linux/almalinux/administration/system-maintenance/system-auditing',
+    'linux/almalinux/administration/system-maintenance/maintenance-automation',
+  ],
+},
           ],
         },
         {
@@ -1631,99 +1743,99 @@ const sidebars: SidebarsConfig = {
                   }
                 ]
               },
-{
-  type: 'category',
-  label: 'Software',
-  link: { type: 'doc', id: 'linux/alpine/software/index' },
-  items: [
-    {
-      type: 'category',
-      label: 'Package Management',
-      link: { type: 'doc', id: 'linux/alpine/software/package-management/index' },
-      items: [
-        {
-          type: 'doc',
-          id: 'linux/alpine/software/package-management/install-packages/index',
-          label: 'apk add'
-        },
-        {
-          type: 'doc',
-          id: 'linux/alpine/software/package-management/remove-packages/index',
-          label: 'apk del'
-        },
-        {
-          type: 'category',
-          label: 'Update Packages',
-          link: { type: 'doc', id: 'linux/alpine/software/package-management/update-packages/index' },
-          items: [
-            {
-              type: 'doc',
-              id: 'linux/alpine/software/package-management/update-packages/apk-update',
-              label: 'apk update'
-            },
-            {
-              type: 'doc',
-              id: 'linux/alpine/software/package-management/update-packages/apk-upgrade',
-              label: 'apk upgrade'
-            }
-          ]
-        },
-        {
-          type: 'category',
-          label: 'Search Packages',
-          link: { type: 'doc', id: 'linux/alpine/software/package-management/search-packages/index' },
-          items: [
-            {
-              type: 'doc',
-              id: 'linux/alpine/software/package-management/search-packages/apk-search',
-              label: 'apk search'
-            },
-            {
-              type: 'doc',
-              id: 'linux/alpine/software/package-management/search-packages/apk-info',
-              label: 'apk info'
-            }
-          ]
-        },
-        {
-          type: 'category',
-          label: 'Package Tools',
-          link: { type: 'doc', id: 'linux/alpine/software/package-management/use-package-tools/index' },
-          items: [
-            {
-              type: 'doc',
-              id: 'linux/alpine/software/package-management/use-package-tools/apk-cache',
-              label: 'apk cache'
-            },
-            {
-              type: 'doc',
-              id: 'linux/alpine/software/package-management/use-package-tools/apk-fix',
-              label: 'apk fix'
-            },
-            {
-              type: 'doc',
-              id: 'linux/alpine/software/package-management/use-package-tools/apk-verify',
-              label: 'apk verify'
-            },
-            {
-              type: 'doc',
-              id: 'linux/alpine/software/package-management/use-package-tools/apk-audit',
-              label: 'apk audit'
-            },
-            {
-              type: 'doc',
-              id: 'linux/alpine/software/package-management/use-package-tools/apk-dot',
-              label: 'apk dot'
-            },
-            {
-              type: 'doc',
-              id: 'linux/alpine/software/package-management/use-package-tools/apk-stats',
-              label: 'apk stats'
-            }
-          ]
-        }
-      ]
-    },
+              {
+                type: 'category',
+                label: 'Software',
+                link: { type: 'doc', id: 'linux/alpine/software/index' },
+                items: [
+                  {
+                    type: 'category',
+                    label: 'Package Management',
+                    link: { type: 'doc', id: 'linux/alpine/software/package-management/index' },
+                    items: [
+                      {
+                        type: 'doc',
+                        id: 'linux/alpine/software/package-management/install-packages/index',
+                        label: 'apk add'
+                      },
+                      {
+                        type: 'doc',
+                        id: 'linux/alpine/software/package-management/remove-packages/index',
+                        label: 'apk del'
+                      },
+                      {
+                        type: 'category',
+                        label: 'Update Packages',
+                        link: { type: 'doc', id: 'linux/alpine/software/package-management/update-packages/index' },
+                        items: [
+                          {
+                            type: 'doc',
+                            id: 'linux/alpine/software/package-management/update-packages/apk-update',
+                            label: 'apk update'
+                          },
+                          {
+                            type: 'doc',
+                            id: 'linux/alpine/software/package-management/update-packages/apk-upgrade',
+                            label: 'apk upgrade'
+                          }
+                        ]
+                      },
+                      {
+                        type: 'category',
+                        label: 'Search Packages',
+                        link: { type: 'doc', id: 'linux/alpine/software/package-management/search-packages/index' },
+                        items: [
+                          {
+                            type: 'doc',
+                            id: 'linux/alpine/software/package-management/search-packages/apk-search',
+                            label: 'apk search'
+                          },
+                          {
+                            type: 'doc',
+                            id: 'linux/alpine/software/package-management/search-packages/apk-info',
+                            label: 'apk info'
+                          }
+                        ]
+                      },
+                      {
+                        type: 'category',
+                        label: 'Package Tools',
+                        link: { type: 'doc', id: 'linux/alpine/software/package-management/use-package-tools/index' },
+                        items: [
+                          {
+                            type: 'doc',
+                            id: 'linux/alpine/software/package-management/use-package-tools/apk-cache',
+                            label: 'apk cache'
+                          },
+                          {
+                            type: 'doc',
+                            id: 'linux/alpine/software/package-management/use-package-tools/apk-fix',
+                            label: 'apk fix'
+                          },
+                          {
+                            type: 'doc',
+                            id: 'linux/alpine/software/package-management/use-package-tools/apk-verify',
+                            label: 'apk verify'
+                          },
+                          {
+                            type: 'doc',
+                            id: 'linux/alpine/software/package-management/use-package-tools/apk-audit',
+                            label: 'apk audit'
+                          },
+                          {
+                            type: 'doc',
+                            id: 'linux/alpine/software/package-management/use-package-tools/apk-dot',
+                            label: 'apk dot'
+                          },
+                          {
+                            type: 'doc',
+                            id: 'linux/alpine/software/package-management/use-package-tools/apk-stats',
+                            label: 'apk stats'
+                          }
+                        ]
+                      }
+                    ]
+                  },
                   {
                     type: 'category',
                     label: 'Repository Management',
@@ -1741,7 +1853,7 @@ const sidebars: SidebarsConfig = {
                         link: { type: 'doc', id: 'linux/alpine/software/repository-management/manage-repository-sources/index' },
                         items: []
                       },
-          {
+                      {
                         type: 'category',
                         label: 'Handle Repository Keys',
                         link: { type: 'doc', id: 'linux/alpine/software/repository-management/handle-repository-keys/index' },

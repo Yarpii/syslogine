@@ -1,0 +1,428 @@
+---
+sidebar_position: 6
+title: "Process Relationships | AlmaLinux"
+sidebar_label: "Process Relationships"
+description: "Understand systemd targets, process trees, service dependencies, and manage complex application relationships on AlmaLinux."
+keywords:
+  - "almalinux process relationships"
+  - "almalinux systemd targets"
+  - "almalinux process tree"
+  - "almalinux service dependencies"
+  - "rhel systemd dependencies"
+tags:
+  - almalinux
+  - process-management
+  - systemd
+  - dependencies
+slug: /linux/almalinux/administration/process-management/process-relationships
+---
+
+# Process Relationships
+
+Every process on AlmaLinux exists within a web of relationships — parent and child processes, service dependencies, cgroup hierarchies, and systemd targets. Understanding these relationships helps you predict how changes propagate, diagnose why services fail to start, and design robust application stacks that start and stop in the right order.
+
+## Parent and child processes
+
+Every process has a parent. When a process spawns another, the new process is its child. The first process — PID 1, systemd — is the ancestor of everything.
+
+```bash
+# View the full process tree
+pstree -p
+
+# View the tree for a specific process
+pstree -p $(pgrep nginx | head -1)
+
+# Show the parent PID of a process
+ps -p $(pgrep nginx | head -1) -o pid,ppid,comm
+
+# Trace the full ancestry of a process up to PID 1
+pid=$(pgrep nginx | head -1)
+while [[ "$pid" -gt 1 ]]; do
+  ps -p "$pid" -o pid=,ppid=,comm= 
+  pid=$(ps -p "$pid" -o ppid= | tr -d ' ')
+done
+```
+
+### What happens when a parent dies
+
+When a parent process exits, its children are **reparented** to PID 1 (systemd). They continue running unless explicitly stopped. This is how daemons survive their launcher.
+
+```bash
+# Verify reparenting — show PPID of all processes
+ps -eo pid,ppid,comm | awk '$2 == 1 {print}'
+```
+
+### Zombie processes and reaping
+
+A process that has exited but whose parent has not called `wait()` becomes a zombie. systemd automatically reaps zombies from processes reparented to it.
+
+```bash
+# Count zombie processes
+ps aux | awk '$8 == "Z"' | wc -l
+
+# Find zombies and their parents
+ps aux | awk '$8 == "Z" {print "Zombie PID:", $2}' 
+ps -eo pid,ppid,stat,comm | awk '$3 ~ /Z/ {
+  print "Zombie:", $1, "Parent:", $2, $4
+}'
+```
+
+## systemd unit dependencies
+
+systemd manages service startup order and dependencies through unit directives. Getting these right is the difference between a stack that starts cleanly and one that races or fails intermittently.
+
+### Dependency directives
+
+| Directive | Type | Meaning |
+|-----------|------|---------|
+| `Requires=` | Hard | If the dependency fails, this unit fails |
+| `Wants=` | Soft | Start the dependency if possible, continue if not |
+| `Requisite=` | Hard | The dependency must already be running — do not start it |
+| `BindsTo=` | Hard | Stop this unit if the dependency stops |
+| `PartOf=` | Propagation | Restart/stop propagates from dependency to this unit |
+| `Conflicts=` | Exclusion | Cannot run alongside these units |
+
+### Ordering directives
+
+| Directive | Meaning |
+|-----------|---------|
+| `After=` | Start after these units are active (ordering only — no dependency) |
+| `Before=` | Start before these units (ordering only) |
+
+:::warning
+`After=` and `Before=` are ordering directives only. They do not create dependencies. A service with `After=postgresql.service` will still start even if PostgreSQL fails — unless `Requires=postgresql.service` is also set.
+:::
+
+```ini
+[Unit]
+# Start after network and database — ordering only
+After=network-online.target postgresql.service
+
+# Hard dependency — fail if postgresql is not running
+Requires=postgresql.service
+
+# Soft dependency — use redis if available
+Wants=redis.service
+
+# Stop this service if postgresql stops
+BindsTo=postgresql.service
+```
+
+### View the dependency tree of a unit
+
+```bash
+# Show what a unit depends on
+systemctl list-dependencies nginx
+
+# Show what depends on a unit
+systemctl list-dependencies nginx --reverse
+
+# Show the full recursive tree
+systemctl list-dependencies nginx --all
+
+# Show only failed or inactive dependencies
+systemctl list-dependencies nginx --failed
+```
+
+## systemd targets
+
+Targets are milestones that group units together. They replace the runlevels of traditional SysV init.
+
+### Common targets
+
+| Target | Equivalent | Purpose |
+|--------|-----------|---------|
+| `poweroff.target` | runlevel 0 | Shut down the system |
+| `rescue.target` | runlevel 1 | Single-user rescue mode |
+| `multi-user.target` | runlevel 3 | Multi-user, no GUI |
+| `graphical.target` | runlevel 5 | Multi-user with GUI |
+| `reboot.target` | runlevel 6 | Reboot the system |
+| `emergency.target` | — | Minimal emergency shell |
+| `network-online.target` | — | Network is fully up |
+| `basic.target` | — | Basic system initialisation complete |
+
+```bash
+# View the current default target
+systemctl get-default
+
+# Change the default target
+sudo systemctl set-default multi-user.target
+
+# Switch to a target immediately
+sudo systemctl isolate rescue.target
+
+# View all active targets
+systemctl list-units --type=target --state=active
+
+# View the dependency tree of the default target
+systemctl list-dependencies multi-user.target
+```
+
+### network-online.target vs network.target
+
+A common mistake is depending on `network.target` when you need the network to be fully configured.
+
+| Target | What it means |
+|--------|--------------|
+| `network.target` | Network interfaces are being configured — not necessarily ready |
+| `network-online.target` | Network is fully up and routable |
+
+For services that need to make outbound connections at startup, always use:
+
+```ini
+[Unit]
+After=network-online.target
+Wants=network-online.target
+```
+
+## Cgroup hierarchy and process grouping
+
+cgroups mirror the systemd unit hierarchy. Every service, user session, and scope lives in a cgroup.
+
+```bash
+# View the full cgroup hierarchy
+systemd-cgls
+
+# View cgroups for a specific slice
+systemd-cgls /system.slice
+
+# View which cgroup a process belongs to
+cat /proc/$(pgrep nginx | head -1)/cgroup
+
+# View all processes in a service's cgroup
+systemd-cgls /system.slice/nginx.service
+```
+
+### Slices — grouping related services
+
+Slices group related services under a common cgroup parent. Resource limits on a slice apply to all services within it.
+
+```
+-.slice                    (root)
+├── system.slice           (system services)
+│   ├── nginx.service
+│   └── postgresql.service
+├── user.slice             (user sessions)
+│   └── user-1000.slice
+└── machine.slice          (containers/VMs)
+```
+
+```bash
+# View all slices
+systemctl list-units --type=slice
+
+# View which slice a service belongs to
+systemctl show nginx --property=Slice
+
+# Move a service to a custom slice
+sudo systemctl edit nginx
+```
+
+```ini
+[Service]
+Slice=webstack.slice
+```
+
+## Process groups and sessions
+
+Every process belongs to a process group and a session. These are used for signal delivery and terminal control.
+
+```bash
+# View process group and session IDs
+ps -eo pid,pgid,sid,comm | head -20
+
+# Show the process group of a specific process
+ps -p $(pgrep nginx | head -1) -o pid,pgid,sid,comm
+
+# Send a signal to an entire process group
+kill -TERM -$(ps -o pgid= -p $(pgrep nginx | head -1) | tr -d ' ')
+```
+
+### Sessions and controlling terminals
+
+A session groups processes that share a controlling terminal. When a terminal closes, SIGHUP is sent to the session leader, which may propagate to all processes in the session.
+
+```bash
+# View sessions
+loginctl list-sessions
+
+# Show processes in a session
+loginctl session-status SESSION_ID
+
+# Detach from terminal (survive logout)
+nohup mycommand &
+disown %1
+```
+
+## Map a complex application stack
+
+For multi-service applications, explicit dependency mapping ensures clean startup and shutdown order.
+
+### Example: web application stack
+
+```
+                    myapp-web.service
+                         │
+              ┌──────────┴──────────┐
+              │                     │
+    myapp-worker.service    myapp-scheduler.service
+              │
+    ┌─────────┴─────────┐
+    │                   │
+postgresql.service   redis.service
+```
+
+Unit file for the web service:
+
+```ini
+[Unit]
+Description=My App Web Service
+After=network-online.target postgresql.service redis.service
+Requires=postgresql.service
+Wants=redis.service
+
+[Service]
+ExecStart=/opt/myapp/bin/web
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Unit file for the worker:
+
+```ini
+[Unit]
+Description=My App Worker
+After=postgresql.service redis.service myapp-web.service
+Requires=postgresql.service
+Wants=redis.service
+PartOf=myapp-web.service
+
+[Service]
+ExecStart=/opt/myapp/bin/worker
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+```
+
+The `PartOf=myapp-web.service` directive means the worker will be stopped and restarted whenever `myapp-web` is stopped or restarted — keeping the stack in sync.
+
+## Propagate restarts across related services
+
+```ini
+# In the primary service
+[Unit]
+# These units will be restarted when this unit restarts
+PropagatesReloadTo=myapp-worker.service myapp-scheduler.service
+```
+
+```ini
+# In a dependent service
+[Unit]
+# Restart when the primary service restarts
+ReloadPropagatedFrom=myapp-web.service
+```
+
+## Debug dependency and ordering problems
+
+When a service fails to start due to dependency issues, systemd provides tools to diagnose the problem.
+
+```bash
+# Show why a unit failed to start
+systemctl status myapp.service
+
+# View the full journal for a failed unit
+journalctl -u myapp.service -b --no-pager
+
+# Check for circular dependencies
+systemd-analyze verify /etc/systemd/system/myapp.service
+
+# View the startup time of each unit
+systemd-analyze blame
+
+# Show the critical path of the boot
+systemd-analyze critical-chain
+
+# Critical chain for a specific service
+systemd-analyze critical-chain myapp.service
+```
+
+### Check for ordering cycles
+
+```bash
+# Verify unit files for errors and cycles
+systemd-analyze verify /etc/systemd/system/*.service
+```
+
+## Common mistakes
+
+### Using After= without Requires=
+
+`After=postgresql.service` only controls ordering. If PostgreSQL is not running, the service will still start — and likely fail. Add `Requires=` for hard dependencies.
+
+```ini
+# WRONG — starts even if postgresql is down
+After=postgresql.service
+
+# CORRECT — fails fast if postgresql is not running
+After=postgresql.service
+Requires=postgresql.service
+```
+
+### Depending on network.target instead of network-online.target
+
+Services that connect to remote hosts at startup should depend on `network-online.target`, not `network.target`.
+
+```ini
+After=network-online.target
+Wants=network-online.target
+```
+
+### Not using PartOf= for tightly coupled services
+
+Without `PartOf=`, restarting the primary service does not restart its workers — leaving them connected to the old instance.
+
+```ini
+# In the worker unit
+PartOf=myapp-web.service
+```
+
+### Circular dependencies
+
+A → Requires B, B → Requires A creates a deadlock. Use `systemd-analyze verify` to detect them.
+
+```bash
+systemd-analyze verify /etc/systemd/system/myapp.service
+```
+
+### Killing a parent without handling its children
+
+Killing a parent process does not always kill its children — they are reparented to PID 1. Use `systemctl stop` for managed services, or signal the entire process group.
+
+```bash
+# Signal entire process group
+kill -TERM -$(ps -o pgid= -p PARENT_PID | tr -d ' ')
+```
+
+## Summary
+
+Process relationships on AlmaLinux span three layers — the process tree, systemd dependency graph, and cgroup hierarchy. Modelling them correctly ensures your application stack starts cleanly, shuts down gracefully, and recovers predictably from failures.
+
+Key points:
+
+- use `pstree -p` to visualise parent-child relationships
+- always pair `After=` with `Requires=` or `Wants=` — ordering alone is not a dependency
+- use `network-online.target` instead of `network.target` for services that make outbound connections
+- use `PartOf=` to propagate restarts from a primary service to its workers
+- use `systemd-analyze critical-chain` to understand boot ordering
+- use `systemd-analyze verify` to catch circular dependencies before they cause problems
+- use `BindsTo=` when a service must stop if its dependency stops
+
+:::tip Related pages
+- [Service Management](./service-management)
+- [Process Control](./process-control)
+- [Process Discovery](./process-discovery)
+- [Process Debugging](./process-debugging)
+:::

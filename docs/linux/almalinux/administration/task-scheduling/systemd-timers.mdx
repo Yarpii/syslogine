@@ -1,0 +1,511 @@
+---
+sidebar_position: 2
+title: "Systemd Timers | AlmaLinux"
+sidebar_label: "Systemd Timers"
+description: "Create and manage systemd timer units on AlmaLinux. Configure calendar and monotonic timers, understand timer dependencies, and migrate from cron to systemd timers."
+keywords:
+  - "almalinux systemd timers"
+  - "almalinux systemd calendar"
+  - "almalinux timer units"
+  - "almalinux task scheduling systemd"
+  - "rhel systemd timers"
+tags:
+  - almalinux
+  - task-scheduling
+  - systemd
+  - timers
+  - automation
+slug: /linux/almalinux/administration/task-scheduling/systemd-timers
+---
+
+# Systemd Timers on AlmaLinux
+
+Systemd timers are the modern alternative to cron for scheduling recurring and deferred tasks on AlmaLinux. Rather than a separate daemon reading its own configuration files, systemd timers are integrated directly into the service manager — they activate systemd service units on a schedule, which means every scheduled job benefits from the same capabilities as any other service: journal logging, resource limits, dependency management, failure handling, and status inspection with `systemctl`.
+
+The two approaches are not mutually exclusive. Many AlmaLinux systems use cron for simple, familiar tasks and systemd timers for jobs that benefit from tighter integration with the service manager. Understanding both lets you make informed choices about which tool fits each scheduling need.
+
+---
+
+## Timer Concepts
+
+A systemd timer always works in conjunction with a service unit. The timer defines *when* something runs; the service unit defines *what* runs. This separation is intentional and useful — you can start the service directly for testing without triggering the timer, and the timer can be enabled or disabled independently of the service it activates.
+
+There are two fundamentally different types of timers:
+
+**Realtime timers** (also called calendar timers) fire at specific calendar times, defined with `OnCalendar=`. They are the direct equivalent of cron entries — run this job at 02:00 every day, run this job every Monday at 08:00, and so on.
+
+**Monotonic timers** fire relative to a specific system event — boot, service activation, or the last time the timer itself fired. They are defined with directives like `OnBootSec=`, `OnStartupSec=`, and `OnUnitActiveSec=`. Monotonic timers are useful for tasks that should run a fixed interval after the system starts or after the previous run, rather than at a specific wall-clock time.
+
+---
+
+## Creating a Timer: Step by Step
+
+Every systemd timer requires at minimum two unit files: a `.service` file defining the job and a `.timer` file defining the schedule. Both must share the same base name — `myapp-cleanup.service` is activated by `myapp-cleanup.timer`.
+
+### Writing the Service Unit
+
+The service unit describes what the timer activates. For scheduled tasks, `Type=oneshot` is almost always the correct type — it indicates that the service runs to completion and exits, rather than staying running as a daemon:
+
+```bash
+nano /etc/systemd/system/myapp-cleanup.service
+```
+
+```ini
+[Unit]
+Description=MyApp temporary file cleanup
+After=network.target
+
+[Service]
+Type=oneshot
+User=myapp
+Group=myapp
+ExecStart=/opt/myapp/bin/cleanup.sh
+StandardOutput=journal
+StandardError=journal
+```
+
+`User=` and `Group=` run the job as a specific non-root user, which is more secure than running everything as root. `StandardOutput=journal` and `StandardError=journal` direct all output to the systemd journal, where it is automatically timestamped and queryable with `journalctl`.
+
+Note that there is no `[Install]` section in the service unit. Timer-activated services do not need to be enabled directly — the timer enables and activates them. Adding `[Install]` and enabling the service would cause it to start at boot as a daemon, which is not what you want for a oneshot job.
+
+### Writing the Timer Unit
+
+```bash
+nano /etc/systemd/system/myapp-cleanup.timer
+```
+
+```ini
+[Unit]
+Description=Run MyApp cleanup daily at 03:00
+
+[Timer]
+OnCalendar=*-*-* 03:00:00
+RandomizedDelaySec=300
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+```
+
+`OnCalendar=*-*-* 03:00:00` fires every day at 03:00. `RandomizedDelaySec=300` adds a random delay of up to 5 minutes — useful when multiple servers run the same timer to spread the load on shared resources. `Persistent=true` causes a missed run (because the system was powered off at 03:00) to execute at the next opportunity after boot.
+
+The `[Install]` section with `WantedBy=timers.target` is what allows the timer to be enabled with `systemctl enable`. The `timers.target` is reached during normal boot, so enabled timers start automatically.
+
+### Enabling and Starting the Timer
+
+After creating both unit files, reload systemd to pick up the new units:
+
+```bash
+systemctl daemon-reload
+```
+
+Enable and start the timer:
+
+```bash
+systemctl enable --now myapp-cleanup.timer
+```
+
+`enable` creates the symlink that causes the timer to start at boot. `--now` also starts it immediately without requiring a reboot.
+
+Verify the timer is active:
+
+```bash
+systemctl status myapp-cleanup.timer
+```
+
+---
+
+## Inspecting Timers
+
+### Listing All Active Timers
+
+To see all currently active timers, including when they last ran and when they will next run:
+
+```bash
+systemctl list-timers
+```
+
+The output columns are:
+
+| Column | Description |
+|---|---|
+| `NEXT` | When the timer will next fire |
+| `LEFT` | Time remaining until next fire |
+| `LAST` | When the timer last fired |
+| `PASSED` | Time since last fire |
+| `UNIT` | The timer unit name |
+| `ACTIVATES` | The service unit it activates |
+
+To include inactive and failed timers in the listing:
+
+```bash
+systemctl list-timers --all
+```
+
+### Checking Timer and Service Status
+
+To see detailed status of a specific timer, including its last activation time and any error messages:
+
+```bash
+systemctl status myapp-cleanup.timer
+```
+
+To check the status of the service the timer activates:
+
+```bash
+systemctl status myapp-cleanup.service
+```
+
+The service status shows the exit code from the last run and the last few lines of journal output, which is often enough to diagnose a failure without a separate `journalctl` query.
+
+### Viewing Job Output in the Journal
+
+Because the service writes to the journal, all output from every run is accessible with `journalctl`:
+
+```bash
+journalctl -u myapp-cleanup.service
+```
+
+To see output from only the most recent run:
+
+```bash
+journalctl -u myapp-cleanup.service -n 50
+```
+
+To follow a job's output in real time while it runs — useful when testing or debugging:
+
+```bash
+journalctl -f -u myapp-cleanup.service
+```
+
+To see all output since a specific time:
+
+```bash
+journalctl -u myapp-cleanup.service --since "2024-06-01 03:00:00"
+```
+
+---
+
+## OnCalendar Expressions
+
+Calendar expressions in systemd are more structured and readable than cron syntax. The full format is:
+
+```
+DayOfWeek Year-Month-Day Hour:Minute:Second
+```
+
+Any component can be `*` to mean "every value". Multiple values are separated by commas, ranges use `..`, and repetitions use `/`.
+
+### Common Calendar Expressions
+
+```ini
+# Every day at midnight
+OnCalendar=daily
+
+# Every day at 02:30
+OnCalendar=*-*-* 02:30:00
+
+# Every Monday at 08:00
+OnCalendar=Mon *-*-* 08:00:00
+
+# Weekdays at 09:00
+OnCalendar=Mon..Fri *-*-* 09:00:00
+
+# Every 15 minutes
+OnCalendar=*:0/15
+
+# Every 6 hours
+OnCalendar=00/6:00:00
+
+# First day of every month at 01:00
+OnCalendar=*-*-1 01:00:00
+
+# Last day of every month (28th for safety across all months)
+OnCalendar=*-*-28 23:00:00
+
+# Every Saturday and Sunday at 06:00
+OnCalendar=Sat,Sun *-*-* 06:00:00
+
+# Specific date and time
+OnCalendar=2024-12-31 23:59:00
+```
+
+### Shorthand Keywords
+
+Systemd recognizes several shorthand keywords as valid `OnCalendar` values:
+
+| Keyword | Equivalent |
+|---|---|
+| `minutely` | `*-*-* *:*:00` |
+| `hourly` | `*-*-* *:00:00` |
+| `daily` | `*-*-* 00:00:00` |
+| `weekly` | `Mon *-*-* 00:00:00` |
+| `monthly` | `*-*-1 00:00:00` |
+| `yearly` | `*-1-1 00:00:00` |
+| `quarterly` | `*-1,4,7,10-1 00:00:00` |
+
+### Validating Calendar Expressions
+
+Before deploying a timer, confirm that the `OnCalendar` expression fires when you expect. The `systemd-analyze calendar` command evaluates an expression and shows the next several times it would fire:
+
+```bash
+systemd-analyze calendar "Mon..Fri *-*-* 09:00:00"
+```
+
+Output:
+
+```
+  Original form: Mon..Fri *-*-* 09:00:00
+Normalized form: Mon..Fri *-*-* 09:00:00
+    Next elapse: Mon 2024-06-03 09:00:00 CEST
+       (in UTC): Mon 2024-06-03 07:00:00 UTC
+       From now: 2 days 14h left
+```
+
+This confirms the expression is valid and shows exactly when it will next fire. Always run `systemd-analyze calendar` before enabling a new timer in production.
+
+---
+
+## Monotonic Timers
+
+Monotonic timers fire relative to system events rather than calendar time. They are useful for tasks that should run shortly after boot, or at a fixed interval relative to the previous run, regardless of the wall-clock time.
+
+### OnBootSec
+
+`OnBootSec=` fires a specified time after the system boots. To run a startup check 2 minutes after every boot:
+
+```ini
+[Timer]
+OnBootSec=2min
+```
+
+### OnStartupSec
+
+`OnStartupSec=` fires relative to when systemd itself started (which is slightly earlier than the boot completion point used by `OnBootSec`). For most purposes the difference is negligible.
+
+### OnUnitActiveSec
+
+`OnUnitActiveSec=` fires at a fixed interval after the timer last activated its service. This is useful for jobs that should run every N minutes continuously, regardless of how long the job itself takes:
+
+```ini
+[Timer]
+OnUnitActiveSec=15min
+```
+
+### OnUnitInactiveSec
+
+`OnUnitInactiveSec=` fires at a fixed interval after the service last became inactive (i.e., after it finished running). This is subtly different from `OnUnitActiveSec` — it waits for the service to complete before starting the countdown to the next run:
+
+```ini
+[Timer]
+OnUnitInactiveSec=10min
+```
+
+Use `OnUnitInactiveSec` when the job duration is variable and you want a consistent gap between the end of one run and the start of the next, rather than a fixed interval between starts.
+
+### Combining Monotonic and Calendar Triggers
+
+A single timer unit can have both `OnCalendar` and monotonic directives. The timer fires whenever any of the conditions is met. For example, to run a job both at 02:00 every day and 5 minutes after every boot:
+
+```ini
+[Timer]
+OnCalendar=*-*-* 02:00:00
+OnBootSec=5min
+Persistent=true
+```
+
+This is useful for startup tasks that also need to run regularly — the `OnBootSec` ensures the job runs promptly after a reboot even if the next `OnCalendar` time is hours away.
+
+---
+
+## Timer Dependencies and Ordering
+
+Like all systemd units, timers can express dependencies on other units. This is one of the key advantages of systemd timers over cron — you can ensure a timer does not fire until the network is up, a database is running, or any other condition is met.
+
+### Waiting for Network Availability
+
+For timers that need network access (such as a backup job that writes to a remote server), add a dependency on `network-online.target`:
+
+```ini
+[Unit]
+Description=Remote backup timer
+After=network-online.target
+Wants=network-online.target
+```
+
+`network-online.target` is reached only after at least one network interface has acquired an address, which is stronger than `network.target` (which only means networking has been configured, not necessarily that it is usable).
+
+### Waiting for a Database Service
+
+To ensure a timer does not fire before a database service is ready:
+
+```ini
+[Unit]
+Description=Database maintenance timer
+After=postgresql.service
+Requires=postgresql.service
+```
+
+`Requires=` means the timer will fail if `postgresql.service` is not active. `After=` means the timer will not start before `postgresql.service` has started. Together they ensure the database is running before the maintenance job attempts to connect.
+
+### Running After Another Service Completes
+
+To run a job after a specific one-shot service has completed — for example, run a post-import cleanup after a data import job:
+
+```ini
+[Unit]
+Description=Post-import cleanup
+After=data-import.service
+```
+
+When the timer fires and starts the service, systemd will not start it until `data-import.service` has completed.
+
+---
+
+## Transient Timers with systemd-run
+
+For one-off scheduled tasks that do not warrant permanent unit files, `systemd-run` creates a transient timer that exists only until it fires:
+
+```bash
+systemd-run --on-active=30m /usr/local/sbin/cleanup.sh
+```
+
+This runs `cleanup.sh` 30 minutes from now, as a transient systemd service. The unit disappears after execution.
+
+To schedule something at a specific calendar time:
+
+```bash
+systemd-run --on-calendar="2024-06-01 15:00:00" /usr/local/sbin/report.sh
+```
+
+To give the transient unit a recognizable name:
+
+```bash
+systemd-run --unit=one-time-report --on-calendar="2024-06-01 15:00:00" /usr/local/sbin/report.sh
+```
+
+List pending transient timers:
+
+```bash
+systemctl list-timers
+```
+
+Transient timers appear in the list alongside permanent ones and can be cancelled with `systemctl stop`:
+
+```bash
+systemctl stop one-time-report.timer
+```
+
+`systemd-run` is the systemd equivalent of the `at` command — useful for scheduling a task to run once in the future without creating permanent unit files.
+
+---
+
+## Overriding System Timer Units
+
+Package-installed timer units (such as `dnf-makecache.timer` or `logrotate.timer`) can be customized without editing the package-provided files. Editing package files directly causes your changes to be overwritten by package updates.
+
+Use `systemctl edit` to create a drop-in override:
+
+```bash
+systemctl edit dnf-makecache.timer
+```
+
+This opens an editor for a drop-in file at `/etc/systemd/system/dnf-makecache.timer.d/override.conf`. Add only the settings you want to change:
+
+```ini
+[Timer]
+OnCalendar=
+OnCalendar=*-*-* 04:00:00
+```
+
+The first `OnCalendar=` with no value clears the original setting. The second sets the new value. This pattern — clear then set — is necessary because systemd merges drop-in files with the original, so simply setting a new value would result in both the old and new values being active.
+
+To view the full effective configuration of a unit after all drop-ins are applied:
+
+```bash
+systemctl cat dnf-makecache.timer
+```
+
+---
+
+## Migrating from Cron to Systemd Timers
+
+If you are moving existing cron jobs to systemd timers, the mapping is straightforward. A cron entry like:
+
+```
+30 2 * * *  root  /usr/local/sbin/system-backup.sh >> /var/log/backup/cron.log 2>&1
+```
+
+Becomes a service unit:
+
+```ini
+[Unit]
+Description=Daily system backup
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/system-backup.sh
+StandardOutput=append:/var/log/backup/system-backup.log
+StandardError=append:/var/log/backup/system-backup.log
+```
+
+And a timer unit:
+
+```ini
+[Unit]
+Description=Run system backup daily at 02:30
+
+[Timer]
+OnCalendar=*-*-* 02:30:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+```
+
+The key differences from the cron version:
+
+- Output goes to the journal (and optionally to a file via `StandardOutput=append:`) rather than requiring shell redirection in the crontab
+- `Persistent=true` handles missed runs automatically, which cron cannot do
+- The job runs in a clean environment defined by the service unit, not inherited from a shell session
+- Failure is visible in `systemctl status` without needing to check a log file manually
+
+### Environment in Systemd Services
+
+Like cron, systemd service units run with a clean environment. Unlike cron, the environment is well-defined and easy to extend in the service unit:
+
+```ini
+[Service]
+Type=oneshot
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=MYAPP_CONFIG=/etc/myapp/config.yaml
+EnvironmentFile=/etc/myapp/environment
+ExecStart=/opt/myapp/bin/scheduled-task.sh
+```
+
+`Environment=` sets individual variables. `EnvironmentFile=` reads variables from a file, one `KEY=value` per line. This is cleaner than sourcing environment files within scripts.
+
+---
+
+## Summary
+
+Systemd timers on AlmaLinux provide scheduled task execution with native integration into the service manager. Calendar timers are the cron equivalent for time-based scheduling; monotonic timers handle interval-based and boot-relative scheduling. All timer output goes to the journal, failure is immediately visible via `systemctl status`, and `Persistent=true` handles missed runs automatically.
+
+Key points to remember:
+
+- Every timer needs a matching service unit with the same base name; the service uses `Type=oneshot`
+- The service unit does not need an `[Install]` section — enable the timer, not the service
+- Use `systemd-analyze calendar` to validate `OnCalendar` expressions before deploying
+- `Persistent=true` causes missed runs to execute at the next opportunity after boot
+- `RandomizedDelaySec` staggers timer fires across multiple servers sharing the same schedule
+- Use `systemctl edit <unit>` with clear-then-set to override package-provided timer units
+- `systemd-run --on-calendar=` is the equivalent of `at` for one-time scheduled tasks
+- Dependencies via `After=` and `Requires=` in the timer unit ensure jobs do not fire before their prerequisites are ready
+
+### Related Pages
+
+- [Cron Scheduling](./cron-scheduling) — traditional cron syntax, crontabs, and crond management
+- [At Commands](./at-commands) — one-time job scheduling with at and batch
+- [Maintenance Automation](./maintenance-automation) — scheduling system maintenance with timers
+- [Enterprise Scheduling](./enterprise-scheduling) — complex job dependencies and patterns
+- [Automated Backup](../backup-restore/automated-backup) — backup scheduling with cron and systemd timers

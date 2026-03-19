@@ -1,0 +1,466 @@
+---
+sidebar_position: 7
+title: "Service Dependencies | AlmaLinux"
+sidebar_label: "Service Dependencies"
+description: "Manage service dependencies with Requires/Wants, understand ordering, and ensure proper service startup sequences on AlmaLinux."
+keywords:
+  - "almalinux service dependencies"
+  - "almalinux systemd requires"
+  - "almalinux systemd wants"
+  - "almalinux service ordering"
+  - "rhel systemd dependencies"
+tags:
+  - almalinux
+  - service-management
+  - systemd
+  - dependencies
+slug: /linux/almalinux/administration/service-management/service-dependencies
+---
+
+# Service Dependencies
+
+Service dependencies tell systemd which services must be running before yours starts, which services should stop when yours stops, and in what order everything should happen. Getting dependencies right means your application stack starts cleanly, shuts down gracefully, and recovers predictably from failures.
+
+## The two dimensions of dependencies
+
+systemd separates two concepts that are often confused:
+
+- **Ordering** — *when* to start a unit relative to others
+- **Requirement** — *whether* a unit must be running for yours to work
+
+Both are needed. Ordering alone does not create a dependency, and a requirement without ordering does not guarantee the dependency is ready before your service starts.
+
+```ini
+[Unit]
+# Ordering: start after postgresql
+After=postgresql.service
+
+# Requirement: fail if postgresql is not running
+Requires=postgresql.service
+```
+
+:::warning
+`After=postgresql.service` alone means your service starts after postgresql in the boot sequence — but it will still start even if postgresql failed. Always pair `After=` with `Requires=` or `Wants=` to create a real dependency.
+:::
+
+## Dependency directives
+
+### Requires=
+
+Hard dependency. If the required unit fails to start or stops while your service is running, your service will also be stopped.
+
+```ini
+[Unit]
+Requires=postgresql.service
+After=postgresql.service
+```
+
+Use `Requires=` when your service cannot function at all without the dependency.
+
+### Wants=
+
+Soft dependency. systemd will try to start the listed unit alongside yours, but your service continues even if the dependency fails.
+
+```ini
+[Unit]
+Wants=redis.service
+After=redis.service
+```
+
+Use `Wants=` for optional dependencies — things that improve your service but are not strictly required.
+
+### Requisite=
+
+Like `Requires=`, but stricter. The dependency must already be active when your service starts — systemd will not try to start it. If it is not running, your service fails immediately.
+
+```ini
+[Unit]
+Requisite=postgresql.service
+After=postgresql.service
+```
+
+Use `Requisite=` when the dependency must be pre-existing — for example, a database that must be initialized before the application can run.
+
+### BindsTo=
+
+The strongest dependency. If the bound unit stops for any reason — even a clean stop — your service stops immediately too. Unlike `Requires=`, the stopping is synchronous.
+
+```ini
+[Unit]
+BindsTo=postgresql.service
+After=postgresql.service
+```
+
+Use `BindsTo=` for services that are meaningless without their dependency — for example, a connection pool that only exists to serve a specific database.
+
+### PartOf=
+
+Propagation dependency. Stopping or restarting the listed unit also stops or restarts your service. Useful for grouping services that should move together.
+
+```ini
+[Unit]
+PartOf=myapp-web.service
+```
+
+Use `PartOf=` for worker or sidecar services that should always move in sync with their primary service.
+
+### Conflicts=
+
+Mutual exclusion. If the listed unit is running, your service cannot start — and starting yours stops the other.
+
+```ini
+[Unit]
+Conflicts=apache2.service
+```
+
+Use `Conflicts=` when two services cannot run simultaneously — for example, two services competing for the same port.
+
+## Ordering directives
+
+### After=
+
+Start this unit after the listed units are active. This is ordering only — no dependency is implied.
+
+```ini
+[Unit]
+After=network-online.target postgresql.service redis.service
+```
+
+### Before=
+
+Start this unit before the listed units. Used less often than `After=` — typically for setup services that must complete before others start.
+
+```ini
+[Unit]
+Before=myapp.service
+```
+
+## Dependency combinations in practice
+
+### Web application with database and cache
+
+```ini
+[Unit]
+Description=My Web Application
+# Start after network and both dependencies
+After=network-online.target postgresql.service redis.service
+# Hard dependency on database
+Requires=postgresql.service
+# Soft dependency on cache — works without it
+Wants=redis.service
+
+[Install]
+WantedBy=multi-user.target
+```
+
+### Worker that must follow its primary service
+
+```ini
+[Unit]
+Description=My App Worker
+After=myapp-web.service postgresql.service
+Requires=postgresql.service
+# Stop and restart when myapp-web stops or restarts
+PartOf=myapp-web.service
+
+[Install]
+WantedBy=multi-user.target
+```
+
+### Migration that runs before the application
+
+```ini
+[Unit]
+Description=Database Migration
+After=postgresql.service
+Requires=postgresql.service
+# Must complete before myapp starts
+Before=myapp.service
+
+[Install]
+WantedBy=multi-user.target
+```
+
+### Service that must not run alongside another
+
+```ini
+[Unit]
+Description=Nginx Web Server
+# Cannot run at the same time as Apache
+Conflicts=httpd.service
+
+[Install]
+WantedBy=multi-user.target
+```
+
+## View dependency relationships
+
+```bash
+# What does a service depend on?
+systemctl list-dependencies nginx
+
+# Full recursive dependency tree
+systemctl list-dependencies nginx --all
+
+# What depends on a service? (reverse)
+systemctl list-dependencies nginx --reverse
+
+# Show only failed or inactive dependencies
+systemctl list-dependencies nginx --failed
+
+# Show the dependency tree for a target
+systemctl list-dependencies multi-user.target
+```
+
+## Propagate restarts across related services
+
+When the primary service restarts, you may want dependent services to restart too.
+
+```ini
+# In the primary service unit
+[Unit]
+# Restart of this unit propagates reload to these units
+PropagatesReloadTo=myapp-worker.service myapp-scheduler.service
+```
+
+```ini
+# In the dependent service unit
+[Unit]
+# Restart when the primary service reloads
+ReloadPropagatedFrom=myapp-web.service
+```
+
+## Conditional dependencies
+
+Use condition directives to make a service start only under specific circumstances.
+
+```ini
+[Unit]
+# Only start if this file exists
+ConditionPathExists=/etc/myapp/config.yml
+
+# Only start if this file does NOT exist
+ConditionPathExists=!/var/lib/myapp/disabled
+
+# Only start on physical hardware (not in a VM)
+ConditionVirtualization=no
+
+# Only start if a kernel module is loaded
+ConditionKernelCommandLine=myfeature
+
+# Only start on a specific host
+ConditionHost=prod-server-01
+
+# Only start if the path is a directory
+ConditionPathIsDirectory=/var/lib/myapp
+```
+
+Unlike `Requires=`, a failed `Condition` does not mark the unit as failed — it simply skips it silently. Use `Assert` variants to fail loudly:
+
+```ini
+# Fail with an error if the config file is missing
+AssertPathExists=/etc/myapp/config.yml
+```
+
+## Debug dependency problems
+
+When a service fails to start due to dependency issues, these tools help you find the cause.
+
+```bash
+# Show why a service failed
+systemctl status myapp.service
+
+# Full log for the failed service
+journalctl -u myapp.service -b --no-pager
+
+# Check if dependencies are satisfied
+systemctl list-dependencies myapp.service
+systemctl is-active postgresql.service
+systemctl is-active redis.service
+
+# Check for circular dependencies
+systemd-analyze verify /etc/systemd/system/myapp.service
+
+# View the startup order and timing
+systemd-analyze critical-chain myapp.service
+
+# Check if ordering is correct
+systemd-analyze dot myapp.service | dot -Tsvg > /tmp/deps.svg
+```
+
+### Common dependency failure patterns
+
+**Service starts before its database is ready:**
+```bash
+# Check if After= and Requires= are both set
+systemctl cat myapp | grep -E "After|Requires|Wants"
+
+# Verify the database is actually active at startup
+journalctl -u postgresql -b | grep "ready to accept"
+journalctl -u myapp -b | head -20
+```
+
+**Service restarts but workers keep old connections:**
+```bash
+# Workers should use PartOf= to restart with the primary
+systemctl cat myapp-worker | grep "PartOf"
+```
+
+**Service starts in wrong order despite After=:**
+```bash
+# After= is ordering only — add Requires= or Wants= too
+systemctl cat myapp | grep -E "After|Requires"
+```
+
+## Dependency graph visualisation
+
+systemd can generate a dependency graph in DOT format for visualisation.
+
+```bash
+# Install graphviz
+sudo dnf install -y graphviz
+
+# Generate dependency graph for a service
+systemd-analyze dot myapp.service | dot -Tsvg > /tmp/myapp-deps.svg
+
+# Generate graph for the full system
+systemd-analyze dot | dot -Tsvg > /tmp/system-deps.svg
+
+# Generate graph for a specific target
+systemd-analyze dot multi-user.target | dot -Tsvg > /tmp/target-deps.svg
+```
+
+## Scripted dependency check
+
+A script to verify all dependencies of a service are healthy before starting it:
+
+```bash
+#!/bin/bash
+# check-deps.sh — verify service dependencies before starting
+
+SERVICE="$1"
+
+if [[ -z "$SERVICE" ]]; then
+  echo "Usage: $0 servicename"
+  exit 1
+fi
+
+echo "Checking dependencies for $SERVICE..."
+echo ""
+
+FAILED=0
+
+# Get required dependencies
+REQUIRES=$(systemctl show "$SERVICE" --property=Requires | cut -d= -f2)
+WANTS=$(systemctl show "$SERVICE" --property=Wants | cut -d= -f2)
+
+check_unit() {
+  local unit="$1"
+  local type="$2"
+  [[ -z "$unit" ]] && return
+
+  for dep in $unit; do
+    STATE=$(systemctl is-active "$dep" 2>/dev/null)
+    if [[ "$STATE" == "active" ]]; then
+      echo "  OK [$type]: $dep is active"
+    else
+      echo "  FAIL [$type]: $dep is $STATE"
+      [[ "$type" == "Requires" ]] && ((FAILED++))
+    fi
+  done
+}
+
+check_unit "$REQUIRES" "Requires"
+check_unit "$WANTS" "Wants"
+
+echo ""
+if [[ "$FAILED" -gt 0 ]]; then
+  echo "ERROR: $FAILED required dependencies are not active"
+  echo "Start them first, then retry"
+  exit 1
+else
+  echo "All required dependencies are active"
+  echo "Starting $SERVICE..."
+  sudo systemctl start "$SERVICE"
+fi
+```
+
+```bash
+sudo bash check-deps.sh myapp
+```
+
+## Common mistakes
+
+### Using After= without Requires= or Wants=
+
+```ini
+# WRONG — starts even if postgresql fails
+After=postgresql.service
+
+# CORRECT — fails if postgresql is not running
+After=postgresql.service
+Requires=postgresql.service
+```
+
+### Using Requires= when Wants= is more appropriate
+
+`Requires=` stops your service if the dependency stops. If the dependency is optional, use `Wants=`.
+
+```ini
+# WRONG — service stops if redis stops, even though redis is optional
+Requires=redis.service
+
+# CORRECT — service continues if redis stops
+Wants=redis.service
+```
+
+### Not using PartOf= for tightly coupled workers
+
+Without `PartOf=`, restarting the primary service leaves workers connected to the old instance.
+
+```ini
+# In worker unit
+PartOf=myapp-web.service
+```
+
+### Circular dependencies
+
+A → Requires B, B → Requires A creates a deadlock at boot.
+
+```bash
+# Detect circular dependencies
+systemd-analyze verify /etc/systemd/system/myapp.service
+```
+
+### Depending on network.target instead of network-online.target
+
+```ini
+# WRONG — network interfaces may not be routable yet
+After=network.target
+
+# CORRECT
+After=network-online.target
+Wants=network-online.target
+```
+
+## Summary
+
+Service dependencies on AlmaLinux require both ordering (`After=`) and requirement directives (`Requires=` or `Wants=`) to work correctly. Using them precisely makes your application stack reliable and predictable.
+
+Key points:
+
+- always pair `After=` with `Requires=` or `Wants=` — ordering alone is not a dependency
+- use `Requires=` for hard dependencies, `Wants=` for optional ones
+- use `BindsTo=` when your service is meaningless without its dependency
+- use `PartOf=` for workers that should restart whenever the primary service restarts
+- use `Conflicts=` for services that cannot run simultaneously
+- use `ConditionPathExists=` to make services conditional on file system state
+- detect circular dependencies with `systemd-analyze verify`
+- visualise the full dependency graph with `systemd-analyze dot`
+
+:::tip Related pages
+- [Service Configuration](./service-configuration)
+- [Custom Unit Files](./custom-unit-files)
+- [Systemd Targets](./systemd-targets)
+- [Service Automation](./service-automation)
+:::

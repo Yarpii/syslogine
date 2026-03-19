@@ -1,0 +1,439 @@
+---
+sidebar_position: 4
+title: "Network Monitoring | AlmaLinux"
+sidebar_label: "Network Monitoring"
+description: "Monitor network connections, bandwidth, and traffic on AlmaLinux with ss, netstat, iftop, tcpdump, and enterprise network analysis tools."
+keywords:
+  - "almalinux network monitoring"
+  - "almalinux ss netstat"
+  - "almalinux iftop"
+  - "almalinux tcpdump"
+  - "rhel network monitoring"
+tags:
+  - almalinux
+  - system-monitoring
+  - network
+  - bandwidth
+slug: /linux/almalinux/administration/system-monitoring/network-monitoring
+---
+
+# Network Monitoring
+
+Network problems — saturated interfaces, unexpected connections, port conflicts, and latency spikes — are among the hardest issues to diagnose without the right tools. AlmaLinux provides everything from simple connection inspection to full packet capture, giving you the visibility to diagnose problems quickly and maintain a clear picture of what your system is communicating with.
+
+## Install monitoring tools
+
+```bash
+sudo dnf install -y \
+  iproute \
+  net-tools \
+  iftop \
+  nethogs \
+  nload \
+  tcpdump \
+  nmap \
+  mtr \
+  bind-utils \
+  ethtool
+```
+
+## Inspect connections with ss
+
+`ss` is the modern replacement for `netstat`. It is faster and more detailed.
+
+```bash
+# All listening TCP and UDP ports
+sudo ss -tlunp
+
+# All established TCP connections
+ss -tnp state established
+
+# Connections to a specific port
+ss -tnp '( dport = :443 or sport = :443 )'
+
+# Connections from a specific IP
+ss -tnp dst 192.168.1.100
+
+# Show socket memory usage
+ss -tm
+
+# Summary of socket states
+ss -s
+```
+
+### ss flag reference
+
+| Flag | Meaning |
+|------|---------|
+| `-t` | TCP sockets |
+| `-u` | UDP sockets |
+| `-l` | Listening sockets only |
+| `-n` | Show numeric addresses and ports |
+| `-p` | Show process using the socket |
+| `-e` | Show extended socket info |
+| `-s` | Show summary statistics |
+
+### Check what is listening on a specific port
+
+```bash
+sudo ss -tlnp | grep :80
+sudo ss -tlnp | grep :443
+sudo ss -tlnp | grep :22
+```
+
+## View network interfaces
+
+```bash
+# Show all interfaces with IP addresses
+ip addr show
+
+# Show interface statistics (errors, drops, bytes)
+ip -s link
+
+# Show routing table
+ip route show
+
+# Show a specific interface
+ip addr show eth0
+```
+
+### Check interface errors and drops
+
+Errors and dropped packets indicate hardware problems, driver issues, or network congestion.
+
+```bash
+# Interface statistics including errors
+ip -s link show eth0
+
+# Detailed stats via ethtool
+sudo ethtool -S eth0
+
+# Watch interface stats in real time
+watch -n 1 'ip -s link show eth0'
+```
+
+## Real-time bandwidth with iftop
+
+`iftop` shows bandwidth usage per connection in real time — useful for identifying which connections are consuming the most bandwidth.
+
+```bash
+# Monitor the default interface
+sudo iftop
+
+# Monitor a specific interface
+sudo iftop -i eth0
+
+# Show port numbers
+sudo iftop -P
+
+# Do not resolve hostnames (faster)
+sudo iftop -n
+
+# Do not resolve hostnames or port names
+sudo iftop -Nn
+```
+
+Useful `iftop` keybindings:
+
+| Key | Action |
+|-----|--------|
+| `n` | Toggle hostname resolution |
+| `p` | Toggle port display |
+| `s` | Toggle source host display |
+| `d` | Toggle destination host display |
+| `t` | Cycle through display modes |
+| `q` | Quit |
+
+## Real-time bandwidth per process with nethogs
+
+`nethogs` groups bandwidth usage by process — useful for finding which application is consuming the network.
+
+```bash
+# Monitor all interfaces
+sudo nethogs
+
+# Monitor a specific interface
+sudo nethogs eth0
+
+# Update every 2 seconds
+sudo nethogs -d 2
+```
+
+## Interface bandwidth with nload
+
+`nload` shows incoming and outgoing bandwidth as a graph per interface.
+
+```bash
+# Monitor all interfaces
+nload
+
+# Monitor a specific interface
+nload eth0
+
+# Set refresh interval to 500ms
+nload -t 500
+```
+
+## Historical network stats with sar
+
+```bash
+# Network interface stats for today
+sar -n DEV
+
+# Network errors for today
+sar -n EDEV
+
+# Socket statistics
+sar -n SOCK
+
+# Stats every 5 minutes
+sar -n DEV 300 12
+```
+
+## Packet capture with tcpdump
+
+`tcpdump` captures raw network traffic. It is the most powerful tool for deep network diagnosis.
+
+```bash
+# Capture all traffic on eth0
+sudo tcpdump -i eth0
+
+# Capture traffic on a specific port
+sudo tcpdump -i eth0 port 80
+
+# Capture traffic to or from a specific host
+sudo tcpdump -i eth0 host 192.168.1.100
+
+# Capture traffic with readable output
+sudo tcpdump -i eth0 -A port 80
+
+# Save capture to a file for analysis in Wireshark
+sudo tcpdump -i eth0 -w /tmp/capture-$(date +%F).pcap
+
+# Read a saved capture file
+sudo tcpdump -r /tmp/capture-$(date +%F).pcap
+
+# Capture HTTPS traffic (shows headers, not decrypted content)
+sudo tcpdump -i eth0 -nn port 443
+
+# Capture DNS queries
+sudo tcpdump -i eth0 -nn port 53
+```
+
+:::warning
+`tcpdump` captures all traffic including passwords sent in plaintext. Use it only on systems you own and administer, and delete captures when you are done.
+:::
+
+## Diagnose connectivity with mtr
+
+`mtr` combines `ping` and `traceroute` into a continuous real-time view of the path to a host. It shows packet loss and latency at every hop.
+
+```bash
+# Interactive mode
+mtr google.com
+
+# Report mode — run 10 cycles and exit
+mtr --report --report-cycles 10 google.com
+
+# Use TCP instead of ICMP (useful when ICMP is blocked)
+mtr --tcp --port 443 google.com
+
+# No hostname resolution
+mtr -n google.com
+```
+
+## DNS lookups and diagnostics
+
+```bash
+# Simple DNS lookup
+dig example.com
+
+# Lookup a specific record type
+dig example.com MX
+dig example.com AAAA
+dig example.com TXT
+
+# Reverse lookup
+dig -x 1.2.3.4
+
+# Query a specific DNS server
+dig @8.8.8.8 example.com
+
+# Short output
+dig +short example.com
+
+# Check DNS propagation
+dig example.com @8.8.8.8 +short
+dig example.com @1.1.1.1 +short
+```
+
+## Port scanning with nmap
+
+```bash
+# Scan open ports on a host
+sudo nmap -sS 192.168.1.100
+
+# Scan a specific port range
+sudo nmap -p 1-1024 192.168.1.100
+
+# Detect service versions
+sudo nmap -sV 192.168.1.100
+
+# Scan your own server for open ports
+sudo nmap -sS localhost
+
+# Quick scan of common ports
+sudo nmap --top-ports 20 192.168.1.100
+```
+
+:::note
+Only scan systems you own or have explicit permission to scan.
+:::
+
+## Monitor firewall connection tracking
+
+```bash
+# View current connection tracking table
+sudo conntrack -L
+
+# Show connection count by state
+sudo conntrack -L | awk '{print $4}' | sort | uniq -c | sort -rn
+
+# Watch connection count in real time
+watch -n 1 'sudo conntrack -L 2>/dev/null | wc -l'
+
+# Check conntrack table limits
+cat /proc/sys/net/netfilter/nf_conntrack_max
+cat /proc/sys/net/netfilter/nf_conntrack_count
+```
+
+If `nf_conntrack_count` approaches `nf_conntrack_max`, new connections will be dropped silently. Raise the limit if needed:
+
+```bash
+sudo sysctl -w net.netfilter.nf_conntrack_max=131072
+
+# Make it persistent
+echo "net.netfilter.nf_conntrack_max = 131072" | sudo tee /etc/sysctl.d/99-conntrack.conf
+sudo sysctl --system
+```
+
+## Scripted network monitoring
+
+A script to alert on interface errors, dropped packets, and unexpected listening ports:
+
+```bash
+#!/bin/bash
+# network-monitor.sh — alert on network anomalies
+
+EXPECTED_PORTS=(22 80 443)
+ERROR_THRESHOLD=100
+ALERT_EMAIL="ops@example.com"
+HOSTNAME=$(hostname)
+ALERTS=()
+
+# Check for interface errors and drops
+while IFS= read -r iface; do
+  [[ "$iface" == "lo" ]] && continue
+
+  ERRORS=$(ip -s link show "$iface" 2>/dev/null | awk '/errors/ {print $3}' | head -1)
+  DROPS=$(ip -s link show "$iface" 2>/dev/null | awk '/errors/ {print $5}' | head -1)
+
+  if [[ "${ERRORS:-0}" -gt "$ERROR_THRESHOLD" ]]; then
+    ALERTS+=("INTERFACE ERRORS: $iface has $ERRORS TX/RX errors")
+  fi
+  if [[ "${DROPS:-0}" -gt "$ERROR_THRESHOLD" ]]; then
+    ALERTS+=("INTERFACE DROPS: $iface has $DROPS dropped packets")
+  fi
+done < <(ip -o link show | awk -F': ' '{print $2}')
+
+# Check for unexpected listening ports
+LISTENING=$(ss -tlnp | awk 'NR>1 {print $4}' | awk -F: '{print $NF}' | sort -un)
+for port in $LISTENING; do
+  EXPECTED=false
+  for exp in "${EXPECTED_PORTS[@]}"; do
+    [[ "$port" == "$exp" ]] && EXPECTED=true && break
+  done
+  if [[ "$EXPECTED" == false ]]; then
+    PROCESS=$(ss -tlnp | grep ":${port} " | awk '{print $NF}')
+    ALERTS+=("UNEXPECTED PORT: $port is listening ($PROCESS)")
+  fi
+done
+
+# Send alert if needed
+if [[ "${#ALERTS[@]}" -gt 0 ]]; then
+  MESSAGE="Network alert on ${HOSTNAME}:\n\n$(printf '%s\n' "${ALERTS[@]}")"
+  echo -e "$MESSAGE" | mail -s "Network Alert: ${HOSTNAME}" "$ALERT_EMAIL"
+  echo -e "$MESSAGE"
+fi
+```
+
+Schedule with cron:
+
+```bash
+sudo crontab -e
+```
+
+```
+*/10 * * * * /usr/local/bin/network-monitor.sh >> /var/log/network-monitor.log 2>&1
+```
+
+## Common mistakes
+
+### Using netstat instead of ss
+
+`netstat` is deprecated on AlmaLinux. `ss` is faster, more detailed, and actively maintained.
+
+```bash
+# Old way
+netstat -tlnp
+
+# Modern way
+ss -tlnp
+```
+
+### Not monitoring interface errors
+
+A network interface can be up and passing traffic while quietly accumulating errors that degrade performance. Check regularly.
+
+```bash
+ip -s link show eth0
+```
+
+### Ignoring conntrack table exhaustion
+
+When the conntrack table fills up, new connections are silently dropped — often causing intermittent and hard-to-diagnose failures on busy servers.
+
+```bash
+# Check utilisation
+echo "$(cat /proc/sys/net/netfilter/nf_conntrack_count) / $(cat /proc/sys/net/netfilter/nf_conntrack_max)"
+```
+
+### Running tcpdump without a filter on a busy interface
+
+Without a filter, `tcpdump` on a high-traffic interface can fill disk space very quickly and impact performance.
+
+```bash
+# Always use filters
+sudo tcpdump -i eth0 -w /tmp/capture.pcap port 80 -c 10000
+```
+
+## Summary
+
+Network monitoring on AlmaLinux covers connections, bandwidth, packet-level traffic, and infrastructure diagnostics. Used together, these tools give you a complete picture of what your system is communicating with and how healthy those communications are.
+
+Key points:
+
+- use `ss -tlnp` to inspect listening ports and active connections
+- use `iftop` and `nethogs` for real-time bandwidth visibility per connection and per process
+- use `sar -n DEV` for historical interface statistics
+- use `tcpdump` for deep packet-level diagnosis — always with filters on busy interfaces
+- use `mtr` instead of `ping` or `traceroute` for path diagnostics
+- monitor conntrack table usage on busy servers to prevent silent connection drops
+- script port and error checks and schedule them with cron for proactive alerting
+
+:::tip Related pages
+- [Resource Monitoring](./resource-monitoring)
+- [Process Monitoring](./process-monitoring)
+- [Log Monitoring](./log-monitoring)
+- [Enterprise Alerting](./enterprise-alerting)
+:::

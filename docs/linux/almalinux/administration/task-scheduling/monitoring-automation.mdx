@@ -1,0 +1,608 @@
+---
+sidebar_position: 4
+title: "Monitoring Automation | AlmaLinux"
+sidebar_label: "Monitoring Automation"
+description: "Automate system monitoring on AlmaLinux with scheduled health checks, performance reports, threshold alerting, and integration with enterprise monitoring systems."
+keywords:
+  - "almalinux monitoring automation"
+  - "almalinux health checks"
+  - "almalinux performance monitoring"
+  - "almalinux alerting"
+  - "rhel monitoring automation"
+tags:
+  - almalinux
+  - task-scheduling
+  - monitoring
+  - automation
+  - alerting
+slug: /linux/almalinux/administration/task-scheduling/monitoring-automation
+---
+
+# Monitoring Automation on AlmaLinux
+
+Manual monitoring — periodically logging into servers to check disk space, review service status, and look for errors — does not scale and misses problems that occur between checks. Automated monitoring runs checks continuously or on a schedule, compares results against thresholds, and alerts when conditions fall outside acceptable bounds. The result is faster detection of problems and a consistent baseline of system data that manual inspection cannot provide.
+
+On AlmaLinux, automated monitoring is built from shell scripts, standard system tools, and scheduling via cron or systemd timers. This page covers how to build scheduled monitoring checks for the most important system resources, how to structure alerting so that notifications are actionable rather than noisy, and how to collect and store performance data over time.
+
+---
+
+## Principles of Effective Monitoring Automation
+
+Before writing monitoring scripts, a few design principles help avoid common pitfalls.
+
+**Alert on conditions that require action, not on every anomaly.** A monitoring system that pages the on-call engineer for every minor fluctuation trains people to ignore alerts. Define thresholds carefully — a disk at 85% is worth a warning, but not necessarily a page at 03:00. Reserve urgent alerts for conditions that will cause service disruption if not addressed promptly.
+
+**Include context in alerts.** An alert that says "disk space low" requires the recipient to log in and investigate before they know what to do. An alert that says "disk /var/log is at 91% on web01 — largest directory is /var/log/httpd/ at 14 GB" gives the recipient enough information to begin remediation immediately.
+
+**Avoid alert storms.** When a root cause triggers many downstream failures, a naive monitoring system sends hundreds of alerts in quick succession. Structure checks so that a single problem generates a single, clear alert rather than a cascade of notifications.
+
+**Log monitoring results, not just alerts.** When investigating an incident, historical monitoring data helps establish when a problem began and how it progressed. Always write check results to a log file, not just to an email on failure.
+
+---
+
+## Disk Space Monitoring
+
+Disk space exhaustion is one of the most common causes of service disruption on Linux systems. Log files, database growth, and application data accumulate silently until a write fails. Automated disk space monitoring catches this before it becomes a crisis.
+
+### A Disk Space Alert Script
+
+The following script checks all mounted filesystems and sends an alert if any exceeds a configurable threshold:
+
+```bash
+nano /usr/local/sbin/check-disk-space.sh
+```
+
+```bash
+#!/bin/bash
+# check-disk-space.sh
+# Checks disk usage on all local filesystems and alerts if any exceeds thresholds.
+
+WARN_THRESHOLD=80
+CRIT_THRESHOLD=90
+ALERT_EMAIL="admin@example.com"
+LOGFILE="/var/log/monitoring/disk-space.log"
+HOSTNAME=$(hostname -s)
+
+mkdir -p "$(dirname "${LOGFILE}")"
+
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "${LOGFILE}"
+}
+
+ALERTS=()
+
+# Read disk usage for all local filesystems, skipping tmpfs and pseudo-filesystems
+while IFS= read -r line; do
+    USAGE=$(echo "${line}" | awk '{print $5}' | tr -d '%')
+    MOUNT=$(echo "${line}" | awk '{print $6}')
+    SOURCE=$(echo "${line}" | awk '{print $1}')
+
+    if [[ "${USAGE}" -ge "${CRIT_THRESHOLD}" ]]; then
+        MSG="CRITICAL: ${SOURCE} mounted at ${MOUNT} is ${USAGE}% full on ${HOSTNAME}"
+        log "${MSG}"
+        ALERTS+=("${MSG}")
+    elif [[ "${USAGE}" -ge "${WARN_THRESHOLD}" ]]; then
+        MSG="WARNING: ${SOURCE} mounted at ${MOUNT} is ${USAGE}% full on ${HOSTNAME}"
+        log "${MSG}"
+        ALERTS+=("${MSG}")
+    else
+        log "OK: ${MOUNT} is ${USAGE}% full"
+    fi
+done < <(df -lP --exclude-type=tmpfs --exclude-type=devtmpfs \
+               --exclude-type=squashfs | tail -n +2)
+
+# Send a single consolidated alert if any thresholds were exceeded
+if [[ "${#ALERTS[@]}" -gt 0 ]]; then
+    {
+        echo "Disk space alert on ${HOSTNAME} at $(date):"
+        echo ""
+        for ALERT in "${ALERTS[@]}"; do
+            echo "  ${ALERT}"
+        done
+        echo ""
+        echo "Full disk usage:"
+        df -lPh --exclude-type=tmpfs --exclude-type=devtmpfs
+    } | mail -s "Disk Space Alert: ${HOSTNAME}" "${ALERT_EMAIL}"
+fi
+```
+
+```bash
+chmod 700 /usr/local/sbin/check-disk-space.sh
+```
+
+The script consolidates all threshold violations into a single email rather than sending one per filesystem, preventing alert storms on systems with many mounts.
+
+Schedule it to run every 15 minutes via cron:
+
+```bash
+nano /etc/cron.d/monitoring-disk
+```
+
+```
+# Check disk space every 15 minutes
+*/15 * * * *  root  /usr/local/sbin/check-disk-space.sh
+```
+
+---
+
+## Service Status Monitoring
+
+Knowing that a service has failed is more useful than discovering it when a user reports an outage. A scheduled service check compares the list of critical services against their current state and alerts when any is not running.
+
+### Defining and Checking Critical Services
+
+```bash
+nano /usr/local/sbin/check-services.sh
+```
+
+```bash
+#!/bin/bash
+# check-services.sh
+# Checks that critical services are active and alerts on any failures.
+
+CRITICAL_SERVICES=(
+    sshd
+    crond
+    firewalld
+    nginx
+    postgresql
+)
+ALERT_EMAIL="admin@example.com"
+LOGFILE="/var/log/monitoring/services.log"
+HOSTNAME=$(hostname -s)
+
+mkdir -p "$(dirname "${LOGFILE}")"
+
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "${LOGFILE}"
+}
+
+FAILED=()
+
+for SERVICE in "${CRITICAL_SERVICES[@]}"; do
+    STATE=$(systemctl is-active "${SERVICE}" 2>/dev/null)
+    if [[ "${STATE}" == "active" ]]; then
+        log "OK: ${SERVICE} is ${STATE}"
+    else
+        log "FAILED: ${SERVICE} is ${STATE}"
+        FAILED+=("${SERVICE} (${STATE})")
+    fi
+done
+
+if [[ "${#FAILED[@]}" -gt 0 ]]; then
+    {
+        echo "Service failures detected on ${HOSTNAME} at $(date):"
+        echo ""
+        for SVC in "${FAILED[@]}"; do
+            echo "  - ${SVC}"
+        done
+        echo ""
+        echo "Recent journal output for failed services:"
+        for SVC in "${FAILED[@]}"; do
+            NAME=$(echo "${SVC}" | awk '{print $1}')
+            echo ""
+            echo "── ${NAME} ──"
+            journalctl -u "${NAME}" -n 10 --no-pager 2>/dev/null
+        done
+    } | mail -s "Service Failure Alert: ${HOSTNAME}" "${ALERT_EMAIL}"
+fi
+```
+
+```bash
+chmod 700 /usr/local/sbin/check-services.sh
+```
+
+The alert includes recent journal output for each failed service — the context needed to begin diagnosing the failure without logging into the server separately. Schedule it every 5 minutes:
+
+```bash
+nano /etc/cron.d/monitoring-services
+```
+
+```
+# Check critical services every 5 minutes
+*/5 * * * *  root  /usr/local/sbin/check-services.sh
+```
+
+---
+
+## CPU and Load Average Monitoring
+
+Sustained high CPU load often precedes service degradation or failure. Load average monitoring provides an early warning before users notice slowness.
+
+### Understanding Load Average
+
+The load average on Linux represents the average number of processes that are either running or waiting for CPU or I/O over 1, 5, and 15 minute periods. A load average equal to the number of CPU cores means the system is fully utilized but not overwhelmed. A load average significantly higher than the core count means processes are queuing for CPU time.
+
+To find the number of CPU cores:
+
+```bash
+nproc
+```
+
+### A CPU Load Alert Script
+
+```bash
+nano /usr/local/sbin/check-load.sh
+```
+
+```bash
+#!/bin/bash
+# check-load.sh
+# Alerts if the 5-minute load average exceeds a threshold relative to CPU count.
+
+LOAD_WARN_MULTIPLIER=2    # Alert at 2x the number of cores
+LOAD_CRIT_MULTIPLIER=4    # Critical at 4x the number of cores
+ALERT_EMAIL="admin@example.com"
+LOGFILE="/var/log/monitoring/load.log"
+HOSTNAME=$(hostname -s)
+
+mkdir -p "$(dirname "${LOGFILE}")"
+
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "${LOGFILE}"
+}
+
+CPU_COUNT=$(nproc)
+LOAD_5MIN=$(uptime | awk -F'load average:' '{print $2}' | awk -F',' '{print $2}' | tr -d ' ')
+LOAD_INT=$(echo "${LOAD_5MIN}" | awk -F. '{print $1}')
+
+WARN_THRESHOLD=$(( CPU_COUNT * LOAD_WARN_MULTIPLIER ))
+CRIT_THRESHOLD=$(( CPU_COUNT * LOAD_CRIT_MULTIPLIER ))
+
+log "Load average (5m): ${LOAD_5MIN} | CPUs: ${CPU_COUNT} | Warn: ${WARN_THRESHOLD} | Crit: ${CRIT_THRESHOLD}"
+
+if [[ "${LOAD_INT}" -ge "${CRIT_THRESHOLD}" ]]; then
+    {
+        echo "CRITICAL: Load average on ${HOSTNAME} is ${LOAD_5MIN} (${CPU_COUNT} CPUs)"
+        echo ""
+        echo "Top processes by CPU:"
+        ps aux --sort=-%cpu | head -15
+        echo ""
+        echo "Full uptime:"
+        uptime
+    } | mail -s "CRITICAL Load Alert: ${HOSTNAME}" "${ALERT_EMAIL}"
+elif [[ "${LOAD_INT}" -ge "${WARN_THRESHOLD}" ]]; then
+    {
+        echo "WARNING: Load average on ${HOSTNAME} is ${LOAD_5MIN} (${CPU_COUNT} CPUs)"
+        echo ""
+        echo "Top processes by CPU:"
+        ps aux --sort=-%cpu | head -10
+    } | mail -s "High Load Warning: ${HOSTNAME}" "${ALERT_EMAIL}"
+fi
+```
+
+```bash
+chmod 700 /usr/local/sbin/check-load.sh
+```
+
+Schedule every 5 minutes:
+
+```bash
+echo "*/5 * * * *  root  /usr/local/sbin/check-load.sh" >> /etc/cron.d/monitoring-load
+```
+
+---
+
+## Memory Monitoring
+
+Memory exhaustion triggers the OOM killer, which terminates processes unpredictably. Monitoring available memory and alerting before it reaches critical levels gives time to investigate and act before service impact.
+
+### A Memory Alert Script
+
+```bash
+nano /usr/local/sbin/check-memory.sh
+```
+
+```bash
+#!/bin/bash
+# check-memory.sh
+# Alerts if available memory falls below a threshold percentage.
+
+WARN_THRESHOLD=20   # Alert when less than 20% memory is available
+CRIT_THRESHOLD=10   # Critical when less than 10% is available
+ALERT_EMAIL="admin@example.com"
+LOGFILE="/var/log/monitoring/memory.log"
+HOSTNAME=$(hostname -s)
+
+mkdir -p "$(dirname "${LOGFILE}")"
+
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "${LOGFILE}"
+}
+
+TOTAL=$(free -m | awk '/^Mem:/{print $2}')
+AVAILABLE=$(free -m | awk '/^Mem:/{print $7}')
+AVAIL_PCT=$(( AVAILABLE * 100 / TOTAL ))
+
+log "Memory: ${AVAILABLE}MB available of ${TOTAL}MB total (${AVAIL_PCT}% free)"
+
+if [[ "${AVAIL_PCT}" -le "${CRIT_THRESHOLD}" ]]; then
+    {
+        echo "CRITICAL: Only ${AVAIL_PCT}% memory available on ${HOSTNAME}"
+        echo "Available: ${AVAILABLE}MB of ${TOTAL}MB"
+        echo ""
+        echo "Top processes by memory:"
+        ps aux --sort=-%mem | head -15
+        echo ""
+        free -h
+    } | mail -s "CRITICAL Memory Alert: ${HOSTNAME}" "${ALERT_EMAIL}"
+elif [[ "${AVAIL_PCT}" -le "${WARN_THRESHOLD}" ]]; then
+    {
+        echo "WARNING: Only ${AVAIL_PCT}% memory available on ${HOSTNAME}"
+        echo "Available: ${AVAILABLE}MB of ${TOTAL}MB"
+        echo ""
+        echo "Top processes by memory:"
+        ps aux --sort=-%mem | head -10
+    } | mail -s "Low Memory Warning: ${HOSTNAME}" "${ALERT_EMAIL}"
+fi
+```
+
+```bash
+chmod 700 /usr/local/sbin/check-memory.sh
+```
+
+```bash
+echo "*/10 * * * *  root  /usr/local/sbin/check-memory.sh" >> /etc/cron.d/monitoring-memory
+```
+
+---
+
+## Collecting Performance Metrics Over Time
+
+Threshold alerts tell you when something is wrong right now. Historical performance data tells you how a system has behaved over time — revealing trends, seasonal patterns, and the baseline that makes anomaly detection meaningful.
+
+### Logging Metrics with sar
+
+The `sysstat` package provides `sar` (System Activity Reporter), which collects system performance statistics on a schedule and stores them for later analysis. Install it:
+
+```bash
+dnf install sysstat
+systemctl enable --now sysstat
+```
+
+`sysstat` configures its own cron job in `/etc/cron.d/sysstat` to collect data every 10 minutes and generate daily summary reports. The raw data is stored in `/var/log/sa/`.
+
+To view CPU utilization since the beginning of today:
+
+```bash
+sar -u
+```
+
+To view memory statistics:
+
+```bash
+sar -r
+```
+
+To view disk I/O statistics:
+
+```bash
+sar -b
+```
+
+To view network statistics:
+
+```bash
+sar -n DEV
+```
+
+To view a specific date's data from the archive:
+
+```bash
+sar -u -f /var/log/sa/sa01
+```
+
+`sar` data is invaluable during post-incident analysis — it provides an objective record of system resource utilization leading up to and during an incident, helping distinguish between a resource exhaustion problem and a software failure.
+
+### Logging Custom Metrics to a File
+
+For application-specific metrics that `sar` does not capture, write a simple collection script that appends measurements to a CSV or plain text file:
+
+```bash
+nano /usr/local/sbin/collect-metrics.sh
+```
+
+```bash
+#!/bin/bash
+# collect-metrics.sh
+# Collects system metrics and appends them to a CSV file for trend analysis.
+
+METRICSFILE="/var/log/monitoring/system-metrics.csv"
+mkdir -p "$(dirname "${METRICSFILE}")"
+
+# Write CSV header if the file does not exist
+if [[ ! -f "${METRICSFILE}" ]]; then
+    echo "timestamp,load_1m,load_5m,load_15m,mem_avail_mb,mem_total_mb,disk_root_pct,disk_var_pct" \
+        > "${METRICSFILE}"
+fi
+
+TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
+read LOAD_1 LOAD_5 LOAD_15 REST < /proc/loadavg
+MEM_TOTAL=$(awk '/MemTotal/{print int($2/1024)}' /proc/meminfo)
+MEM_AVAIL=$(awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo)
+DISK_ROOT=$(df -P / | awk 'NR==2{print $5}' | tr -d '%')
+DISK_VAR=$(df -P /var | awk 'NR==2{print $5}' | tr -d '%')
+
+echo "${TIMESTAMP},${LOAD_1},${LOAD_5},${LOAD_15},${MEM_AVAIL},${MEM_TOTAL},${DISK_ROOT},${DISK_VAR}" \
+    >> "${METRICSFILE}"
+```
+
+```bash
+chmod 700 /usr/local/sbin/collect-metrics.sh
+```
+
+Schedule every 5 minutes:
+
+```bash
+echo "*/5 * * * *  root  /usr/local/sbin/collect-metrics.sh" >> /etc/cron.d/monitoring-metrics
+```
+
+The resulting CSV file can be analyzed with standard tools, imported into spreadsheets, or fed into a visualization tool. Add a logrotate rule to prevent it from growing indefinitely:
+
+```bash
+nano /etc/logrotate.d/monitoring-metrics
+```
+
+```
+/var/log/monitoring/system-metrics.csv {
+    weekly
+    rotate 52
+    compress
+    missingok
+    notifempty
+    copytruncate
+}
+```
+
+The `copytruncate` option is essential here — because the script appends to the file rather than writing a fresh file, standard logrotate rotation (rename and reopen) would break the script. `copytruncate` copies the file then truncates the original, allowing the script to continue appending uninterrupted.
+
+---
+
+## Preventing Alert Fatigue with State Tracking
+
+A naive monitoring script sends an alert every time it runs and finds a problem. For a check running every 5 minutes, a sustained disk space issue generates 12 alerts per hour — quickly training the team to ignore them. State tracking solves this by sending an alert only when a condition transitions from OK to problem, and again when it resolves.
+
+The following pattern uses a state file to track whether an alert has already been sent:
+
+```bash
+nano /usr/local/sbin/check-disk-stateful.sh
+```
+
+```bash
+#!/bin/bash
+# check-disk-stateful.sh
+# Checks disk usage and sends alerts only on state transitions (OK -> ALERT, ALERT -> OK).
+
+THRESHOLD=85
+MOUNT="/"
+ALERT_EMAIL="admin@example.com"
+STATE_FILE="/var/lib/monitoring/disk-root.state"
+LOGFILE="/var/log/monitoring/disk-stateful.log"
+HOSTNAME=$(hostname -s)
+
+mkdir -p "$(dirname "${STATE_FILE}")"
+mkdir -p "$(dirname "${LOGFILE}")"
+
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "${LOGFILE}"
+}
+
+USAGE=$(df -P "${MOUNT}" | awk 'NR==2{print $5}' | tr -d '%')
+PREV_STATE=$(cat "${STATE_FILE}" 2>/dev/null || echo "OK")
+
+if [[ "${USAGE}" -ge "${THRESHOLD}" ]]; then
+    CURRENT_STATE="ALERT"
+else
+    CURRENT_STATE="OK"
+fi
+
+log "Disk ${MOUNT}: ${USAGE}% | Previous: ${PREV_STATE} | Current: ${CURRENT_STATE}"
+
+# Alert only on state transition
+if [[ "${CURRENT_STATE}" == "ALERT" && "${PREV_STATE}" == "OK" ]]; then
+    echo "Disk ${MOUNT} on ${HOSTNAME} has exceeded ${THRESHOLD}% — currently at ${USAGE}%." \
+        | mail -s "Disk Alert: ${HOSTNAME}" "${ALERT_EMAIL}"
+    log "Alert sent: disk exceeded threshold"
+elif [[ "${CURRENT_STATE}" == "OK" && "${PREV_STATE}" == "ALERT" ]]; then
+    echo "Disk ${MOUNT} on ${HOSTNAME} has recovered — now at ${USAGE}% (below ${THRESHOLD}%)." \
+        | mail -s "Disk Recovered: ${HOSTNAME}" "${ALERT_EMAIL}"
+    log "Recovery notification sent"
+fi
+
+echo "${CURRENT_STATE}" > "${STATE_FILE}"
+```
+
+```bash
+chmod 700 /usr/local/sbin/check-disk-stateful.sh
+```
+
+With this approach, a problem generates exactly one alert when it occurs and one recovery notification when it clears — regardless of how many check cycles it spans.
+
+---
+
+## Scheduling a Daily Performance Summary
+
+In addition to threshold alerts, a daily performance summary email provides a regular overview of system health without requiring anyone to log in. Deliver it early in the morning so it is available when the team starts work:
+
+```bash
+nano /etc/systemd/system/daily-perf-summary.service
+```
+
+```ini
+[Unit]
+Description=Daily performance summary report
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/weekly-health-report.sh
+```
+
+```bash
+nano /etc/systemd/system/daily-perf-summary.timer
+```
+
+```ini
+[Unit]
+Description=Send daily performance summary at 06:30
+
+[Timer]
+OnCalendar=*-*-* 06:30:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+```
+
+```bash
+systemctl daemon-reload
+systemctl enable --now daily-perf-summary.timer
+```
+
+The health report script from the [Maintenance Automation](./maintenance-automation) page serves this purpose well — adapt it to include the metrics most relevant to your environment.
+
+---
+
+## Integration with External Monitoring Systems
+
+For environments with dedicated monitoring infrastructure — Prometheus, Nagios, Zabbix, Grafana — the local scripts described in this page can serve as a fallback or complement rather than a replacement. Local scripts are valuable because they work without external dependencies and run even when the monitoring server is unreachable.
+
+When both local scripts and an external monitoring system are in use, avoid duplication. Use local scripts for:
+- Checks that must run even if the monitoring server is down
+- Alerting on monitoring system failures themselves
+- Collecting metrics that the external system does not cover
+
+Use the external system for:
+- Centralized dashboards across many servers
+- Cross-host correlation (one server's metrics affecting another's threshold)
+- Long-term metric retention and trend analysis beyond what local CSV files provide
+
+For Prometheus environments, the `node_exporter` package exposes standard system metrics in Prometheus format and replaces most of what a custom metrics collection script would do:
+
+```bash
+dnf install golang-github-prometheus-node-exporter
+systemctl enable --now node_exporter
+```
+
+---
+
+## Summary
+
+Monitoring automation on AlmaLinux combines threshold-based alerting scripts with continuous metric collection to give administrators early warning of problems and historical context for investigation. The key is designing monitoring that is actionable — alerts that contain enough context to begin remediation, sent only when conditions genuinely warrant attention.
+
+Key points to remember:
+
+- Include context in alert emails: hostname, affected resource, current value, and relevant process or file details
+- Consolidate multiple threshold violations into a single alert per check run to prevent alert storms
+- Use state files to send alerts only on state transitions — once when a problem begins, once when it resolves
+- `sysstat` / `sar` provides built-in performance history; install it on every AlmaLinux server
+- Use `copytruncate` in logrotate for files that are appended to by long-running processes
+- Local monitoring scripts provide a reliable fallback when external monitoring systems are unavailable
+- `node_exporter` exposes standard system metrics for Prometheus-based monitoring environments
+
+### Related Pages
+
+- [Cron Scheduling](./cron-scheduling) — scheduling monitoring checks with crond
+- [Systemd Timers](./systemd-timers) — scheduling monitoring with systemd timer units
+- [Maintenance Automation](./maintenance-automation) — automated system upkeep tasks
+- [Error Logging](../log-management/error-logging) — locating and interpreting error messages
+- [Log Monitoring](../log-management/log-monitoring) — alerting on log patterns with fail2ban and logwatch

@@ -1,0 +1,389 @@
+---
+sidebar_position: 1
+title: "Starting Services | AlmaLinux"
+sidebar_label: "Starting Services"
+description: "Start services with systemctl start, understand service activation, and manage service startup on AlmaLinux."
+keywords:
+  - "almalinux start service"
+  - "almalinux systemctl start"
+  - "almalinux service activation"
+  - "almalinux enable service"
+  - "rhel start service"
+tags:
+  - almalinux
+  - service-management
+  - systemd
+slug: /linux/almalinux/administration/service-management/starting-services
+---
+
+# Starting Services
+
+On AlmaLinux, every service is managed by systemd. Starting a service correctly means understanding the difference between activating it now, enabling it at boot, and ensuring its dependencies are satisfied before it runs. Getting this right is the foundation of reliable service management.
+
+## The difference between start and enable
+
+This is the most important distinction in systemd service management.
+
+| Command | Effect |
+|---------|--------|
+| `systemctl start` | Starts the service **now** — does not persist across reboots |
+| `systemctl enable` | Configures the service to **start at boot** — does not start it now |
+| `systemctl enable --now` | Does both — starts now and enables at boot |
+
+```bash
+# Start a service right now
+sudo systemctl start nginx
+
+# Enable at boot only (does not start immediately)
+sudo systemctl enable nginx
+
+# Start now AND enable at boot — the most common operation
+sudo systemctl enable --now nginx
+```
+
+## Verify a service started successfully
+
+```bash
+# Full status with recent log output
+systemctl status nginx
+
+# Just check if it is running
+systemctl is-active nginx
+
+# Check if it is enabled at boot
+systemctl is-enabled nginx
+```
+
+Example output from `systemctl status`:
+
+```
+● nginx.service - The nginx HTTP and reverse proxy server
+     Loaded: loaded (/usr/lib/systemd/system/nginx.service; enabled; preset: disabled)
+     Active: active (running) since Thu 2026-03-19 10:42:17 CET; 3min ago
+    Process: 1234 ExecStartPre=/usr/bin/rm -f /run/nginx.pid (code=exited, status=0/SUCCESS)
+   Main PID: 1238 (nginx)
+      Tasks: 3 (limit: 4096)
+     Memory: 6.2M
+        CPU: 45ms
+     CGroup: /system.slice/nginx.service
+             ├─1238 "nginx: master process /usr/sbin/nginx"
+             ├─1239 "nginx: worker process"
+             └─1240 "nginx: worker process"
+```
+
+## Start multiple services at once
+
+```bash
+sudo systemctl start nginx postgresql redis
+```
+
+## Start a service and follow its logs
+
+When starting a service for the first time or after a configuration change, follow the logs immediately to catch errors:
+
+```bash
+# Start the service
+sudo systemctl start myapp
+
+# Follow its logs in real time
+journalctl -u myapp -f
+```
+
+Or in one command using a shell subshell:
+
+```bash
+sudo systemctl start myapp & journalctl -u myapp -f
+```
+
+## Reload vs restart
+
+Not every change requires a full restart. Many services can reload their configuration without dropping connections.
+
+```bash
+# Reload configuration without restarting (zero downtime)
+sudo systemctl reload nginx
+
+# Restart completely (briefly drops connections)
+sudo systemctl restart nginx
+
+# Reload if supported, restart if not
+sudo systemctl reload-or-restart nginx
+```
+
+:::tip
+Always try `reload` first for configuration changes on production services. It is faster and avoids dropping active connections. Check the service documentation to confirm reload is supported.
+:::
+
+## Start a service after editing its unit file
+
+After modifying a unit file, systemd must be told to re-read it before the changes take effect.
+
+```bash
+# Tell systemd to re-read all unit files
+sudo systemctl daemon-reload
+
+# Then start or restart the service
+sudo systemctl restart myapp
+```
+
+:::warning
+Skipping `daemon-reload` after editing a unit file means systemd will continue using the old version. Always reload before restarting.
+:::
+
+## Start a service with different parameters temporarily
+
+Use `systemd-run` to start a service with custom parameters without modifying the unit file — useful for one-off testing.
+
+```bash
+# Run a command as a transient service
+sudo systemd-run --unit=myapp-test \
+  --uid=myapp \
+  --gid=myapp \
+  /usr/local/bin/myapp --config /etc/myapp/config-test.yml
+
+# Check its status
+systemctl status myapp-test
+
+# Follow its logs
+journalctl -u myapp-test -f
+```
+
+## Start a service at a specific target
+
+Services are started when their target is reached during boot. The most common targets for production services are:
+
+```ini
+[Install]
+# Start in multi-user mode (most server services)
+WantedBy=multi-user.target
+
+# Start in graphical mode only
+WantedBy=graphical.target
+```
+
+To add a service to a target without modifying the unit file:
+
+```bash
+# Create a symlink manually
+sudo systemctl enable nginx
+# This creates: /etc/systemd/system/multi-user.target.wants/nginx.service -> ...
+```
+
+## Understand why a service did not start
+
+When `systemctl start` fails, the error output often points directly to the problem.
+
+```bash
+# Show the status and recent log output
+systemctl status nginx
+
+# Show the full journal for the service since last boot
+journalctl -u nginx -b --no-pager
+
+# Show only errors
+journalctl -u nginx -b -p err
+
+# Check the unit file for syntax errors
+systemd-analyze verify /etc/systemd/system/nginx.service
+```
+
+### Common reasons a service fails to start
+
+**Port already in use:**
+```bash
+# Find what is using the port
+sudo ss -tlnp | grep :80
+```
+
+**Permission denied:**
+```bash
+# Check the service user and file permissions
+systemctl show nginx --property=User
+ls -la /var/log/nginx/
+```
+
+**Missing dependency:**
+```bash
+# Check dependency status
+systemctl list-dependencies nginx
+systemctl status postgresql  # if nginx depends on it
+```
+
+**Configuration error:**
+```bash
+# Test the service configuration directly
+sudo nginx -t
+sudo postgresql --check-config
+```
+
+## Start services in the correct order
+
+If your application depends on a database or cache, ensure the dependency is declared in the unit file so systemd starts them in the right order.
+
+```ini
+[Unit]
+Description=My Application
+After=network-online.target postgresql.service redis.service
+Requires=postgresql.service
+Wants=redis.service
+
+[Install]
+WantedBy=multi-user.target
+```
+
+With this configuration, starting `myapp` will automatically start `postgresql` first if it is not already running.
+
+```bash
+# Starting myapp will pull in its dependencies
+sudo systemctl start myapp
+```
+
+## Boot-time service activation
+
+### View services enabled at boot
+
+```bash
+# All enabled services
+systemctl list-unit-files --type=service --state=enabled
+
+# Services that will start in the current default target
+systemctl list-dependencies multi-user.target | grep service
+```
+
+### Check boot-time preset
+
+AlmaLinux applies default presets when packages are installed. Some services are disabled by default.
+
+```bash
+# View the preset for a service
+systemctl is-enabled nginx
+# disabled — means it was not auto-enabled by the package preset
+
+# View all presets
+systemctl list-unit-files --type=service | grep -E "enabled|disabled|preset"
+```
+
+### Enable at boot without a unit [Install] section
+
+Some units do not have an `[Install]` section and cannot be enabled with `systemctl enable`. Use a static symlink instead:
+
+```bash
+sudo ln -s /usr/lib/systemd/system/myapp.service \
+  /etc/systemd/system/multi-user.target.wants/myapp.service
+sudo systemctl daemon-reload
+```
+
+## Scripted service startup with health check
+
+A script to start a service and verify it is healthy before proceeding:
+
+```bash
+#!/bin/bash
+# start-with-healthcheck.sh — start a service and verify it is healthy
+
+SERVICE="$1"
+HEALTH_URL="${2:-}"
+TIMEOUT=30
+
+if [[ -z "$SERVICE" ]]; then
+  echo "Usage: $0 servicename [health-check-url]"
+  exit 1
+fi
+
+echo "Starting $SERVICE..."
+sudo systemctl start "$SERVICE"
+
+# Wait for the service to become active
+for i in $(seq 1 $TIMEOUT); do
+  if systemctl is-active --quiet "$SERVICE"; then
+    echo "$SERVICE is active after ${i}s"
+    break
+  fi
+  if [[ "$i" -eq "$TIMEOUT" ]]; then
+    echo "ERROR: $SERVICE did not become active within ${TIMEOUT}s"
+    journalctl -u "$SERVICE" -n 20 --no-pager
+    exit 1
+  fi
+  sleep 1
+done
+
+# Optional HTTP health check
+if [[ -n "$HEALTH_URL" ]]; then
+  echo "Running health check: $HEALTH_URL"
+  for i in $(seq 1 $TIMEOUT); do
+    if curl -sf "$HEALTH_URL" > /dev/null 2>&1; then
+      echo "Health check passed after ${i}s"
+      exit 0
+    fi
+    sleep 1
+  done
+  echo "ERROR: Health check failed after ${TIMEOUT}s"
+  exit 1
+fi
+
+exit 0
+```
+
+```bash
+# Start nginx and check its health endpoint
+bash start-with-healthcheck.sh nginx http://localhost/health
+```
+
+## Common mistakes
+
+### Starting without enabling — service does not survive reboot
+
+```bash
+# WRONG — starts now but not at boot
+sudo systemctl start nginx
+
+# CORRECT — starts now and survives reboot
+sudo systemctl enable --now nginx
+```
+
+### Enabling without starting — service is not running yet
+
+```bash
+# WRONG — enabled at boot but not running now
+sudo systemctl enable nginx
+
+# CORRECT — both enabled and running
+sudo systemctl enable --now nginx
+```
+
+### Not running daemon-reload after editing unit files
+
+```bash
+sudo systemctl edit myapp        # or nano /etc/systemd/system/myapp.service
+sudo systemctl daemon-reload     # always required after changes
+sudo systemctl restart myapp
+```
+
+### Starting a service without checking its dependencies first
+
+```bash
+# Check that dependencies are met before starting
+systemctl list-dependencies myapp
+systemctl is-active postgresql || sudo systemctl start postgresql
+sudo systemctl start myapp
+```
+
+## Summary
+
+Starting services correctly on AlmaLinux is about more than just `systemctl start`. Understanding the start vs enable distinction, checking logs immediately, and ensuring dependencies are satisfied will save you from the most common service management mistakes.
+
+Key points:
+
+- use `systemctl enable --now` to start a service and ensure it starts at boot
+- always run `systemctl daemon-reload` after editing unit files
+- use `systemctl reload` instead of `restart` for configuration changes when possible
+- follow logs with `journalctl -u servicename -f` immediately after starting
+- declare dependencies with `After=` and `Requires=` so systemd handles startup order
+- use `systemd-analyze verify` to catch unit file errors before starting
+
+:::tip Related pages
+- [Stopping Services](./stopping-services)
+- [Service Configuration](./service-configuration)
+- [Service Status](./service-status)
+- [Service Dependencies](./service-dependencies)
+:::

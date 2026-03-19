@@ -1,0 +1,553 @@
+---
+sidebar_position: 4
+title: "Performance Tuning | AlmaLinux"
+sidebar_label: "Performance Tuning"
+description: "Optimize AlmaLinux for enterprise workloads using tuned profiles, kernel parameter tuning, CPU and memory optimization, I/O scheduling, and network performance configuration."
+keywords:
+  - "almalinux performance tuning"
+  - "almalinux tuned"
+  - "almalinux kernel parameters"
+  - "almalinux sysctl"
+  - "rhel performance tuning"
+tags:
+  - almalinux
+  - system-maintenance
+  - performance
+  - tuning
+  - optimization
+slug: /linux/almalinux/administration/system-maintenance/performance-tuning
+---
+
+# Performance Tuning on AlmaLinux
+
+A default AlmaLinux installation is tuned for general-purpose use — a reasonable balance across a wide range of workloads. Production systems running specific workloads — high-throughput databases, latency-sensitive web applications, scientific computing, or network appliances — can often achieve significantly better performance by adjusting kernel parameters, CPU scheduling, memory management, and I/O settings to match the actual workload characteristics.
+
+Performance tuning is an evidence-based practice. The starting point is always measurement: establish a baseline, make one change at a time, measure again, and keep changes that improve the metric you care about. Tuning without measurement is guesswork, and guesswork in production is risk.
+
+This page covers the primary levers available for performance tuning on AlmaLinux: the `tuned` daemon for profile-based system tuning, `sysctl` for kernel parameter adjustment, CPU power management, memory and swap configuration, I/O scheduler selection, and network stack tuning.
+
+---
+
+## Establishing a Performance Baseline
+
+Before making any tuning changes, measure the current state of the system. Without a baseline, you cannot tell whether a change improved or degraded performance.
+
+### CPU and Load
+
+Capture CPU utilization and load average over a representative period:
+
+```bash
+# Snapshot of current CPU utilization by category
+mpstat -P ALL 1 5
+```
+
+```bash
+# Load average and CPU count for context
+uptime
+nproc
+```
+
+### Memory
+
+```bash
+# Detailed memory statistics
+free -h
+
+# Virtual memory statistics: page faults, swapping, I/O wait
+vmstat 1 10
+```
+
+### Disk I/O
+
+```bash
+# Per-device I/O statistics
+iostat -xz 1 10
+```
+
+The `%util` column shows device utilization — values consistently near 100% indicate an I/O-bound workload where disk is the bottleneck. `await` shows the average time (in milliseconds) for I/O requests to complete; high values indicate queuing or slow storage.
+
+### Network
+
+```bash
+# Per-interface traffic statistics
+sar -n DEV 1 10
+```
+
+### Saving the Baseline
+
+Store baseline measurements before making any changes:
+
+```bash
+mkdir -p /var/log/performance
+DATE=$(date +%Y%m%d-%H%M)
+
+mpstat -P ALL 1 30 > /var/log/performance/cpu-baseline-${DATE}.txt &
+vmstat 1 30 > /var/log/performance/memory-baseline-${DATE}.txt &
+iostat -xz 1 30 > /var/log/performance/disk-baseline-${DATE}.txt &
+sar -n DEV 1 30 > /var/log/performance/network-baseline-${DATE}.txt &
+wait
+
+echo "Baseline captured: ${DATE}"
+```
+
+---
+
+## tuned — Profile-Based System Tuning
+
+`tuned` is the recommended tool for applying performance profiles on AlmaLinux. It ships with profiles for common workload types and adjusts dozens of kernel parameters, CPU settings, and I/O scheduler choices automatically when a profile is activated. Using `tuned` is safer and more maintainable than making manual `sysctl` changes because profiles are documented, reversible, and maintained by the distribution.
+
+### Installing and Enabling tuned
+
+```bash
+dnf install tuned
+systemctl enable --now tuned
+```
+
+### Listing Available Profiles
+
+```bash
+tuned-adm list
+```
+
+Common profiles relevant to production systems:
+
+| Profile | Best for |
+|---|---|
+| `throughput-performance` | High-throughput servers; maximizes CPU and I/O throughput |
+| `latency-performance` | Low-latency applications; disables power saving |
+| `network-throughput` | Network-intensive servers; optimizes NIC and buffer settings |
+| `network-latency` | Low-latency network applications |
+| `virtual-guest` | VMs; appropriate defaults for virtualized environments |
+| `virtual-host` | Hypervisors; optimizes for hosting VMs |
+| `oracle` | Oracle Database workloads |
+| `mssql` | SQL Server workloads |
+| `balanced` | General-purpose workloads (default) |
+| `powersave` | Battery-powered or low-power environments |
+
+### Checking the Active Profile
+
+```bash
+tuned-adm active
+```
+
+### Applying a Profile
+
+To switch to the `throughput-performance` profile:
+
+```bash
+tuned-adm profile throughput-performance
+```
+
+The change takes effect immediately — no reboot required. `tuned` adjusts the relevant kernel parameters and CPU settings live.
+
+### Getting a Profile Recommendation
+
+`tuned` can recommend a profile based on the current hardware and configuration:
+
+```bash
+tuned-adm recommend
+```
+
+This is a useful starting point, though the recommendation is based on hardware characteristics rather than workload profile — you may still want to override it based on what the system actually does.
+
+### Creating a Custom Profile
+
+When no built-in profile exactly matches your requirements, create a custom profile that inherits from the closest built-in and overrides specific settings:
+
+```bash
+mkdir -p /etc/tuned/myapp-profile
+nano /etc/tuned/myapp-profile/tuned.conf
+```
+
+```ini
+[main]
+summary=Optimized profile for MyApp workload
+include=throughput-performance
+
+[sysctl]
+# Override specific kernel parameters
+vm.swappiness=10
+net.core.somaxconn=65535
+
+[disk]
+# Set elevator for all disks
+elevator=mq-deadline
+```
+
+Activate the custom profile:
+
+```bash
+tuned-adm profile myapp-profile
+```
+
+Custom profiles in `/etc/tuned/` are preserved across `tuned` package updates and can be version-controlled alongside other system configuration.
+
+---
+
+## Kernel Parameter Tuning with sysctl
+
+`sysctl` reads and writes kernel parameters at runtime. Parameters can be changed temporarily (taking effect immediately, lost on reboot) or persistently (written to files in `/etc/sysctl.d/` and applied at boot).
+
+### Viewing Current Parameters
+
+To list all current kernel parameters:
+
+```bash
+sysctl -a
+```
+
+To query a specific parameter:
+
+```bash
+sysctl vm.swappiness
+```
+
+### Changing a Parameter Temporarily
+
+To change a parameter immediately without making it persistent — useful for testing:
+
+```bash
+sysctl -w vm.swappiness=10
+```
+
+### Making Changes Persistent
+
+Write persistent parameter changes to a file in `/etc/sysctl.d/`. Never edit `/etc/sysctl.conf` directly for custom changes — use a drop-in file that survives system updates:
+
+```bash
+nano /etc/sysctl.d/99-performance.conf
+```
+
+```ini
+# Custom performance tuning parameters
+# Applied by: sysctl --system
+
+vm.swappiness = 10
+vm.dirty_ratio = 15
+vm.dirty_background_ratio = 5
+net.core.somaxconn = 65535
+net.ipv4.tcp_max_syn_backlog = 65535
+```
+
+Apply the new configuration without rebooting:
+
+```bash
+sysctl --system
+```
+
+Or apply a specific file:
+
+```bash
+sysctl -p /etc/sysctl.d/99-performance.conf
+```
+
+---
+
+## Memory and Swap Tuning
+
+### Swappiness
+
+The `vm.swappiness` parameter controls how aggressively the kernel moves anonymous memory pages to swap. The value ranges from 0 to 200 (kernel 3.5+). Lower values cause the kernel to prefer keeping data in RAM; higher values cause more aggressive swapping.
+
+For database servers and applications where memory access latency is critical:
+
+```bash
+sysctl -w vm.swappiness=10
+```
+
+A value of 10 tells the kernel to prefer keeping data in RAM and only swap when truly necessary, reducing I/O latency spikes caused by swapping.
+
+For systems where swapping should be avoided entirely but some swap must be configured for OOM protection:
+
+```bash
+sysctl -w vm.swappiness=1
+```
+
+Setting `vm.swappiness=0` does not disable swapping entirely — the kernel will still swap when memory is exhausted. Setting it to `1` is safer as it expresses a strong preference against swapping without risking OOM conditions being handled less gracefully.
+
+### Dirty Page Management
+
+Dirty pages are memory pages that have been modified but not yet written to disk. The kernel flushes them to disk periodically, controlled by two parameters:
+
+`vm.dirty_background_ratio` — the percentage of total memory at which background writeback begins. Lower values cause more frequent, smaller write bursts:
+
+```bash
+sysctl -w vm.dirty_background_ratio=5
+```
+
+`vm.dirty_ratio` — the percentage of total memory at which processes block waiting for writeback to complete. This is the hard limit:
+
+```bash
+sysctl -w vm.dirty_ratio=15
+```
+
+For write-intensive workloads, lower `dirty_background_ratio` (more frequent flushing) reduces the risk of large I/O bursts. For write-sequential workloads where batching writes is beneficial, higher values allow larger buffers to accumulate before flushing.
+
+### Transparent Huge Pages
+
+Transparent Huge Pages (THP) can improve performance for memory-intensive workloads by reducing TLB pressure, but they cause latency spikes in workloads with irregular memory access patterns. Databases (particularly MongoDB, Redis, and older versions of Oracle) explicitly recommend disabling THP.
+
+To check the current THP setting:
+
+```bash
+cat /sys/kernel/mm/transparent_hugepage/enabled
+```
+
+The active setting is shown in square brackets. To disable THP immediately:
+
+```bash
+echo never > /sys/kernel/mm/transparent_hugepage/enabled
+echo never > /sys/kernel/mm/transparent_hugepage/defrag
+```
+
+To make this persistent across reboots, add it to a systemd service unit or a `tuned` custom profile. The `tuned` `latency-performance` profile disables THP automatically.
+
+### HugePages for Databases
+
+For Oracle Database, PostgreSQL, or other applications that benefit from explicit huge page allocation, configure static HugePages:
+
+```bash
+# Check the application's huge page requirement (example for PostgreSQL)
+# PostgreSQL recommends: ceil(shared_buffers / huge_page_size) pages
+grep huge_page_size /proc/meminfo
+```
+
+Set the number of HugePages:
+
+```bash
+sysctl -w vm.nr_hugepages=512
+```
+
+Make it persistent:
+
+```bash
+echo "vm.nr_hugepages = 512" >> /etc/sysctl.d/99-hugepages.conf
+```
+
+---
+
+## CPU Performance
+
+### CPU Scaling Governor
+
+The CPU frequency scaling governor controls how the CPU adjusts its clock speed in response to load. The default `powersave` governor reduces clock speed when idle to save power, which increases latency for workloads with sudden bursts of activity.
+
+For latency-sensitive production servers:
+
+```bash
+# Check the current governor on all CPUs
+cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor | sort -u
+```
+
+The `tuned` `throughput-performance` and `latency-performance` profiles set the governor to `performance` automatically:
+
+```bash
+tuned-adm profile latency-performance
+```
+
+To set the governor manually for all CPUs:
+
+```bash
+for cpu in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
+    echo performance > "${cpu}"
+done
+```
+
+This change is lost on reboot unless applied through `tuned` or a startup script.
+
+### NUMA Topology Awareness
+
+On multi-socket servers, NUMA (Non-Uniform Memory Access) topology means memory access time depends on whether the CPU and memory are on the same socket. Applications that are not NUMA-aware may allocate memory on a remote socket, incurring additional latency.
+
+Check the NUMA topology:
+
+```bash
+numactl --hardware
+```
+
+For applications that should be pinned to a specific NUMA node:
+
+```bash
+numactl --cpunodebind=0 --membind=0 /opt/myapp/bin/myapp
+```
+
+This binds `myapp` to CPU node 0 and allocates all its memory from node 0, eliminating cross-socket memory access. Databases and high-performance applications frequently benefit from NUMA pinning.
+
+---
+
+## I/O Scheduler Tuning
+
+The I/O scheduler determines how disk requests are ordered and merged before being sent to the storage device. The optimal scheduler depends on the storage type.
+
+### Checking the Current Scheduler
+
+```bash
+# For a specific device
+cat /sys/block/sda/queue/scheduler
+```
+
+The active scheduler is shown in square brackets.
+
+### Choosing an I/O Scheduler
+
+| Scheduler | Best for |
+|---|---|
+| `mq-deadline` | SATA/SAS HDDs; general-purpose rotating media |
+| `kyber` | NVMe SSDs; low-latency solid-state storage |
+| `bfq` | Desktops; interactive workloads requiring fair scheduling |
+| `none` | NVMe devices with their own internal queuing; bypasses scheduler entirely |
+
+Modern NVMe drives typically perform best with `none` because they have their own sophisticated internal queuing and adding a software scheduler adds overhead without benefit:
+
+```bash
+echo none > /sys/block/nvme0n1/queue/scheduler
+```
+
+For SATA SSDs, `mq-deadline` with a short deadline is typically best:
+
+```bash
+echo mq-deadline > /sys/block/sda/queue/scheduler
+```
+
+To make scheduler settings persistent, use a `tuned` custom profile or a `udev` rule:
+
+```bash
+nano /etc/udev/rules.d/60-io-scheduler.rules
+```
+
+```
+# Set none scheduler for NVMe devices
+ACTION=="add|change", KERNEL=="nvme[0-9]*", ATTR{queue/scheduler}="none"
+
+# Set mq-deadline for SATA devices
+ACTION=="add|change", KERNEL=="sd[a-z]", ATTR{queue/rotational}=="0", ATTR{queue/scheduler}="mq-deadline"
+```
+
+### Read-Ahead Settings
+
+The read-ahead value controls how much data the kernel prefetches from disk in anticipation of sequential reads. For workloads with large sequential reads (log processing, data import, bulk backups), increasing read-ahead improves throughput:
+
+```bash
+# Check current read-ahead (in 512-byte sectors)
+blockdev --getra /dev/sda
+
+# Set read-ahead to 8192 KB (8 MB)
+blockdev --setra 16384 /dev/sda
+```
+
+For random-access workloads (OLTP databases), the default or a lower value is more appropriate — prefetching data that will not be used wastes I/O bandwidth and cache.
+
+---
+
+## Network Stack Tuning
+
+### Increasing Socket Buffer Sizes
+
+For high-throughput network applications, the default socket buffer sizes limit how much data can be in flight. Increasing them improves throughput on high-bandwidth or high-latency connections:
+
+```bash
+nano /etc/sysctl.d/99-network-performance.conf
+```
+
+```ini
+# Increase socket send and receive buffer sizes
+net.core.rmem_max = 134217728
+net.core.wmem_max = 134217728
+net.core.rmem_default = 16777216
+net.core.wmem_default = 16777216
+
+# TCP buffer sizes (min, default, max in bytes)
+net.ipv4.tcp_rmem = 4096 87380 134217728
+net.ipv4.tcp_wmem = 4096 65536 134217728
+
+# Increase the connection backlog queue
+net.core.somaxconn = 65535
+net.ipv4.tcp_max_syn_backlog = 65535
+
+# Enable TCP Fast Open for reduced connection latency
+net.ipv4.tcp_fastopen = 3
+```
+
+```bash
+sysctl -p /etc/sysctl.d/99-network-performance.conf
+```
+
+### TIME_WAIT Connection Management
+
+On servers handling many short-lived connections (HTTP servers, API endpoints), `TIME_WAIT` sockets accumulate and can exhaust available ports. Two parameters address this:
+
+```ini
+# Allow reuse of TIME_WAIT sockets for new connections
+net.ipv4.tcp_tw_reuse = 1
+
+# Reduce TIME_WAIT timeout from the default 60 seconds
+# (applies to all TCP connections — use carefully in production)
+net.ipv4.tcp_fin_timeout = 15
+```
+
+`tcp_tw_reuse` is safe to enable for outgoing connections to different peers. For servers receiving connections from clients at fixed IPs (load balancers, proxies), ensure the server's time synchronization is accurate before enabling this, as it relies on timestamps.
+
+---
+
+## Measuring the Impact of Changes
+
+After applying tuning changes, measure the same metrics you captured at baseline. A change is beneficial only if it improves the metrics that matter for your workload.
+
+Run the workload under realistic conditions while collecting metrics:
+
+```bash
+# CPU and memory during a load test
+sar -u -r 1 60 > /var/log/performance/cpu-after-tuning.txt &
+
+# I/O during the same period
+iostat -xz 1 60 > /var/log/performance/disk-after-tuning.txt &
+
+# Run the workload
+/usr/local/bin/run-load-test.sh
+
+wait
+```
+
+Compare the results against the baseline. If the improvement is not measurable, revert the change — unnecessary configuration complexity is a maintenance burden.
+
+To revert a `tuned` profile change:
+
+```bash
+tuned-adm profile balanced
+```
+
+To revert a `sysctl` change (until the next boot):
+
+```bash
+sysctl -w vm.swappiness=30
+```
+
+To permanently revert, remove or edit the relevant `/etc/sysctl.d/` file and apply:
+
+```bash
+sysctl --system
+```
+
+---
+
+## Summary
+
+Performance tuning on AlmaLinux is most effective when it targets specific, measured bottlenecks rather than applying generic settings. `tuned` profiles provide a safe, maintainable starting point for common workload types. `sysctl` parameters give precise control over kernel behavior when profile settings are insufficient. I/O scheduler selection and network stack tuning address the two most common production bottlenecks after CPU and memory.
+
+Key points to remember:
+
+- Always capture a baseline before tuning — improvement cannot be measured without a reference point
+- Use `tuned-adm profile` as the first tuning step; it handles many parameters safely and coherently
+- Write persistent `sysctl` changes to `/etc/sysctl.d/99-*.conf` drop-in files, not to `/etc/sysctl.conf`
+- Apply `sysctl --system` to activate changes without rebooting
+- Disable Transparent Huge Pages for databases that explicitly recommend it (MongoDB, Redis, older Oracle)
+- Use `mq-deadline` for SATA/SAS rotating media, `none` for NVMe — scheduler overhead is unnecessary for fast storage with internal queuing
+- Set the CPU scaling governor to `performance` for latency-sensitive workloads
+- Revert changes that do not produce measurable improvement — tuning complexity without benefit is technical debt
+
+### Related Pages
+
+- [Storage Maintenance](./storage-maintenance) — LVM, filesystem health, and disk monitoring
+- [Maintenance Automation](./maintenance-automation) — scheduling tuned profile activation during maintenance windows
+- [System Auditing](./system-auditing) — verifying system configuration against performance baselines
+- [Monitoring Automation](../task-scheduling/monitoring-automation) — collecting and alerting on performance metrics

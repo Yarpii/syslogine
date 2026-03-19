@@ -1,0 +1,419 @@
+---
+sidebar_position: 6
+title: "Systemd Targets | AlmaLinux"
+sidebar_label: "Systemd Targets"
+description: "Understand systemd targets, configure multi-user, graphical, and custom targets for different operational modes on AlmaLinux."
+keywords:
+  - "almalinux systemd targets"
+  - "almalinux runlevels"
+  - "almalinux multi-user target"
+  - "almalinux rescue target"
+  - "rhel systemd targets"
+tags:
+  - almalinux
+  - service-management
+  - systemd
+  - targets
+slug: /linux/almalinux/administration/service-management/systemd-targets
+---
+
+# Systemd Targets
+
+Targets are systemd's replacement for the traditional SysV runlevels. A target is a named milestone that groups units together and represents a desired system state — everything needed to run a multi-user server, a minimal rescue environment, or a custom application platform. Understanding targets lets you control what runs at boot, switch operational modes at runtime, and design clean service activation logic.
+
+## Targets vs runlevels
+
+AlmaLinux maps traditional runlevels to systemd targets for compatibility.
+
+| SysV Runlevel | Systemd Target | Purpose |
+|---------------|---------------|---------|
+| 0 | `poweroff.target` | Shut down the system |
+| 1 | `rescue.target` | Single-user rescue mode |
+| 2, 3, 4 | `multi-user.target` | Multi-user, no GUI |
+| 5 | `graphical.target` | Multi-user with GUI |
+| 6 | `reboot.target` | Reboot the system |
+| — | `emergency.target` | Minimal emergency shell |
+| — | `network-online.target` | Network fully configured |
+| — | `basic.target` | Basic system initialisation complete |
+| — | `sysinit.target` | Early system initialisation |
+
+## View the current default target
+
+```bash
+# Show the default boot target
+systemctl get-default
+
+# Show all active targets
+systemctl list-units --type=target --state=active
+
+# Show all targets including inactive
+systemctl list-units --type=target --all
+```
+
+## Change the default boot target
+
+```bash
+# Boot into multi-user mode (server default — no GUI)
+sudo systemctl set-default multi-user.target
+
+# Boot into graphical mode
+sudo systemctl set-default graphical.target
+
+# Verify the change
+systemctl get-default
+```
+
+The default target is stored as a symlink:
+
+```bash
+ls -la /etc/systemd/system/default.target
+```
+
+## Switch targets at runtime
+
+Switching targets changes the system state immediately — stopping services not needed by the new target and starting services required by it.
+
+```bash
+# Switch to rescue mode (drops to single-user shell)
+sudo systemctl isolate rescue.target
+
+# Switch to multi-user mode
+sudo systemctl isolate multi-user.target
+
+# Switch to graphical mode
+sudo systemctl isolate graphical.target
+
+# Emergency mode — minimal shell, no services, read-only root
+sudo systemctl isolate emergency.target
+```
+
+:::warning
+`systemctl isolate` stops all units not required by the target. On a production server, isolating to `rescue.target` will stop all running services. Always warn users and schedule maintenance first.
+:::
+
+## Rescue and emergency modes
+
+### Rescue mode
+
+Rescue mode starts a minimal single-user environment. Most services are stopped. The root filesystem is mounted read-write. Use it for system recovery when normal boot fails.
+
+```bash
+# Enter rescue mode
+sudo systemctl isolate rescue.target
+
+# Or reboot into rescue mode
+sudo systemctl reboot --force
+# Then append 'systemd.unit=rescue.target' to the kernel command line in GRUB
+```
+
+### Emergency mode
+
+Emergency mode is even more minimal than rescue. The root filesystem is mounted read-only. Use it when even rescue mode fails to boot.
+
+```bash
+sudo systemctl isolate emergency.target
+```
+
+To boot into emergency mode permanently:
+
+```bash
+sudo grubby --args="systemd.unit=emergency.target" --update-kernel=ALL
+# Remember to revert after recovery
+sudo grubby --remove-args="systemd.unit=emergency.target" --update-kernel=ALL
+```
+
+## View the dependency tree of a target
+
+```bash
+# What does multi-user.target pull in?
+systemctl list-dependencies multi-user.target
+
+# Full recursive tree
+systemctl list-dependencies multi-user.target --all
+
+# What depends on a target?
+systemctl list-dependencies multi-user.target --reverse
+```
+
+## How services attach to targets
+
+Services declare which target they want to be part of in their `[Install]` section.
+
+```ini
+[Install]
+# Start when multi-user.target is reached
+WantedBy=multi-user.target
+```
+
+When you run `systemctl enable myapp`, systemd creates a symlink:
+
+```
+/etc/systemd/system/multi-user.target.wants/myapp.service
+  → /etc/systemd/system/myapp.service
+```
+
+View all services attached to a target:
+
+```bash
+# Services that start with multi-user.target
+ls /etc/systemd/system/multi-user.target.wants/
+ls /usr/lib/systemd/system/multi-user.target.wants/
+
+# Combined view
+systemctl list-dependencies multi-user.target | grep service
+```
+
+## Important intermediate targets
+
+The boot process passes through a series of targets in order. Understanding these helps you place services at the right point in the boot sequence.
+
+```
+sysinit.target          — mounts filesystems, loads kernel modules
+    └── basic.target    — sets up sockets, timers, and paths
+        └── network.target        — network interfaces configured
+            └── network-online.target   — network fully routable
+                └── multi-user.target  — all server services
+                    └── graphical.target  — GUI (if applicable)
+```
+
+```bash
+# View the full boot dependency chain
+systemd-analyze critical-chain multi-user.target
+```
+
+### network.target vs network-online.target
+
+This is a common source of service startup failures.
+
+| Target | Meaning |
+|--------|---------|
+| `network.target` | Network interfaces are being configured — not necessarily usable |
+| `network-online.target` | Network is fully up, routable, and DNS resolves |
+
+For services that make outbound connections at startup, always use `network-online.target`:
+
+```ini
+[Unit]
+After=network-online.target
+Wants=network-online.target
+```
+
+## Create a custom target
+
+Custom targets let you define a named system state that groups related services together. Useful for staging environments, maintenance modes, or application-specific operational states.
+
+```bash
+sudo nano /etc/systemd/system/myapp-stack.target
+```
+
+```ini
+[Unit]
+Description=My Application Stack
+Requires=multi-user.target
+After=multi-user.target
+AllowIsolate=yes
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Attach services to the custom target by setting `WantedBy=myapp-stack.target` in their `[Install]` sections, or create the wants symlinks manually:
+
+```bash
+sudo mkdir -p /etc/systemd/system/myapp-stack.target.wants
+
+sudo ln -s /etc/systemd/system/myapp-web.service \
+  /etc/systemd/system/myapp-stack.target.wants/
+
+sudo ln -s /etc/systemd/system/myapp-worker.service \
+  /etc/systemd/system/myapp-stack.target.wants/
+
+sudo systemctl daemon-reload
+sudo systemctl enable myapp-stack.target
+```
+
+Start the entire stack at once:
+
+```bash
+sudo systemctl start myapp-stack.target
+```
+
+Stop the entire stack:
+
+```bash
+sudo systemctl stop myapp-stack.target
+```
+
+## Create a maintenance target
+
+A maintenance target stops application services while keeping the system accessible for admin tasks.
+
+```bash
+sudo nano /etc/systemd/system/maintenance.target
+```
+
+```ini
+[Unit]
+Description=Maintenance Mode — application services stopped
+Requires=multi-user.target
+After=multi-user.target
+AllowIsolate=yes
+```
+
+```bash
+sudo systemctl daemon-reload
+```
+
+Enter maintenance mode:
+
+```bash
+sudo systemctl isolate maintenance.target
+# Application services not listed in this target's wants stop automatically
+```
+
+Return to normal:
+
+```bash
+sudo systemctl isolate multi-user.target
+```
+
+## Boot target override at runtime via GRUB
+
+You can override the boot target at the GRUB menu without permanently changing the default — useful for one-time recovery boots.
+
+1. Reboot the system
+2. At the GRUB menu, press `e` to edit the boot entry
+3. Find the line starting with `linux`
+4. Append `systemd.unit=rescue.target` (or any other target) to the end of that line
+5. Press `Ctrl+X` to boot
+
+## Analyse target timing at boot
+
+```bash
+# Time taken to reach each target
+systemd-analyze blame | grep target
+
+# Critical chain to multi-user.target
+systemd-analyze critical-chain multi-user.target
+
+# Which target took the longest to activate
+systemd-analyze critical-chain
+```
+
+## Scripted target management
+
+A script to safely switch the system into and out of a maintenance state:
+
+```bash
+#!/bin/bash
+# maintenance-mode.sh — toggle maintenance mode
+
+ACTION="${1:-status}"
+NORMAL_TARGET="multi-user.target"
+MAINTENANCE_TARGET="maintenance.target"
+
+case "$ACTION" in
+  enter)
+    echo "Entering maintenance mode..."
+    echo "Stopping application services..."
+    sudo systemctl isolate "$MAINTENANCE_TARGET"
+    echo "System is now in maintenance mode"
+    echo "Active target: $(systemctl get-default)"
+    ;;
+
+  leave)
+    echo "Leaving maintenance mode..."
+    sudo systemctl isolate "$NORMAL_TARGET"
+    echo "System is back to normal operation"
+    systemctl list-units --type=service --state=failed
+    ;;
+
+  status)
+    echo "Current active targets:"
+    systemctl list-units --type=target --state=active --no-legend
+    echo ""
+    echo "Default target: $(systemctl get-default)"
+    ;;
+
+  *)
+    echo "Usage: $0 {enter|leave|status}"
+    exit 1
+    ;;
+esac
+```
+
+```bash
+# Enter maintenance
+sudo bash maintenance-mode.sh enter
+
+# Leave maintenance
+sudo bash maintenance-mode.sh leave
+
+# Check current state
+bash maintenance-mode.sh status
+```
+
+## Common mistakes
+
+### Using multi-user.target as a dependency instead of a want
+
+```ini
+# WRONG — hard dependency breaks system boot if your service fails
+Requires=multi-user.target
+
+# CORRECT — attach to the target
+[Install]
+WantedBy=multi-user.target
+```
+
+### Depending on network.target for services that need connectivity
+
+```ini
+# WRONG — network may not be usable yet
+After=network.target
+
+# CORRECT — wait for full network availability
+After=network-online.target
+Wants=network-online.target
+```
+
+### Using systemctl isolate without warning users
+
+Isolating to a different target stops services immediately. On a multi-user system, always notify users first.
+
+```bash
+# Warn logged-in users before switching targets
+sudo wall "System entering maintenance mode in 5 minutes"
+sleep 300
+sudo systemctl isolate maintenance.target
+```
+
+### Forgetting AllowIsolate=yes in custom targets
+
+Without `AllowIsolate=yes`, `systemctl isolate` will refuse to switch to the custom target.
+
+```ini
+[Unit]
+AllowIsolate=yes
+```
+
+## Summary
+
+Targets give you a clean, declarative way to define what the system should be doing at any given state. For most production servers, `multi-user.target` is all you need — but understanding the full target hierarchy makes it much easier to design reliable service dependencies and recovery procedures.
+
+Key points:
+
+- use `systemctl get-default` and `systemctl set-default` to manage the boot target
+- use `multi-user.target` as `WantedBy=` for server services — not `graphical.target`
+- always use `network-online.target` instead of `network.target` for services that connect to the network
+- use `systemctl isolate` to switch targets at runtime — with care on production systems
+- create custom targets to group related services and enable stack-level control
+- add `AllowIsolate=yes` to any target you want to isolate to
+- use `systemd-analyze critical-chain` to understand boot ordering through targets
+
+:::tip Related pages
+- [Service Dependencies](./service-dependencies)
+- [Service Configuration](./service-configuration)
+- [Custom Unit Files](./custom-unit-files)
+- [Starting Services](./starting-services)
+:::

@@ -1,0 +1,373 @@
+---
+sidebar_position: 3
+title: "Group Management | AlmaLinux"
+sidebar_label: "Group Management"
+description: "Manage groups on AlmaLinux with groupadd, groupdel, and gpasswd. Implement role-based access control and configure enterprise group policies."
+keywords:
+  - "almalinux group management"
+  - "almalinux groupadd"
+  - "almalinux groupdel"
+  - "almalinux gpasswd"
+  - "rhel group management"
+tags:
+  - almalinux
+  - user-management
+  - system-administration
+slug: /linux/almalinux/administration/user-management/group-management
+---
+
+# Group Management
+
+Groups on AlmaLinux are the primary way to control shared access to files, directories, and system resources. Instead of managing permissions per user, you assign permissions to a group and add users to it. This makes access control easier to maintain at scale.
+
+AlmaLinux distinguishes between two types of groups:
+
+- **Primary group** — assigned at user creation, stored in `/etc/passwd`. Every file a user creates is owned by this group by default.
+- **Supplementary groups** — additional groups a user belongs to, stored in `/etc/group`. Used to grant access to shared resources.
+
+## View existing groups
+
+```bash
+# List all groups on the system
+getent group
+
+# Show groups a specific user belongs to
+groups username
+
+# Show detailed group info including members
+getent group groupname
+```
+
+## Create a group
+
+```bash
+sudo groupadd developers
+```
+
+Verify it was created:
+
+```bash
+getent group developers
+```
+
+### Create a group with a specific GID
+
+In environments where GIDs need to match across multiple servers or with NFS, set the GID explicitly:
+
+```bash
+sudo groupadd --gid 2500 developers
+```
+
+### Create a system group
+
+System groups are used for services and daemons. They get a GID below 1000 and are not meant for regular users.
+
+```bash
+sudo groupadd --system appservice
+```
+
+## Add a user to a group
+
+```bash
+# Add to a supplementary group
+sudo usermod --append --groups developers jdoe
+```
+
+:::warning
+Always use `--append` together with `--groups`. Without `--append`, `usermod --groups` **replaces** all existing supplementary groups with only the ones you specify.
+
+```bash
+# WRONG — removes jdoe from all other groups
+sudo usermod --groups developers jdoe
+
+# CORRECT — adds developers without touching existing groups
+sudo usermod --append --groups developers jdoe
+```
+:::
+
+The user needs to log out and back in for the new group membership to take effect in their session. To apply it immediately without logging out:
+
+```bash
+newgrp developers
+```
+
+## Add a user to multiple groups at once
+
+```bash
+sudo usermod --append --groups developers,docker,wheel jdoe
+```
+
+## Remove a user from a group
+
+```bash
+sudo gpasswd --delete jdoe developers
+```
+
+Verify:
+
+```bash
+groups jdoe
+```
+
+## Set a group administrator
+
+A group administrator can add and remove members without needing full sudo access.
+
+```bash
+# Make jdoe an administrator of the developers group
+sudo gpasswd --administrator jdoe developers
+```
+
+Group admins can then manage membership with:
+
+```bash
+gpasswd --add newmember developers
+gpasswd --delete oldmember developers
+```
+
+## Set a group password
+
+Group passwords allow users who are not members to temporarily join a group using `newgrp`. This is rarely needed in modern environments but supported for compatibility.
+
+```bash
+sudo gpasswd developers
+```
+
+## Rename a group
+
+```bash
+sudo groupmod --new-name engineering developers
+```
+
+Verify:
+
+```bash
+getent group engineering
+```
+
+## Change a group's GID
+
+```bash
+sudo groupmod --gid 2600 developers
+```
+
+:::warning
+Changing a GID does not automatically update file ownership. Files previously owned by the old GID will appear as orphaned. Update them after the change:
+
+```bash
+sudo find / -group 2500 -exec chgrp developers {} \; 2>/dev/null
+```
+:::
+
+## Delete a group
+
+```bash
+sudo groupdel developers
+```
+
+:::note
+You cannot delete a group that is the primary group of an existing user. Remove or reassign those users first.
+
+```bash
+# Check which users have this as their primary group
+getent passwd | awk -F: '$4 == 2500 {print $1}'
+```
+:::
+
+## Set group ownership on a directory
+
+A common pattern is to create a shared directory owned by a group so all members can read and write to it.
+
+```bash
+# Create a shared directory
+sudo mkdir -p /data/projects
+
+# Assign group ownership
+sudo chown :developers /data/projects
+
+# Give the group read/write/execute access
+sudo chmod 770 /data/projects
+```
+
+### Use the setgid bit for shared directories
+
+The setgid bit ensures new files created inside the directory inherit the group, rather than the creating user's primary group.
+
+```bash
+sudo chmod g+s /data/projects
+```
+
+Verify:
+
+```bash
+ls -ld /data/projects
+# drwxrws--- 2 root developers 4096 ...
+#       ^ s = setgid is set
+```
+
+## Role-based access control with groups
+
+A practical pattern for enterprise environments is to map groups to roles, then assign directory and sudo permissions to those groups rather than individual users.
+
+```bash
+# Create role groups
+sudo groupadd developers
+sudo groupadd ops
+sudo groupadd auditors
+
+# Assign users to roles
+sudo usermod --append --groups developers jdoe
+sudo usermod --append --groups ops bsmith
+sudo usermod --append --groups auditors mwilson
+
+# Create role-specific directories
+sudo mkdir -p /data/{dev,ops,audit}
+
+sudo chown :developers /data/dev  && sudo chmod 2770 /data/dev
+sudo chown :ops        /data/ops  && sudo chmod 2770 /data/ops
+sudo chown :auditors   /data/audit && sudo chmod 2750 /data/audit
+```
+
+## Scripted bulk group and membership management
+
+```bash
+#!/bin/bash
+# setup-groups.sh
+# Creates groups and assigns members from a config file.
+#
+# Config format (one entry per line):
+#   groupname:user1,user2,user3
+
+CONFIG_FILE="$1"
+
+if [[ -z "$CONFIG_FILE" || ! -f "$CONFIG_FILE" ]]; then
+  echo "Usage: $0 groups.conf"
+  exit 1
+fi
+
+while IFS=: read -r groupname members; do
+  [[ -z "$groupname" || "$groupname" == \#* ]] && continue
+
+  # Create the group if it does not exist
+  if ! getent group "$groupname" &>/dev/null; then
+    groupadd "$groupname"
+    echo "CREATED group: $groupname"
+  else
+    echo "EXISTS group: $groupname"
+  fi
+
+  # Add each member
+  IFS=',' read -ra user_list <<< "$members"
+  for username in "${user_list[@]}"; do
+    username="${username// /}"  # trim whitespace
+    [[ -z "$username" ]] && continue
+
+    if ! id "$username" &>/dev/null; then
+      echo "  SKIP: user $username does not exist"
+      continue
+    fi
+
+    usermod --append --groups "$groupname" "$username"
+    echo "  ADDED: $username -> $groupname"
+  done
+
+done < "$CONFIG_FILE"
+```
+
+Example `groups.conf`:
+
+```
+developers:jdoe,bsmith,alee
+ops:bsmith,mwilson
+auditors:mwilson
+wheel:adminuser
+```
+
+Run it:
+
+```bash
+sudo bash setup-groups.sh groups.conf
+```
+
+## List all members of a group
+
+```bash
+# Using getent
+getent group developers
+
+# Using grep
+grep '^developers:' /etc/group
+
+# More readable format
+awk -F: '$1 == "developers" {print $4}' /etc/group | tr ',' '\n'
+```
+
+## Find all groups a user belongs to
+
+```bash
+# Simple output
+groups jdoe
+
+# With GIDs
+id jdoe
+```
+
+## Find files owned by a group
+
+```bash
+sudo find / -group developers 2>/dev/null
+```
+
+## Common mistakes
+
+### Using --groups without --append
+
+This silently removes all existing supplementary group memberships and replaces them.
+
+```bash
+# WRONG
+sudo usermod --groups docker jdoe
+
+# CORRECT
+sudo usermod --append --groups docker jdoe
+```
+
+### Deleting a group that is still a primary group
+
+`groupdel` will refuse with an error. Check first:
+
+```bash
+getent passwd | awk -F: -v gid="$(getent group developers | cut -d: -f3)" '$4 == gid {print $1}'
+```
+
+### Changing a GID without updating file ownership
+
+Files will become orphaned after a GID change. Always follow a GID change with a `find` and `chgrp`.
+
+### Not using the setgid bit on shared directories
+
+Without setgid, files created in a shared directory inherit the creator's primary group, which often breaks shared access.
+
+```bash
+sudo chmod g+s /data/shared
+```
+
+## Summary
+
+Groups are the foundation of access control on AlmaLinux. Managing them well keeps permissions clean and maintainable as your environment grows.
+
+Key points:
+
+- use `groupadd` to create groups, with explicit GIDs where consistency matters
+- always use `usermod --append --groups` to avoid accidentally removing memberships
+- use `gpasswd --delete` to remove a user from a group
+- apply the setgid bit to shared directories so new files inherit the correct group
+- map groups to roles rather than assigning permissions per user
+- script group provisioning for consistency across servers
+
+:::tip Related pages
+- [Creating Users](./creating-users)
+- [Removing Users](./removing-users)
+- [Sudo & Privileges](./sudo-privileges)
+- [Security Policies](./security-policies)
+:::
