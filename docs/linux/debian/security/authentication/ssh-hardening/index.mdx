@@ -1,0 +1,817 @@
+---
+sidebar_position: 2
+title: "SSH Hardening | Authentication"
+sidebar_label: "SSH Hardening"
+description: "Deep-dive OpenSSH hardening on Debian - sshd_config internals, cipher analysis, Match blocks, AuthorizedKeysCommand, host key management, RekeyLimit, ssh-audit, and production-ready security policies."
+keywords:
+  - "debian ssh hardening"
+  - "openssh hardening"
+  - "sshd_config security"
+  - "ssh ciphers debian"
+  - "ssh match block"
+  - "ssh-audit debian"
+  - "ssh host keys"
+  - "disable root ssh debian"
+tags:
+  - debian
+  - ssh
+  - hardening
+  - openssh
+  - authentication
+slug: /linux/debian/security/authentication/ssh-hardening
+hide_table_of_contents: true
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+# SSH Hardening
+
+OpenSSH ships with defaults tuned for maximum compatibility — not maximum security. It supports legacy ciphers, allows root login, and exposes features you almost certainly do not need. This guide explains not just *what* to change, but *why* each setting matters and what an attacker gains if you leave it at default.
+
+:::info Prerequisites
+- Debian 11 (Bullseye) or Debian 12 (Bookworm)
+- Root or `sudo` access
+- SSH key authentication already working — see [SSH Key Management](/linux/debian/security/authentication/ssh-key-management/)
+- **Keep your current session open** while testing every change
+:::
+
+:::danger Never close your session until you have tested changes in a second terminal
+A syntax error or misconfiguration in `sshd_config` can lock you out completely. Always test in a second terminal before closing the original.
+:::
+
+---
+
+## 1. Backup First
+
+```bash
+sudo cp /etc/ssh/sshd_config /etc/ssh/sshd_config.bak
+sudo cp -r /etc/ssh /etc/ssh.bak
+```
+
+If something goes wrong:
+
+```bash
+sudo cp /etc/ssh/sshd_config.bak /etc/ssh/sshd_config
+sudo systemctl restart ssh
+```
+
+---
+
+## 2. Understanding the Config Structure
+
+`sshd_config` is evaluated top to bottom. There are two types of directives:
+
+- **Global directives** — apply to all connections, must appear before any `Match` block
+- **Match block directives** — override globals for connections matching specific criteria
+
+```
+[global directives]
+...
+
+Match User deploy
+    [overrides for user 'deploy' only]
+
+Match Address 10.0.0.0/8
+    [overrides for connections from this subnet only]
+```
+
+This matters because many guides dump everything into the global section, making it impossible to give different users or networks different policies.
+
+---
+
+## 3. Host Keys — What OpenSSH Offers and What to Keep
+
+When OpenSSH is installed, it generates several host key pairs in `/etc/ssh/`:
+
+```bash
+ls /etc/ssh/ssh_host_*
+```
+
+```
+/etc/ssh/ssh_host_dsa_key        ← DSA — broken, remove
+/etc/ssh/ssh_host_ecdsa_key      ← ECDSA — NIST curve, avoid
+/etc/ssh/ssh_host_ed25519_key    ← Ed25519 — keep
+/etc/ssh/ssh_host_rsa_key        ← RSA — keep for compatibility
+```
+
+**Why it matters:** The host key is how clients verify *your server's* identity. The more key types you offer, the more negotiation surface exists. Only advertise what you want to support.
+
+Disable DSA and ECDSA host keys by removing them from `sshd_config`:
+
+```bash
+# Only advertise Ed25519 and RSA host keys
+HostKey /etc/ssh/ssh_host_ed25519_key
+HostKey /etc/ssh/ssh_host_rsa_key
+```
+
+Then physically remove the unused key files to prevent them from being accidentally re-enabled:
+
+```bash
+sudo rm /etc/ssh/ssh_host_dsa_key /etc/ssh/ssh_host_dsa_key.pub
+sudo rm /etc/ssh/ssh_host_ecdsa_key /etc/ssh/ssh_host_ecdsa_key.pub
+```
+
+Regenerate host keys if they were created with default parameters long ago:
+
+```bash
+# Remove old keys and regenerate
+sudo rm /etc/ssh/ssh_host_*
+sudo ssh-keygen -A
+```
+
+`ssh-keygen -A` generates one key of each supported type with default parameters. After running it, remove the DSA and ECDSA keys again.
+
+### Verify your server's host key fingerprint
+
+After any host key change, note the new fingerprint so you can share it out-of-band with users:
+
+```bash
+ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub
+```
+
+---
+
+## 4. Cryptography — Understanding What You Are Disabling
+
+Most hardening guides give you a cipher list to copy-paste with no explanation. Here is what you are actually choosing between.
+
+### Key Exchange Algorithms (KEX)
+
+KEX is how client and server establish a shared session key without transmitting it. Weak KEX means an attacker recording traffic today could decrypt it later if they crack the key.
+
+| Algorithm | Status | Notes |
+|-----------|--------|-------|
+| `curve25519-sha256` | ✅ Keep | Fastest, strongest — Bernstein's Curve25519 |
+| `diffie-hellman-group16-sha512` | ✅ Keep | DH with 4096-bit group, SHA-512 |
+| `diffie-hellman-group18-sha512` | ✅ Keep | DH with 8192-bit group, SHA-512 |
+| `diffie-hellman-group14-sha256` | ⚠️ Acceptable | 2048-bit group — minimum acceptable |
+| `diffie-hellman-group14-sha1` | ❌ Remove | SHA-1 is broken |
+| `diffie-hellman-group1-sha1` | ❌ Remove | 768-bit group + SHA-1 — completely broken |
+| `ecdh-sha2-nistp256/384/521` | ❌ Remove | NIST curves — same design concerns as ECDSA |
+
+### Symmetric Ciphers
+
+Used to encrypt the actual session after KEX.
+
+| Cipher | Status | Notes |
+|--------|--------|-------|
+| `chacha20-poly1305@openssh.com` | ✅ Keep | Best choice — authenticated, no IV reuse risk |
+| `aes256-gcm@openssh.com` | ✅ Keep | AES-GCM with 256-bit key |
+| `aes128-gcm@openssh.com` | ✅ Keep | AES-GCM with 128-bit key |
+| `aes256-ctr` | ✅ Keep | CTR mode — no padding oracle risk |
+| `aes192-ctr` | ✅ Keep | CTR mode |
+| `aes128-ctr` | ✅ Keep | CTR mode |
+| `aes128-cbc` | ❌ Remove | CBC mode — vulnerable to BEAST-style attacks |
+| `3des-cbc` | ❌ Remove | 3DES is obsolete, CBC mode |
+| `arcfour*` | ❌ Remove | RC4 — completely broken |
+
+**Why CTR over CBC:** CBC (cipher block chaining) is vulnerable to padding oracle attacks when combined with certain MAC schemes. CTR and GCM modes have no padding, eliminating this class of vulnerability.
+
+### MACs (Message Authentication Codes)
+
+MACs verify integrity — they ensure the ciphertext was not tampered with in transit.
+
+| MAC | Status | Notes |
+|-----|--------|-------|
+| `hmac-sha2-512-etm@openssh.com` | ✅ Keep | Encrypt-then-MAC — the correct order |
+| `hmac-sha2-256-etm@openssh.com` | ✅ Keep | Encrypt-then-MAC |
+| `umac-128-etm@openssh.com` | ✅ Keep | Fast, secure, ETM |
+| `hmac-sha2-512` | ⚠️ Avoid | MAC-then-Encrypt — wrong order |
+| `hmac-sha2-256` | ⚠️ Avoid | MAC-then-Encrypt — wrong order |
+| `hmac-sha1` | ❌ Remove | SHA-1 broken |
+| `hmac-md5` | ❌ Remove | MD5 broken |
+
+**Why ETM matters:** "Encrypt-then-MAC" means the MAC is computed over the ciphertext. "MAC-then-Encrypt" (the wrong order) means the MAC is computed over the plaintext and then encrypted — this enables Lucky13 and similar padding oracle attacks. Always prefer `-etm` variants.
+
+### Host Key Algorithms
+
+Controls which algorithms the server uses to prove its identity to clients.
+
+| Algorithm | Status | Notes |
+|-----------|--------|-------|
+| `ssh-ed25519` | ✅ Keep | Ed25519 host key |
+| `ssh-ed25519-cert-v01@openssh.com` | ✅ Keep | Ed25519 with certificate |
+| `rsa-sha2-512` | ✅ Keep | RSA with SHA-512 |
+| `rsa-sha2-256` | ✅ Keep | RSA with SHA-256 |
+| `ssh-rsa` | ❌ Remove | RSA with SHA-1 — broken |
+| `ssh-dss` | ❌ Remove | DSA — deprecated |
+| `ecdsa-sha2-nistp*` | ❌ Remove | NIST curves |
+
+### Apply the hardened crypto settings
+
+```bash
+KexAlgorithms curve25519-sha256,curve25519-sha256@libssh.org,diffie-hellman-group16-sha512,diffie-hellman-group18-sha512
+Ciphers chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-gcm@openssh.com,aes256-ctr,aes192-ctr,aes128-ctr
+MACs hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com,umac-128-etm@openssh.com
+HostKeyAlgorithms ssh-ed25519,ssh-ed25519-cert-v01@openssh.com,rsa-sha2-512,rsa-sha2-256
+```
+
+:::note Compatibility
+These settings drop support for clients using SHA-1, ECDSA (NIST curves), or CBC-mode ciphers. All modern OpenSSH clients (7.6+, released 2017) are fully compatible.
+:::
+
+---
+
+## 5. Authentication Settings
+
+### Disable root login
+
+```bash
+PermitRootLogin no
+```
+
+Root login over SSH is the highest-value target for any attacker. Use a regular user with `sudo` instead. If automation genuinely requires root access, use `PermitRootLogin prohibit-password` (key-only root, no passwords) as a last resort.
+
+### Disable password authentication
+
+```bash
+PasswordAuthentication no
+PermitEmptyPasswords no
+```
+
+Password authentication is vulnerable to brute-force and credential stuffing. Once SSH keys are deployed, disable passwords entirely. There is no middle ground worth defending.
+
+### Disable challenge-response
+
+```bash
+KbdInteractiveAuthentication no
+```
+
+Challenge-response is the PAM-based interactive auth path. Unless you are using PAM-based MFA (like TOTP — see [Multi-Factor Authentication](/linux/debian/security/authentication/multi-factor-authentication/)), disable it. On older Debian versions, this directive is named `ChallengeResponseAuthentication`.
+
+### Explicitly set allowed auth methods
+
+```bash
+AuthenticationMethods publickey
+```
+
+For MFA combining keys and TOTP:
+
+```bash
+AuthenticationMethods publickey,keyboard-interactive
+```
+
+The comma means *both* are required, not either-or.
+
+### Disable PAM if not needed
+
+```bash
+UsePAM no
+```
+
+PAM (Pluggable Authentication Modules) is the Linux authentication framework that sits between SSH and the actual credential check. When `UsePAM yes` is set, SSH defers parts of the auth process to PAM — useful for MFA and account policies, but an unnecessary dependency if you only use key authentication.
+
+If you disable PAM, note that:
+- Account expiry and lockout enforced via PAM (`pam_faillock`, `pam_tally2`) will not apply to SSH sessions
+- Environment variables from PAM modules will not be set
+- You must handle session management yourself
+
+If you are using `libpam-google-authenticator` for MFA, keep `UsePAM yes`.
+
+---
+
+## 6. Access Control
+
+### Change the default port
+
+```bash
+Port 2222
+```
+
+Port 22 is hammered by automated scanners constantly. Changing the port does not add real security, but it dramatically reduces log noise and slows down unsophisticated bots. Use a port above 1024 that is not already assigned.
+
+:::tip
+Update your firewall before restarting SSH after a port change. See [Firewall Rules](/linux/debian/security/firewall-rules/).
+:::
+
+### Restrict which interface SSH listens on
+
+```bash
+# Listen on all interfaces (default)
+ListenAddress 0.0.0.0
+
+# Listen only on a specific IP (e.g. internal interface only)
+ListenAddress 10.0.0.1
+
+# IPv4 only
+AddressFamily inet
+```
+
+If your server has a public IP and a private/VPN IP, binding SSH to the private interface alone eliminates exposure to the public internet entirely.
+
+### Restrict users and groups
+
+```bash
+AllowGroups sshusers
+DenyUsers guest tempuser
+```
+
+`AllowGroups` is the cleanest approach — only users who are members of the specified group can connect. Everyone else is rejected before authentication even begins.
+
+Create the group and add users:
+
+```bash
+sudo groupadd sshusers
+sudo usermod -aG sshusers alice
+sudo usermod -aG sshusers bob
+```
+
+**Directive precedence** when multiple are set: `DenyUsers` → `AllowUsers` → `DenyGroups` → `AllowGroups`. `Deny` always wins.
+
+---
+
+## 7. Session and Connection Limits
+
+```bash
+# Maximum authentication attempts per connection
+MaxAuthTries 3
+
+# Maximum simultaneous unauthenticated connections
+# Format: start:rate:full
+# Start dropping at 3 connections, 50% drop rate, full drop at 10
+MaxStartups 3:50:10
+
+# Maximum concurrent sessions per connection (SSH multiplexing)
+MaxSessions 5
+
+# Close connections that do not complete auth within 30 seconds
+LoginGraceTime 30
+
+# Send keepalive to detect dead connections, disconnect after 1 missed reply
+ClientAliveInterval 300
+ClientAliveCountMax 1
+```
+
+### Understanding MaxStartups
+
+`MaxStartups 3:50:10` is one of the most misunderstood settings:
+
+- **3** — allow up to 3 unauthenticated connections simultaneously without dropping
+- **50** — once 3 are open, start probabilistically dropping new connections at 50%
+- **10** — once 10 unauthenticated connections are open, drop 100% of new ones
+
+This is specifically designed to slow down parallel brute-force connection floods without blocking legitimate users. A legitimate user making one connection will almost never be dropped; an automated scanner opening hundreds will be.
+
+### Understanding ClientAliveInterval vs ServerAliveInterval
+
+- `ClientAliveInterval` / `ClientAliveCountMax` — server-side: sshd sends keepalive packets to the client. Set in `sshd_config`.
+- `ServerAliveInterval` / `ServerAliveCountMax` — client-side: the SSH client sends keepalive packets to the server. Set in `~/.ssh/config`.
+
+Setting `ClientAliveInterval 300` with `ClientAliveCountMax 1` means: if the client does not respond to a keepalive within 300 seconds, disconnect. This prevents zombie sessions from accumulating.
+
+---
+
+## 8. Disable Unused Features
+
+Every enabled feature is an attack surface. Disable what you do not use.
+
+```bash
+# X11 forwarding — tunnels GUI applications over SSH
+# Disable unless you specifically need remote GUI access
+X11Forwarding no
+
+# TCP forwarding — allows SSH to act as a SOCKS proxy or port forwarder
+# An attacker with shell access could use this to pivot into your network
+AllowTcpForwarding no
+
+# Unix domain socket forwarding — similar to TCP forwarding but for local sockets
+AllowStreamLocalForwarding no
+
+# Agent forwarding — forwards your local ssh-agent to the remote server
+# If the remote server is compromised, the attacker can use your agent
+AllowAgentForwarding no
+
+# SSH tunneling (tun device creation)
+PermitTunnel no
+
+# .rhosts and /etc/hosts.equiv — legacy host-based auth (1980s tech)
+IgnoreRhosts yes
+HostbasedAuthentication no
+
+# Prevent reading environment variables from ~/.ssh/environment
+# Can be used to override PATH and similar — not needed for most setups
+PermitUserEnvironment no
+
+# Do not print /etc/motd on login (handle this at the shell level instead)
+PrintMotd no
+
+# Do not print last login time (reduces information leakage)
+PrintLastLog no
+```
+
+### AllowTcpForwarding vs AllowStreamLocalForwarding
+
+These are commonly confused:
+
+- `AllowTcpForwarding` controls TCP port forwarding (`-L`, `-R`, `-D` flags) — this is what most people mean when they say "SSH tunneling"
+- `AllowStreamLocalForwarding` controls forwarding of Unix domain sockets — used by tools like forwarding a Docker socket over SSH
+
+If you are running a deployment server where engineers legitimately need to forward database ports for debugging, you can selectively re-enable TCP forwarding for specific users using a `Match` block (see section 9).
+
+---
+
+## 9. Match Blocks — Per-User and Per-Network Policies
+
+`Match` blocks let you override global settings for specific users, groups, IP addresses, or hostnames. This is how you apply a strict global policy while making exceptions without weakening the baseline.
+
+```bash
+# Global: deny everything by default
+PasswordAuthentication no
+AllowTcpForwarding no
+X11Forwarding no
+AllowGroups sshusers
+
+# Exception: internal network gets more relaxed rules
+Match Address 10.0.0.0/8
+    AllowTcpForwarding yes
+    X11Forwarding yes
+
+# Exception: deploy user can only run one specific command
+Match User deploy
+    ForceCommand /usr/local/bin/deploy.sh
+    AllowTcpForwarding no
+    PasswordAuthentication no
+
+# Exception: backup user gets severely restricted session
+Match User backup
+    ForceCommand /usr/bin/rsync --server -az . /backups/
+    AllowTcpForwarding no
+    X11Forwarding no
+    PermitTTY no
+
+# Exception: admin group gets longer grace time from specific network
+Match Group admins Address 192.168.1.0/24
+    LoginGraceTime 60
+    MaxAuthTries 5
+```
+
+### Match criteria
+
+| Criterion | Example | Matches |
+|-----------|---------|---------|
+| `User` | `Match User alice` | Specific username |
+| `Group` | `Match Group sysadmins` | Group membership |
+| `Address` | `Match Address 10.0.0.0/8` | Source IP/CIDR |
+| `Host` | `Match Host *.internal` | Source hostname (requires DNS) |
+| `LocalAddress` | `Match LocalAddress 10.0.0.1` | Which interface was connected to |
+| `LocalPort` | `Match LocalPort 2222` | Which port was connected on |
+
+Combine multiple criteria on one line — all must match:
+
+```bash
+Match User deploy Address 10.0.0.0/8
+```
+
+### ForceCommand
+
+`ForceCommand` replaces whatever command the client sends with a fixed command. The client's requested command is available in `$SSH_ORIGINAL_COMMAND` if you want to log or selectively allow it:
+
+```bash
+Match User git
+    ForceCommand /usr/bin/git-shell -c "$SSH_ORIGINAL_COMMAND"
+    PasswordAuthentication no
+    AllowTcpForwarding no
+    X11Forwarding no
+    PermitTTY no
+```
+
+---
+
+## 10. AuthorizedKeysCommand — Dynamic Key Lookup
+
+By default, SSH reads authorized keys from `~/.ssh/authorized_keys` on disk. `AuthorizedKeysCommand` lets you replace that with a program that dynamically returns authorized keys — from a database, LDAP, an API, or any other source.
+
+**Why this is powerful:** In environments with many users and servers, managing `authorized_keys` files on every server is unscalable and error-prone. With `AuthorizedKeysCommand`, you maintain keys in one central place. Revoke a key once, and it is immediately revoked everywhere.
+
+```bash
+# The command to run — receives the username as %u
+AuthorizedKeysCommand /usr/local/bin/fetch-ssh-keys %u
+
+# The user to run the command as (must not be root)
+AuthorizedKeysCommandUser nobody
+```
+
+The command must:
+- Accept the username as an argument
+- Output authorized public keys to stdout, one per line (same format as `authorized_keys`)
+- Exit 0 on success, non-zero on failure
+- Be owned by root and not world-writable
+
+Example script that reads from a file per user (simple case):
+
+```bash
+#!/bin/bash
+# /usr/local/bin/fetch-ssh-keys
+# Usage: fetch-ssh-keys <username>
+
+USERNAME="$1"
+KEY_FILE="/etc/ssh/authorized_keys.d/${USERNAME}"
+
+if [[ -f "$KEY_FILE" ]]; then
+    cat "$KEY_FILE"
+fi
+```
+
+```bash
+sudo chmod 755 /usr/local/bin/fetch-ssh-keys
+sudo chown root:root /usr/local/bin/fetch-ssh-keys
+```
+
+For production use, this script would query LDAP, a REST API, or a database instead of a flat file.
+
+### AuthorizedKeysCommand tokens
+
+The command supports several tokens that are substituted at runtime:
+
+| Token | Substitution |
+|-------|-------------|
+| `%u` | Username of the authenticating user |
+| `%h` | Home directory of the user |
+| `%f` | Fingerprint of the key being offered |
+| `%k` | Base64-encoded public key being offered |
+| `%t` | Key type (e.g. `ssh-ed25519`) |
+
+Using `%f` lets you build a command that validates the specific key fingerprint against an allowlist:
+
+```bash
+AuthorizedKeysCommand /usr/local/bin/validate-key %u %f
+```
+
+---
+
+## 11. RekeyLimit — Forcing Session Key Rotation
+
+Once a session is established, the same session key is used until the connection closes — by default, indefinitely. `RekeyLimit` forces the session key to be renegotiated after a certain amount of data or time.
+
+```bash
+# Force rekey after 500MB of data or 1 hour, whichever comes first
+RekeyLimit 500M 1h
+```
+
+Format: `RekeyLimit <data> <time>`
+
+- Data: `500M`, `1G`, `100K` — use `0` for no data limit
+- Time: `1h`, `30m`, `3600` (seconds) — use `0` for no time limit
+
+**Why it matters:** If an attacker is recording an encrypted SSH session (a passive recording attack), a rekeyed session means they would need to break multiple session keys to decrypt the full conversation. For long-lived sessions transferring sensitive data, this provides forward secrecy at the session level.
+
+```bash
+# For very sensitive environments — rekey every 100MB or 10 minutes
+RekeyLimit 100M 10m
+```
+
+---
+
+## 12. Logging
+
+Verbose logging is essential for detecting brute-force attempts, spotting unusual access patterns, and conducting post-incident forensics.
+
+```bash
+# Log level — VERBOSE includes key fingerprints in auth logs
+LogLevel VERBOSE
+
+# Log to AUTH facility (goes to /var/log/auth.log on Debian)
+SyslogFacility AUTH
+```
+
+### What VERBOSE adds over INFO
+
+With `LogLevel INFO` (default), you see:
+
+```
+Accepted publickey for alice from 203.0.113.10 port 54321 ssh2
+```
+
+With `LogLevel VERBOSE`, you also see:
+
+```
+Accepted publickey for alice from 203.0.113.10 port 54321 ssh2: ED25519 SHA256:abc123...
+```
+
+The key fingerprint in the log lets you determine *which* key was used — critical when a user has multiple keys and one is suspected compromised.
+
+### Monitor SSH logs
+
+```bash
+# Follow live
+sudo journalctl -u ssh -f
+
+# Filter for failed attempts only
+sudo journalctl -u ssh | grep "Failed\|Invalid\|error"
+
+# Count failed attempts by source IP
+sudo grep "Failed password\|Invalid user" /var/log/auth.log \
+  | awk '{print $(NF-3)}' | sort | uniq -c | sort -rn | head -20
+
+# See all successful logins
+sudo grep "Accepted publickey" /var/log/auth.log
+```
+
+---
+
+## 13. Validate With ssh-audit
+
+`ssh-audit` is a purpose-built tool that scans an SSH server and rates its configuration — ciphers, KEX algorithms, MACs, host keys, and known vulnerabilities.
+
+```bash
+# Install
+sudo apt install ssh-audit
+
+# Scan your own server (from another machine or localhost)
+ssh-audit localhost
+
+# Scan a specific port
+ssh-audit -p 2222 localhost
+
+# Output as JSON for automation
+ssh-audit --json localhost
+```
+
+The output color-codes each algorithm as good (green), warn (yellow), or fail (red), and references the specific CVEs or weaknesses for each flagged item. Run it after every configuration change.
+
+For remote scanning before you have access:
+
+```bash
+ssh-audit your-server-ip
+```
+
+---
+
+## 14. Validate and Apply Changes
+
+Always test the configuration syntax before restarting:
+
+```bash
+sudo sshd -t
+```
+
+No output means valid. Restart only if the test passes:
+
+```bash
+sudo systemctl restart ssh
+sudo systemctl status ssh
+```
+
+**Test in a new terminal before closing your existing session:**
+
+```bash
+ssh -p 2222 -i ~/.ssh/id_ed25519 alice@your-server-ip
+```
+
+Verify what settings are actually active after restart:
+
+```bash
+# Dump all effective settings
+sudo sshd -T
+
+# Check specific options
+sudo sshd -T | grep -E "passwordauth|permitroot|port|maxauthtries|kexalgorithms|ciphers|macs"
+
+# Confirm the listening port
+sudo ss -tlnp | grep sshd
+```
+
+---
+
+## 15. Complete Hardened sshd_config
+
+<Tabs>
+  <TabItem value="full" label="Full Production Config" default>
+
+```bash
+# /etc/ssh/sshd_config — Hardened Debian configuration
+
+# ─── Host Keys ────────────────────────────────────────────────────────────────
+HostKey /etc/ssh/ssh_host_ed25519_key
+HostKey /etc/ssh/ssh_host_rsa_key
+
+# ─── Network ──────────────────────────────────────────────────────────────────
+Port 2222
+ListenAddress 0.0.0.0
+AddressFamily inet
+
+# ─── Cryptography ─────────────────────────────────────────────────────────────
+KexAlgorithms curve25519-sha256,curve25519-sha256@libssh.org,diffie-hellman-group16-sha512,diffie-hellman-group18-sha512
+Ciphers chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-gcm@openssh.com,aes256-ctr,aes192-ctr,aes128-ctr
+MACs hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com,umac-128-etm@openssh.com
+HostKeyAlgorithms ssh-ed25519,ssh-ed25519-cert-v01@openssh.com,rsa-sha2-512,rsa-sha2-256
+
+# ─── Authentication ───────────────────────────────────────────────────────────
+PermitRootLogin no
+PasswordAuthentication no
+PermitEmptyPasswords no
+KbdInteractiveAuthentication no
+AuthenticationMethods publickey
+PubkeyAuthentication yes
+AuthorizedKeysFile .ssh/authorized_keys
+UsePAM no
+
+# ─── Access Control ───────────────────────────────────────────────────────────
+AllowGroups sshusers
+
+# ─── Session Limits ───────────────────────────────────────────────────────────
+MaxAuthTries 3
+MaxStartups 3:50:10
+MaxSessions 5
+LoginGraceTime 30
+ClientAliveInterval 300
+ClientAliveCountMax 1
+RekeyLimit 500M 1h
+
+# ─── Disabled Features ────────────────────────────────────────────────────────
+X11Forwarding no
+AllowTcpForwarding no
+AllowStreamLocalForwarding no
+AllowAgentForwarding no
+PermitTunnel no
+IgnoreRhosts yes
+HostbasedAuthentication no
+PermitUserEnvironment no
+PrintMotd no
+PrintLastLog no
+
+# ─── Logging ──────────────────────────────────────────────────────────────────
+LogLevel VERBOSE
+SyslogFacility AUTH
+
+# ─── Match Blocks ─────────────────────────────────────────────────────────────
+# Internal network: allow TCP forwarding for database tunnels
+Match Address 10.0.0.0/8
+    AllowTcpForwarding yes
+
+# Deploy user: force a specific command only
+Match User deploy
+    ForceCommand /usr/local/bin/deploy.sh
+    AllowTcpForwarding no
+    PermitTTY no
+```
+
+  </TabItem>
+  <TabItem value="minimal" label="Minimal Hardened Config">
+
+```bash
+# /etc/ssh/sshd_config — Minimal hardened config (essentials only)
+
+HostKey /etc/ssh/ssh_host_ed25519_key
+HostKey /etc/ssh/ssh_host_rsa_key
+
+Port 2222
+PermitRootLogin no
+PasswordAuthentication no
+PermitEmptyPasswords no
+KbdInteractiveAuthentication no
+AuthenticationMethods publickey
+
+MaxAuthTries 3
+LoginGraceTime 30
+ClientAliveInterval 300
+ClientAliveCountMax 1
+
+X11Forwarding no
+AllowTcpForwarding no
+
+LogLevel VERBOSE
+```
+
+  </TabItem>
+</Tabs>
+
+---
+
+## Troubleshooting
+
+| Problem | Cause | Fix |
+|---------|-------|-----|
+| `Connection refused` after restart | Port change, firewall not updated | `sudo ufw allow 2222/tcp` |
+| `Permission denied (publickey)` | Key not working | Test with `ssh -vvv`, check `authorized_keys` permissions |
+| `sshd: no hostkeys available` | Host key files missing | `sudo ssh-keygen -A` |
+| `Bad configuration option` on start | Unsupported directive (older OpenSSH) | Check version: `ssh -V`, remove unsupported options |
+| Cipher negotiation failure | Client too old | Add one transitional cipher to `Ciphers` list temporarily |
+| `Too many authentication failures` | Agent tries all keys before yours | Add `IdentitiesOnly yes` in `~/.ssh/config` |
+| Completely locked out | Bad config or lost keys | Use VNC/console access, restore from `/etc/ssh.bak` |
+
+Always debug with:
+
+```bash
+ssh -vvv -p 2222 -i ~/.ssh/id_ed25519 user@server 2>&1 | head -60
+```
+
+And check the server logs simultaneously:
+
+```bash
+sudo journalctl -u ssh -f
+```
+
+---
+
+## Related Topics
+
+- [SSH Key Management](/linux/debian/security/authentication/ssh-key-management/) — Generate and manage SSH key pairs
+- [Multi-Factor Authentication](/linux/debian/security/authentication/multi-factor-authentication/) — Add TOTP on top of key auth
+- [Brute-Force Protection](/linux/debian/security/authentication/brute-force-protection/) — Block attackers with Fail2ban
+- [Firewall Rules](/linux/debian/security/firewall-rules/) — Restrict SSH access by IP
+
+---
+
+*A hardened SSH config is not a one-time task — audit it with `ssh-audit` after every change, and revisit the cipher lists annually as cryptographic recommendations evolve.*

@@ -3535,26 +3535,38 @@ const sidebars: SidebarsConfig = {
           items: [
             {
               type: 'category',
-              label: 'Setup Password Authentication',
-              link: { type: 'doc', id: 'linux/debian/security/authentication/setup-password-authentication/index' },
+              label: 'SSH Key Management',
+              link: { type: 'doc', id: 'linux/debian/security/authentication/ssh-key-management/index' },
               items: []
             },
             {
               type: 'category',
-              label: 'Configure Key Authentication',
-              link: { type: 'doc', id: 'linux/debian/security/authentication/configure-key-authentication/index' },
+              label: 'SSH Hardening',
+              link: { type: 'doc', id: 'linux/debian/security/authentication/ssh-hardening/index' },
               items: []
             },
             {
               type: 'category',
-              label: 'Enable Multi Factor Auth',
-              link: { type: 'doc', id: 'linux/debian/security/authentication/enable-multi-factor-auth/index' },
+              label: 'Multi-Factor Authentication',
+              link: { type: 'doc', id: 'linux/debian/security/authentication/multi-factor-authentication/index' },
               items: []
             },
             {
               type: 'category',
-              label: 'Choose Authentication Methods',
-              link: { type: 'doc', id: 'linux/debian/security/authentication/choose-authentication-methods/index' },
+              label: 'Brute-Force Protection',
+              link: { type: 'doc', id: 'linux/debian/security/authentication/brute-force-protection/index' },
+              items: []
+            },
+            {
+              type: 'category',
+              label: 'PAM Configuration',
+              link: { type: 'doc', id: 'linux/debian/security/authentication/pam-configuration/index' },
+              items: []
+            },
+            {
+              type: 'category',
+              label: 'Password Policies',
+              link: { type: 'doc', id: 'linux/debian/security/authentication/password-policies/index' },
               items: []
             }
           ]

@@ -1,0 +1,720 @@
+---
+sidebar_position: 4
+title: "Brute-Force Protection | Authentication"
+sidebar_label: "Brute-Force Protection"
+description: "Deep-dive brute-force protection on Debian - Fail2ban internals, custom filters, jails, repeat offender banning, ipset integration, pam_faillock, and log analysis."
+keywords:
+  - "debian fail2ban"
+  - "debian brute force protection"
+  - "fail2ban ssh debian"
+  - "fail2ban custom filter"
+  - "pam_faillock debian"
+  - "debian ssh ban"
+  - "fail2ban ipset"
+  - "debian login protection"
+tags:
+  - debian
+  - fail2ban
+  - brute-force
+  - security
+  - ssh
+  - pam
+slug: /linux/debian/security/authentication/brute-force-protection
+hide_table_of_contents: true
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+# Brute-Force Protection
+
+Every internet-facing server is being scanned right now. Automated bots probe port 22 continuously, cycling through username and password combinations from credential dumps. This guide covers two complementary layers of defense: **Fail2ban** — which monitors logs and bans IPs dynamically — and **pam_faillock** — which enforces account lockout at the PAM level regardless of how the attack arrives. Understanding both, and how they interact, is what separates a properly hardened system from one that just has Fail2ban installed with default settings.
+
+:::info Prerequisites
+- Debian 11 (Bullseye) or Debian 12 (Bookworm)
+- SSH hardening already applied — see [SSH Hardening](/linux/debian/security/authentication/ssh-hardening/)
+- Basic understanding of PAM — see [Multi-Factor Authentication](/linux/debian/security/authentication/multi-factor-authentication/)
+:::
+
+---
+
+## 1. Understanding the Two Layers
+
+Before installing anything, understand what each tool actually protects against:
+
+| | Fail2ban | pam_faillock |
+|---|---|---|
+| **Works at** | Network level — monitors logs, bans IPs via firewall | PAM level — locks accounts regardless of IP |
+| **Protects against** | Distributed single-IP brute force | Distributed multi-IP brute force (same account, many IPs) |
+| **Ban target** | IP address | User account |
+| **Survives restart** | Configurable | Yes (stored in `/var/run/faillock/`) |
+| **Bypassed by** | Rotating source IPs | Using different accounts |
+| **Requires** | Log parsing | PAM integration |
+
+**The critical insight:** Fail2ban bans IPs. An attacker using a botnet with 10,000 IPs, sending one attempt per IP, will never trigger Fail2ban's threshold — but will still hammer your accounts. `pam_faillock` catches this because it counts failures per account, not per IP. Use both.
+
+---
+
+## 2. pam_faillock — Account-Level Lockout
+
+`pam_faillock` is part of `libpam-modules` (installed by default on Debian). It tracks failed authentication attempts per user and locks accounts after a threshold is reached.
+
+### Configure pam_faillock
+
+Edit `/etc/security/faillock.conf`:
+
+```bash
+sudo nano /etc/security/faillock.conf
+```
+
+```bash
+# Lock account after 5 failed attempts
+deny = 5
+
+# Within a 10-minute window
+fail_interval = 600
+
+# Keep the account locked for 15 minutes
+unlock_time = 900
+
+# Also count root failures (careful — can lock out root)
+# even_deny_root
+
+# Log failures to syslog
+audit
+
+# Show generic "authentication error" instead of "account locked"
+# (prevents username enumeration)
+silent
+```
+
+### Wire pam_faillock into PAM
+
+Edit `/etc/pam.d/common-auth`:
+
+```bash
+sudo nano /etc/pam.d/common-auth
+```
+
+The default Debian `common-auth` looks like:
+
+```
+auth    [success=1 default=ignore]  pam_unix.so nullok
+auth    requisite                   pam_deny.so
+auth    required                    pam_permit.so
+```
+
+Add `pam_faillock` as a preauth check and postauth recorder:
+
+```
+# Check if account is locked BEFORE attempting auth
+auth    required                    pam_faillock.so preauth
+
+# Standard auth
+auth    [success=1 default=ignore]  pam_unix.so nullok
+
+# Record failure if auth failed
+auth    [default=die]               pam_faillock.so authfail
+
+# Record success if auth passed
+auth    sufficient                  pam_faillock.so authsucc
+
+auth    requisite                   pam_deny.so
+auth    required                    pam_permit.so
+```
+
+Also add to `/etc/pam.d/common-account` so locked accounts are rejected even if auth somehow passes:
+
+```bash
+sudo nano /etc/pam.d/common-account
+```
+
+```
+# Add this line before the existing account lines
+account required pam_faillock.so
+```
+
+### Managing locked accounts
+
+```bash
+# View failed attempt count for a specific user
+faillock --user alice
+
+# View all users with failed attempts
+faillock
+
+# Unlock a specific user manually
+faillock --user alice --reset
+
+# Unlock all users
+for user in $(faillock | grep -E '^\w' | awk '{print $1}'); do
+  faillock --user "$user" --reset
+  echo "Unlocked: $user"
+done
+```
+
+Example `faillock` output:
+
+```
+alice:
+When                Type  Source                                           Valid
+2024-01-15 03:42:11 RHOST 185.220.101.45                                    V
+2024-01-15 03:42:14 RHOST 185.220.101.47                                    V
+2024-01-15 03:42:17 RHOST 185.220.101.49                                    V
+```
+
+The `Source` column shows the IPs that triggered failures — useful for cross-referencing with Fail2ban.
+
+---
+
+## 3. Installing Fail2ban
+
+```bash
+sudo apt install fail2ban
+sudo systemctl enable fail2ban
+sudo systemctl start fail2ban
+```
+
+### Never edit jail.conf directly
+
+Fail2ban ships with `/etc/fail2ban/jail.conf`. **Do not edit this file** — it is overwritten on package updates. All customization goes in `/etc/fail2ban/jail.local` and `/etc/fail2ban/jail.d/`.
+
+```bash
+# Create your local override file
+sudo nano /etc/fail2ban/jail.local
+```
+
+---
+
+## 4. Understanding Fail2ban Internals
+
+Before configuring jails, understand how Fail2ban actually works:
+
+```
+Log file (e.g. /var/log/auth.log)
+    ↓
+Filter — regex patterns that match failure lines
+    ↓
+Jail — combines a filter with thresholds and an action
+    ↓
+Action — what to do when threshold is reached (ban, notify, etc.)
+    ↓
+Backend — iptables, nftables, ipset, ufw, or firewalld
+```
+
+### Filters
+
+A filter is a set of regex patterns. When a line in the log matches a pattern, it counts as a failure for the IP in that line. Filters live in `/etc/fail2ban/filter.d/`.
+
+### Jails
+
+A jail ties a filter to a log file and defines:
+- `maxretry` — how many matches trigger a ban
+- `findtime` — the time window for counting matches
+- `bantime` — how long to ban
+- `action` — what to do on ban
+
+### Actions
+
+An action is a script that runs on ban/unban. Actions live in `/etc/fail2ban/action.d/`. The most common are:
+- `iptables-multiport` — adds rules to iptables
+- `nftables-multiport` — adds rules to nftables (Debian 12 default)
+- `ufw` — uses `ufw` commands
+- `ipset` — adds IPs to an ipset (much more efficient for large ban lists)
+
+---
+
+## 5. Global Settings
+
+Set sensible global defaults in `jail.local`:
+
+```bash
+sudo nano /etc/fail2ban/jail.local
+```
+
+```ini
+[DEFAULT]
+# Ban duration — start with 1 hour, escalate with recidive jail
+bantime  = 1h
+
+# Time window for counting failures
+findtime = 10m
+
+# Number of failures before ban
+maxretry = 5
+
+# Backend for log monitoring
+# systemd uses journald — faster and more reliable than polling log files
+backend = systemd
+
+# Action to take on ban
+# %(action_mwl)s = ban + send email with whois + log lines (if mail configured)
+# %(action_)s    = ban only (recommended if no mail configured)
+action = %(action_)s
+
+# IPs and networks to never ban — always add your own management IPs
+ignoreip = 127.0.0.1/8 ::1 10.0.0.0/8 192.168.1.0/24
+
+# Ban the IP across ALL jails, not just the one that triggered
+# bantime.increment = true  (see section 8 for recidive jail — preferred approach)
+```
+
+### backend = systemd vs auto
+
+On Debian 11/12, `backend = systemd` reads directly from journald instead of polling log files. This is:
+- More reliable (no missed entries due to log rotation)
+- Faster (no inotify polling)
+- Cleaner (works even if `/var/log/auth.log` does not exist)
+
+The trade-off: the filter `journalmatch` directive must match the systemd unit, not a log file path.
+
+---
+
+## 6. SSH Jail
+
+The SSH jail is the most important one. Enable and harden it:
+
+```ini
+[sshd]
+enabled  = true
+port     = 2222
+filter   = sshd
+backend  = systemd
+
+# Aggressive settings for SSH — this is the most targeted service
+maxretry = 3
+findtime = 5m
+bantime  = 24h
+
+# Log the ban reason
+logencoding = utf-8
+```
+
+If you changed the SSH port, update `port` accordingly. You can also specify multiple ports:
+
+```ini
+port = 22,2222
+```
+
+### Verify the sshd filter
+
+The built-in `sshd` filter covers most attack patterns. Inspect it:
+
+```bash
+cat /etc/fail2ban/filter.d/sshd.conf
+```
+
+Test the filter against your actual log to see what it would catch:
+
+```bash
+sudo fail2ban-regex /var/log/auth.log /etc/fail2ban/filter.d/sshd.conf
+```
+
+Or with systemd backend:
+
+```bash
+sudo fail2ban-regex systemd-journal /etc/fail2ban/filter.d/sshd.conf
+```
+
+Output shows how many lines matched, how many were ignored, and the match rate — essential for verifying your filter works before relying on it.
+
+---
+
+## 7. Writing Custom Filters
+
+The built-in filters cover common patterns, but applications with custom log formats need custom filters. Understanding filter syntax lets you protect anything that writes logs.
+
+### Filter structure
+
+```ini
+# /etc/fail2ban/filter.d/myapp.conf
+
+[INCLUDES]
+before = common.conf
+
+[Definition]
+# The regex pattern — <HOST> is a Fail2ban macro for IP address matching
+failregex = ^%(__prefix_line)sFailed login attempt from <HOST>.*$
+            ^%(__prefix_line)sInvalid credentials from <HOST>.*$
+
+# Lines to ignore (reduces false positives)
+ignoreregex = ^%(__prefix_line)ssuccessful login.*$
+
+# For systemd backend — match journal fields instead of log file
+journalmatch = _SYSTEMD_UNIT=myapp.service
+```
+
+### Key macros
+
+| Macro | Expands to |
+|-------|-----------|
+| `<HOST>` | IPv4 or IPv6 address |
+| `<ADDR>` | IPv4 address only |
+| `<IP6>` | IPv6 address only |
+| `%(__prefix_line)s` | Optional log prefix (date, hostname, process) |
+| `<F-USER>` | Capture the username from the log line |
+
+### Testing your filter
+
+Always test before deploying:
+
+```bash
+# Test against a log file
+sudo fail2ban-regex /var/log/myapp.log /etc/fail2ban/filter.d/myapp.conf
+
+# Test a single line
+sudo fail2ban-regex "2024-01-15 03:42:11 Failed login attempt from 185.220.101.45" \
+  /etc/fail2ban/filter.d/myapp.conf
+
+# Verbose output — shows each line and whether it matched
+sudo fail2ban-regex --print-all-matched /var/log/auth.log /etc/fail2ban/filter.d/sshd.conf
+```
+
+A good filter has:
+- High match count on genuine failure lines
+- Zero false positives on success lines
+- Match rate above 80% on a log with known brute-force activity
+
+---
+
+## 8. The Recidive Jail — Permanent Bans for Repeat Offenders
+
+The standard SSH jail bans for 24 hours. An attacker waits, the ban expires, they try again. The recidive jail solves this: it watches Fail2ban's own ban log and permanently bans IPs that get banned repeatedly.
+
+```ini
+[recidive]
+enabled  = true
+filter   = recidive
+logpath  = /var/log/fail2ban.log
+backend  = auto
+
+# If banned 3 times in 1 day...
+maxretry = 3
+findtime = 1d
+
+# ...ban for 4 weeks
+bantime  = 4w
+```
+
+The recidive filter watches for lines like:
+```
+2024-01-15 03:42:11,423 fail2ban.actions [1234]: NOTICE  [sshd] Ban 185.220.101.45
+```
+
+Each time an IP is banned by any jail, it counts toward the recidive threshold. Three bans in a day = 4-week ban. This turns short-term bans into escalating long-term ones without any manual intervention.
+
+:::tip
+The recidive jail requires `backend = auto` (not `systemd`) because it reads from `/var/log/fail2ban.log`, not journald.
+:::
+
+---
+
+## 9. ipset Integration — Efficient Large-Scale Banning
+
+By default, Fail2ban adds one `iptables` rule per banned IP. At 1,000 banned IPs, you have 1,000 iptables rules — and every packet is checked against each one sequentially. Performance degrades noticeably at scale.
+
+**ipset** stores IPs in a hash table. Iptables checks a single rule (`is this IP in the set?`) — O(1) regardless of how many IPs are banned.
+
+```bash
+sudo apt install ipset
+```
+
+Configure Fail2ban to use ipset:
+
+```bash
+sudo nano /etc/fail2ban/jail.local
+```
+
+```ini
+[DEFAULT]
+banaction = iptables-ipset-proto6-allports
+banaction_allports = iptables-ipset-proto6-allports
+```
+
+This switches all jails to use ipset-backed banning. Verify ipset is working after a ban occurs:
+
+```bash
+# List all ipsets created by Fail2ban
+sudo ipset list | grep -E "^Name:"
+
+# View IPs in the SSH ban set
+sudo ipset list f2b-sshd
+```
+
+### Persistent ipset across reboots
+
+ipset entries are lost on reboot by default. Make them persistent:
+
+```bash
+sudo apt install ipset-persistent
+sudo netfilter-persistent save
+```
+
+Or configure Fail2ban to restore its bans on startup — which it does automatically via `dbpurgeage` and the SQLite database at `/var/lib/fail2ban/fail2ban.sqlite3`.
+
+---
+
+## 10. Geographic IP Blocking
+
+For servers that only need to be accessible from specific countries, blocking entire geographic regions eliminates the majority of brute-force traffic before it even reaches Fail2ban.
+
+```bash
+sudo apt install ipset xtables-addons-dkms xtables-addons-common
+sudo apt install libtext-csv-xs-perl libmoosex-types-netaddr-ip-perl
+```
+
+Download the GeoIP database and load it:
+
+```bash
+sudo /usr/lib/xtables-addons/xt_geoip_dl
+sudo /usr/lib/xtables-addons/xt_geoip_build -D /usr/share/xt_geoip
+```
+
+Block all countries except the Netherlands and Germany:
+
+```bash
+# Allow specific countries
+sudo iptables -A INPUT -p tcp --dport 2222 -m geoip --src-cc NL,DE -j ACCEPT
+
+# Drop everything else on that port
+sudo iptables -A INPUT -p tcp --dport 2222 -j DROP
+```
+
+:::warning
+GeoIP databases are not 100% accurate and VPN/proxy IPs are often misclassified. Use this as a noise reducer, not a security boundary. Always maintain your `ignoreip` list in Fail2ban for management IPs.
+:::
+
+---
+
+## 11. Fail2ban Actions — Beyond Banning
+
+The default action just bans the IP. Fail2ban supports richer actions.
+
+### Send email on ban
+
+```bash
+sudo apt install mailutils
+```
+
+```ini
+[DEFAULT]
+destemail = admin@example.com
+sender    = fail2ban@your-server
+mta       = sendmail
+
+# Ban + email with whois info
+action = %(action_mw)s
+
+# Ban + email with whois + relevant log lines
+action = %(action_mwl)s
+```
+
+### Run a custom script on ban
+
+Create a custom action:
+
+```bash
+sudo nano /etc/fail2ban/action.d/custom-notify.conf
+```
+
+```ini
+[Definition]
+actionban   = /usr/local/bin/on-ban.sh <ip> <name>
+actionunban = /usr/local/bin/on-unban.sh <ip> <name>
+```
+
+```bash
+# /usr/local/bin/on-ban.sh
+#!/bin/bash
+IP="$1"
+JAIL="$2"
+echo "$(date): Banned $IP from jail $JAIL" >> /var/log/custom-bans.log
+# Could also: post to Slack, write to database, update a blocklist API
+```
+
+```bash
+sudo chmod 755 /usr/local/bin/on-ban.sh
+```
+
+Use it in a jail:
+
+```ini
+[sshd]
+action = %(action_)s
+         custom-notify
+```
+
+Multiple action lines stack — both run on ban.
+
+---
+
+## 12. Monitoring and Observability
+
+### Live status
+
+```bash
+# Overview of all jails
+sudo fail2ban-client status
+
+# Detailed status for a specific jail
+sudo fail2ban-client status sshd
+```
+
+Example output:
+
+```
+Status for the jail: sshd
+|- Filter
+|  |- Currently failed: 3
+|  |- Total failed:     847
+|  `- Journal matches:  _SYSTEMD_UNIT=ssh.service
+`- Actions
+   |- Currently banned: 12
+   |- Total banned:     234
+   `- Banned IP list:   185.220.101.45 185.220.101.47 ...
+```
+
+### Manual ban and unban
+
+```bash
+# Manually ban an IP in a specific jail
+sudo fail2ban-client set sshd banip 185.220.101.45
+
+# Unban an IP from a specific jail
+sudo fail2ban-client set sshd unbanip 185.220.101.45
+
+# Unban an IP from ALL jails
+sudo fail2ban-client unban 185.220.101.45
+
+# Unban all IPs (use with caution)
+sudo fail2ban-client unban --all
+```
+
+### Log analysis — find top attackers
+
+```bash
+# Top 20 IPs by failed SSH attempt count
+sudo grep "Failed password\|Invalid user" /var/log/auth.log \
+  | awk '{print $(NF-3)}' \
+  | sort | uniq -c | sort -rn | head -20
+
+# Top usernames being targeted
+sudo grep "Invalid user" /var/log/auth.log \
+  | awk '{print $8}' \
+  | sort | uniq -c | sort -rn | head -20
+
+# Count bans per jail from fail2ban log
+sudo grep "Ban " /var/log/fail2ban.log \
+  | awk '{print $6}' \
+  | tr -d '[]' \
+  | sort | uniq -c | sort -rn
+
+# IPs banned and unbanned today
+sudo grep "$(date +%Y-%m-%d)" /var/log/fail2ban.log \
+  | grep -E "Ban|Unban" | wc -l
+```
+
+### Check if a specific IP is currently banned
+
+```bash
+sudo fail2ban-client status sshd | grep "185.220.101.45"
+
+# Or check iptables directly
+sudo iptables -L f2b-sshd -n | grep "185.220.101.45"
+
+# Or check ipset (if using ipset backend)
+sudo ipset test f2b-sshd 185.220.101.45 && echo "Banned" || echo "Not banned"
+```
+
+---
+
+## 13. Complete Configuration Reference
+
+```bash
+sudo nano /etc/fail2ban/jail.local
+```
+
+```ini
+[DEFAULT]
+# ─── Global Settings ──────────────────────────────────────────────────────────
+bantime   = 1h
+findtime  = 10m
+maxretry  = 5
+backend   = systemd
+action    = %(action_)s
+
+# Never ban these — always include your own management IPs
+ignoreip  = 127.0.0.1/8 ::1 10.0.0.0/8 192.168.1.0/24
+
+# Use ipset for efficient large-scale banning
+banaction          = iptables-ipset-proto6-allports
+banaction_allports = iptables-ipset-proto6-allports
+
+
+# ─── SSH ──────────────────────────────────────────────────────────────────────
+[sshd]
+enabled  = true
+port     = 2222
+filter   = sshd
+backend  = systemd
+maxretry = 3
+findtime = 5m
+bantime  = 24h
+
+
+# ─── Repeat Offenders ─────────────────────────────────────────────────────────
+[recidive]
+enabled  = true
+filter   = recidive
+logpath  = /var/log/fail2ban.log
+backend  = auto
+maxretry = 3
+findtime = 1d
+bantime  = 4w
+```
+
+Reload after changes:
+
+```bash
+sudo fail2ban-client reload
+```
+
+---
+
+## Troubleshooting
+
+| Problem | Cause | Fix |
+|---------|-------|-----|
+| Fail2ban not banning despite failures | Filter not matching log format | Run `fail2ban-regex` against the log to verify |
+| Banned your own IP | Management IP not in `ignoreip` | `sudo fail2ban-client set sshd unbanip <your-ip>`, add to `ignoreip` |
+| `backend = systemd` — no matches | Wrong `journalmatch` in filter | Check with `journalctl -u ssh` to see actual log format |
+| `recidive` jail not triggering | Wrong `logpath` or `backend` | Recidive needs `backend = auto` and `/var/log/fail2ban.log` |
+| Bans lost after reboot | ipset not persistent | Install `ipset-persistent` and run `netfilter-persistent save` |
+| `pam_faillock` locking out root | `even_deny_root` set | Remove from `faillock.conf`, or use `unlock_time = 0` for root only |
+| Account locked but IP not banned | `pam_faillock` hit, Fail2ban did not | Normal — they operate independently. Use `faillock --reset` |
+
+Debug Fail2ban filter matching:
+
+```bash
+sudo fail2ban-regex --print-all-matched systemd-journal /etc/fail2ban/filter.d/sshd.conf 2>&1 | tail -30
+```
+
+Check Fail2ban's own log for errors:
+
+```bash
+sudo journalctl -u fail2ban -f
+```
+
+---
+
+## Related Topics
+
+- [SSH Hardening](/linux/debian/security/authentication/ssh-hardening/) — Reduce attack surface before banning
+- [SSH Key Management](/linux/debian/security/authentication/ssh-key-management/) — Eliminate password attacks entirely
+- [Multi-Factor Authentication](/linux/debian/security/authentication/multi-factor-authentication/) — Add TOTP as a second factor
+- [PAM Configuration](/linux/debian/security/authentication/pam-configuration/) — Full PAM stack reference
+- [Firewall Rules](/linux/debian/security/firewall-rules/) — Network-level access restriction
+
+---
+
+*Brute-force protection is only meaningful when password authentication is already disabled. If you have followed the SSH Hardening guide, attackers have no passwords to brute-force — Fail2ban and pam_faillock then catch the remaining attack vectors.*

@@ -1,0 +1,736 @@
+---
+sidebar_position: 5
+title: "PAM Configuration | Authentication"
+sidebar_label: "PAM Configuration"
+description: "Deep-dive PAM configuration on Debian - module stack internals, control flags, common-auth, session management, limits, environment, and building precise authentication policies."
+keywords:
+  - "debian pam configuration"
+  - "pam pluggable authentication modules debian"
+  - "pam stack debian"
+  - "pam_unix debian"
+  - "pam_limits debian"
+  - "pam_env debian"
+  - "common-auth debian"
+  - "pam module debian"
+tags:
+  - debian
+  - pam
+  - authentication
+  - security
+  - linux
+slug: /linux/debian/security/authentication/pam-configuration
+hide_table_of_contents: true
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+# PAM Configuration
+
+PAM (Pluggable Authentication Modules) is the authentication backbone of every Debian system. SSH uses it, `sudo` uses it, `login` uses it, `su` uses it. When you add MFA, enforce password policies, set resource limits, or restrict login times — you are configuring PAM. Most administrators treat PAM as a black box and only touch it when following a tutorial. This guide explains how it actually works, so you can build and debug authentication policies with confidence instead of copying config snippets and hoping they work.
+
+:::info Prerequisites
+- Debian 11 (Bullseye) or Debian 12 (Bookworm)
+- Root or `sudo` access
+- Familiarity with the concepts from [Multi-Factor Authentication](/linux/debian/security/authentication/multi-factor-authentication/) and [Brute-Force Protection](/linux/debian/security/authentication/brute-force-protection/)
+:::
+
+:::danger PAM misconfigurations lock everyone out
+A broken PAM stack can make it impossible to log in — including as root over SSH and on the console. Always keep an active root session open while editing PAM files, and test changes before closing it.
+:::
+
+---
+
+## 1. How PAM Actually Works
+
+PAM sits between an application (SSH, sudo, login) and the actual authentication mechanism (password check, TOTP, LDAP). Applications do not implement authentication themselves — they hand off to PAM, which runs a stack of modules and returns a final pass/fail decision.
+
+```
+Application (sshd, sudo, login)
+    │
+    ▼
+PAM API call: pam_authenticate()
+    │
+    ▼
+/etc/pam.d/<service>  ←── service-specific config
+    │
+    ├── module 1 (e.g. pam_faillock.so preauth)
+    ├── module 2 (e.g. pam_unix.so)
+    ├── module 3 (e.g. pam_google_authenticator.so)
+    └── ...
+    │
+    ▼
+Final result: success or failure
+    │
+    ▼
+Application proceeds or denies
+```
+
+### The four PAM module types
+
+PAM modules are organized into four management groups. Each file in `/etc/pam.d/` can contain lines from any group:
+
+| Type | Purpose | Example modules |
+|------|---------|----------------|
+| `auth` | Verify identity — is this user who they claim to be? | `pam_unix`, `pam_google_authenticator`, `pam_faillock` |
+| `account` | Is this account allowed to access the service right now? | `pam_nologin`, `pam_time`, `pam_faillock` |
+| `password` | Handle password changes | `pam_unix`, `pam_pwquality`, `pam_pwhistory` |
+| `session` | Set up and tear down the session environment | `pam_limits`, `pam_env`, `pam_loginuid` |
+
+A single module can appear in multiple groups — `pam_unix.so` for example handles `auth` (password check), `account` (account validity), `password` (password changes), and `session` (session logging).
+
+---
+
+## 2. Control Flags — The Core of PAM Logic
+
+The control flag on each line determines how its result affects the overall stack. This is the part that trips people up because the behavior of `required` vs `requisite` is subtle but the difference matters enormously.
+
+### Simple control flags
+
+```
+auth    required      pam_unix.so
+auth    requisite     pam_deny.so
+auth    sufficient    pam_permit.so
+auth    optional      pam_echo.so
+```
+
+| Flag | On success | On failure |
+|------|-----------|-----------|
+| `required` | Continue evaluating stack | Mark as failed, but **keep running** remaining modules |
+| `requisite` | Continue evaluating stack | **Stop immediately**, return failure |
+| `sufficient` | **Stop immediately**, return success (if nothing before it failed) | Continue evaluating |
+| `optional` | Continue | Continue — result ignored unless it is the only module |
+
+**Why `required` keeps running after failure:** This prevents timing attacks. If PAM stopped immediately on a failed password check, an attacker could distinguish "wrong username" from "wrong password" by measuring response time. Running all modules masks which one failed.
+
+**When to use `requisite`:** For checks where continuing after failure is actively harmful — like `pam_faillock` preauth. If an account is locked, you want an immediate stop, not a slower response after running the rest of the stack.
+
+### Extended control flags — the `[success=N]` syntax
+
+Simple flags are binary. Extended flags give you precise flow control:
+
+```
+auth [success=2 default=ignore] pam_succeed_if.so user ingroup sshusers
+auth [success=1 default=ignore] pam_access.so
+auth required                   pam_google_authenticator.so
+auth required                   pam_unix.so
+```
+
+The format is `[result=action result=action ...]`:
+
+| Result | Meaning |
+|--------|---------|
+| `success` | Module returned PAM_SUCCESS |
+| `default` | Any result not explicitly listed |
+| `ignore` | Continue to next module, do not count this result |
+| `bad` | Treat as failure |
+| `die` | Treat as failure and stop immediately |
+| `ok` | Treat as success |
+| `done` | Treat as success and stop immediately |
+| `N` (integer) | Skip the next N modules |
+| `reset` | Clear all accumulated results |
+
+**Reading `[success=2 default=ignore]`:** If this module succeeds, skip the next 2 modules. If anything else happens, ignore this result and continue. This is how you build conditional bypass logic — "if user is in this group, skip MFA."
+
+---
+
+## 3. The Debian PAM File Structure
+
+```bash
+/etc/pam.d/
+├── common-auth          ← shared auth stack, included by most services
+├── common-account       ← shared account checks
+├── common-password      ← shared password change rules
+├── common-session       ← shared session setup
+├── common-session-noninteractive  ← session setup without TTY
+├── sshd                 ← SSH-specific overrides
+├── sudo                 ← sudo-specific overrides
+├── login                ← console login
+├── su                   ← su command
+└── other                ← fallback for services with no specific file
+```
+
+### The @include directive
+
+Service files include the shared stacks:
+
+```
+@include common-auth
+@include common-account
+@include common-password
+@include common-session
+```
+
+This means changes to `common-auth` affect every service that includes it — SSH, sudo, login, su, everything. Changes to `/etc/pam.d/sshd` only affect SSH. Be deliberate about where you make changes.
+
+### View the full effective stack for a service
+
+```bash
+# Resolve all @includes and show the full effective stack
+sudo pam-auth-update --force 2>/dev/null; cat /etc/pam.d/common-auth
+
+# Or manually follow the includes
+grep -r "" /etc/pam.d/sshd | sed 's/@include /cat \/etc\/pam.d\//e'
+```
+
+---
+
+## 4. The common-auth Stack
+
+This is the most important PAM file on a Debian system. Understanding its default structure — and how to extend it safely — is the foundation of everything else.
+
+Default `/etc/pam.d/common-auth` on Debian 12:
+
+```
+# /etc/pam.d/common-auth — authentication settings common to all services
+
+auth    [success=1 default=ignore]  pam_unix.so nullok
+auth    requisite                   pam_deny.so
+auth    required                    pam_permit.so
+auth    optional                    pam_cap.so
+```
+
+**Walking through it line by line:**
+
+**Line 1:** `auth [success=1 default=ignore] pam_unix.so nullok`
+- `pam_unix.so` checks the password against `/etc/shadow`
+- `nullok` allows empty passwords (remove this on hardened systems)
+- `[success=1 default=ignore]` — if password is correct, skip the next 1 module (`pam_deny.so`) and land on `pam_permit.so` (success). If wrong, `ignore` — continue to next module.
+
+**Line 2:** `auth requisite pam_deny.so`
+- Always returns failure
+- Reached only if `pam_unix.so` failed — causes immediate failure
+- The `requisite` stops the stack immediately
+
+**Line 3:** `auth required pam_permit.so`
+- Always returns success
+- Reached only by the `success=1` skip from `pam_unix.so`
+- Marks the overall auth as successful
+
+**Line 4:** `auth optional pam_cap.so`
+- Sets POSIX capabilities for the session
+- `optional` — if it fails (e.g. not installed), auth still succeeds
+
+This design means: correct password → skip deny → hit permit → success. Wrong password → hit deny → immediate failure.
+
+### Adding modules safely
+
+When adding modules to `common-auth`, the skip counts matter:
+
+```
+auth    required                    pam_faillock.so preauth     ← NEW: check lockout
+auth    [success=1 default=ignore]  pam_unix.so nullok          ← existing (skip=1)
+auth    [default=die]               pam_faillock.so authfail    ← NEW: record failure
+auth    requisite                   pam_deny.so                 ← existing
+auth    required                    pam_permit.so               ← existing
+auth    sufficient                  pam_faillock.so authsucc    ← NEW: record success
+auth    optional                    pam_cap.so                  ← existing
+```
+
+The `success=1` on `pam_unix.so` still skips exactly one module — `pam_faillock authfail` — and lands on `pam_deny.so`. Wait, that is wrong. After adding `pam_faillock authfail`, the skip needs to jump over it:
+
+```
+auth    [success=2 default=ignore]  pam_unix.so nullok          ← skip=2 now
+auth    [default=die]               pam_faillock.so authfail
+auth    requisite                   pam_deny.so
+```
+
+**This is the most common PAM misconfiguration:** adding a module without updating the skip counts of modules before it. Always count the modules after `pam_unix.so` up to and including `pam_deny.so` and set `success=N` accordingly.
+
+---
+
+## 5. pam_unix — The Core Auth Module
+
+`pam_unix.so` is the workhorse of PAM on Debian. It handles traditional Unix authentication against `/etc/passwd` and `/etc/shadow`.
+
+### Important options
+
+```
+auth    required    pam_unix.so nullok try_first_pass sha512 shadow
+```
+
+| Option | Effect |
+|--------|--------|
+| `nullok` | Allow empty passwords — remove on production systems |
+| `try_first_pass` | Use the password already gathered by a previous module (avoids double prompt) |
+| `use_first_pass` | Like `try_first_pass` but fails if no password was gathered |
+| `sha512` | Use SHA-512 for password hashing (Debian 11+ default) |
+| `shadow` | Read hashes from `/etc/shadow` (required for non-root PAM) |
+| `audit` | Log failed attempts including the username |
+| `nodelay` | Remove the artificial delay on failed auth (default adds a 1-second delay) |
+| `remember=N` | Remember last N passwords (used with `pam_pwhistory`) |
+
+### Check the current password hashing algorithm
+
+```bash
+sudo grep "^ENCRYPT_METHOD" /etc/login.defs
+```
+
+On Debian 12, the default should be `yescrypt` — a modern memory-hard algorithm that is more resistant to GPU cracking than SHA-512. Verify it:
+
+```bash
+# Check what algorithm is used for a user's hash
+sudo getent shadow alice | cut -d: -f2 | cut -c1-4
+```
+
+| Prefix | Algorithm |
+|--------|-----------|
+| `$1$` | MD5 — never use |
+| `$5$` | SHA-256 — acceptable |
+| `$6$` | SHA-512 — good |
+| `$y$` | yescrypt — best, Debian 12 default |
+
+---
+
+## 6. pam_limits — Resource Limits per User and Group
+
+`pam_limits.so` applies resource limits from `/etc/security/limits.conf` to every session. This is how you prevent a single user or process from consuming all system resources.
+
+```bash
+sudo nano /etc/security/limits.conf
+```
+
+```bash
+# Format: <domain> <type> <item> <value>
+
+# Limit all users to max 100 processes
+*               hard    nproc           100
+
+# Limit the deploy user to 50 processes
+deploy          hard    nproc           50
+
+# Limit the www-data group to 200 open files
+@www-data       soft    nofile          200
+@www-data       hard    nofile          1000
+
+# Give the admin group unlimited file descriptors
+@admins         soft    nofile          unlimited
+@admins         hard    nofile          unlimited
+
+# Prevent core dumps for all users (security — core dumps can contain secrets)
+*               hard    core            0
+
+# Limit maximum file size a user can create (in KB) — 0 means no limit
+*               hard    fsize           unlimited
+
+# Limit memory lock (for applications that pin memory)
+*               hard    memlock         64
+
+# Limit maximum number of logins for a user
+alice           -       maxlogins       3
+```
+
+### Domain syntax
+
+| Domain | Matches |
+|--------|---------|
+| `*` | All users |
+| `alice` | Specific user |
+| `@sysadmins` | All members of the group |
+| `%sysadmins` | All members (alternative syntax) |
+
+### Type: soft vs hard
+
+- **soft** — default limit, the user can raise it up to the hard limit with `ulimit`
+- **hard** — ceiling the user cannot exceed, even as root (unless they are root)
+- **-** — set both soft and hard to the same value
+
+### Verify limits for a session
+
+```bash
+# Current limits for your session
+ulimit -a
+
+# Limits as seen by a running process
+cat /proc/$(pgrep -u alice bash | head -1)/limits
+```
+
+### Common security-focused limits
+
+```bash
+# Prevent core dumps system-wide (they can expose memory contents)
+*       hard    core        0
+
+# Prevent fork bombs
+*       hard    nproc       500
+
+# Limit file descriptors (default 1024 is often too low for production apps)
+*       soft    nofile      4096
+*       hard    nofile      65536
+```
+
+---
+
+## 7. pam_access — Login Access Control
+
+`pam_access.so` controls which users can log in from which hosts or terminals, independently of password correctness. A user can have valid credentials and still be rejected by `pam_access`.
+
+```bash
+sudo nano /etc/security/access.conf
+```
+
+```bash
+# Format: permission : users/groups : origins
+# + = allow, - = deny
+
+# Allow root only from console (tty1-tty6)
++ : root : LOCAL
+
+# Allow the admin group from the internal network and localhost
++ : @admins : 10.0.0.0/8 127.0.0.1
+
+# Allow alice from anywhere
++ : alice : ALL
+
+# Allow the deploy user only from the CI server
++ : deploy : 10.0.5.100
+
+# Deny everyone else
+- : ALL : ALL
+```
+
+### Origins syntax
+
+| Origin | Matches |
+|--------|---------|
+| `ALL` | Any origin |
+| `LOCAL` | Local terminals (console) |
+| `192.168.1.0/24` | CIDR network |
+| `192.168.1.10` | Specific IP |
+| `*.example.com` | Hostname pattern |
+| `tty1` | Specific terminal |
+
+Enable `pam_access` in `/etc/pam.d/common-account`:
+
+```bash
+sudo nano /etc/pam.d/common-account
+```
+
+```
+account required pam_access.so
+```
+
+:::tip
+`pam_access` is evaluated in the `account` group, not `auth`. This means it runs after authentication — the user proves who they are, then PAM checks if they are allowed in from this location. For SSH specifically, combining `pam_access` with `AllowUsers`/`AllowGroups` in `sshd_config` gives you two independent layers.
+:::
+
+---
+
+## 8. pam_time — Time-Based Login Restrictions
+
+`pam_time.so` restricts when users can log in — by service, terminal, username, and time of day.
+
+```bash
+sudo nano /etc/security/time.conf
+```
+
+```bash
+# Format: services;ttys;users;times
+# Wildcards: * = all, ! = not
+# Times: day+HHMM-HHMM (Mo Tu We Th Fr Sa Su Wk Wd Al)
+
+# Allow the deploy user to SSH only during business hours (Mon-Fri 08:00-18:00)
+sshd;*;deploy;Wk0800-1800
+
+# Deny console login for all users outside business hours
+login;tty*;!root;!Wk0800-1800
+
+# Allow admins SSH access at any time
+sshd;*;@admins;Al0000-2400
+
+# Deny all users except root from logging in on weekends
+login;*;!root;!Wd0000-2400
+```
+
+Enable in `/etc/pam.d/sshd` or `common-account`:
+
+```
+account required pam_time.so
+```
+
+---
+
+## 9. pam_env — Environment Variables at Login
+
+`pam_env.so` sets environment variables during PAM session setup. This runs before the shell starts, so variables set here are available in all login sessions.
+
+```bash
+# System-wide environment (all users)
+sudo nano /etc/environment
+
+# PAM-specific environment (more control)
+sudo nano /etc/security/pam_env.conf
+```
+
+```bash
+# /etc/security/pam_env.conf format:
+# VARIABLE   [DEFAULT=value] [OVERRIDE=value]
+
+# Set PATH for all users
+PATH    DEFAULT=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+# Set EDITOR to vim for all users
+EDITOR  DEFAULT=vim
+
+# Set UMASK — affects default file permissions
+# (Also set in /etc/login.defs for broader coverage)
+UMASK   DEFAULT=0027
+
+# Set timezone
+TZ      DEFAULT=Europe/Amsterdam
+```
+
+The difference between `DEFAULT` and `OVERRIDE`:
+- `DEFAULT` — used only if the variable is not already set in the environment
+- `OVERRIDE` — always set this value, overriding anything already set
+
+---
+
+## 10. pam_loginuid — Audit Trail Integrity
+
+`pam_loginuid.so` sets the `loginuid` kernel attribute on the process. This is the UID of the user who logged in — it cannot be changed by the process, even if it later becomes root via `sudo` or `su`.
+
+```bash
+# Check the loginuid of your own session
+cat /proc/self/loginuid
+```
+
+This is what allows the audit subsystem to track "root did X, but the original login was alice." Without `pam_loginuid`, all root actions look identical in audit logs regardless of who originally logged in.
+
+It is in `/etc/pam.d/common-session` by default:
+
+```
+session required pam_loginuid.so
+```
+
+**Do not remove this.** It is critical for audit trail integrity on systems where multiple users can become root.
+
+---
+
+## 11. pam_namespace — Per-User Private Temp Directories
+
+Most administrators have never heard of `pam_namespace.so`, but it solves a real security problem: `/tmp` is shared between all users. A process running as `alice` can create files in `/tmp` that a process running as `bob` might accidentally open. This is the root cause of symlink attacks and temp file races.
+
+`pam_namespace.so` gives each user a private `/tmp` that is invisible to other users.
+
+```bash
+sudo nano /etc/security/namespace.conf
+```
+
+```bash
+# Format: mountpoint  instance_dir  method  users_to_skip
+
+# Give each user a private /tmp
+/tmp        /tmp-inst/          user        root
+
+# Give each user a private /var/tmp  
+/var/tmp    /var/tmp-inst/      user        root
+```
+
+Enable in `/etc/pam.d/common-session`:
+
+```
+session required pam_namespace.so
+```
+
+Create the instance directories:
+
+```bash
+sudo mkdir /tmp-inst /var/tmp-inst
+sudo chmod 000 /tmp-inst /var/tmp-inst
+```
+
+With `method=user`, each user gets their own directory under `/tmp-inst/<username>/`. It is bind-mounted over `/tmp` for their session. When they log out, it is unmounted. Other users cannot see it.
+
+---
+
+## 12. pam_exec — Run Arbitrary Scripts on Auth Events
+
+`pam_exec.so` runs an external command at any point in the PAM stack. This is PAM's escape hatch — when no existing module does what you need, write a script.
+
+```bash
+# Run a script after successful login
+session optional pam_exec.so /usr/local/bin/on-login.sh
+
+# Run a script on auth failure (useful for alerting)
+auth optional pam_exec.so /usr/local/bin/on-auth-failure.sh
+
+# Run with the PAM environment exposed to the script
+auth optional pam_exec.so expose_authtok /usr/local/bin/check-token.sh
+```
+
+Example — send a Slack alert on any root login:
+
+```bash
+#!/bin/bash
+# /usr/local/bin/on-login.sh
+
+if [[ "$PAM_USER" == "root" ]]; then
+  MESSAGE="Root login: user=${PAM_RUSER} from=${PAM_RHOST} tty=${PAM_TTY} at=$(date)"
+  curl -s -X POST -H 'Content-type: application/json' \
+    --data "{\"text\":\"${MESSAGE}\"}" \
+    https://hooks.slack.com/services/YOUR/SLACK/WEBHOOK
+fi
+```
+
+```bash
+sudo chmod 755 /usr/local/bin/on-login.sh
+```
+
+PAM environment variables available to the script:
+
+| Variable | Value |
+|----------|-------|
+| `PAM_USER` | Username being authenticated |
+| `PAM_RUSER` | Remote user (who initiated) |
+| `PAM_RHOST` | Remote host/IP |
+| `PAM_TTY` | Terminal |
+| `PAM_SERVICE` | PAM service name (sshd, sudo, login) |
+| `PAM_TYPE` | Module type (auth, session, etc.) |
+
+---
+
+## 13. pam-auth-update — Managing Modules on Debian
+
+Debian provides `pam-auth-update` to manage PAM module registration in the shared stacks without manually editing files. Modules installed via `apt` register themselves here.
+
+```bash
+# View and toggle installed PAM modules
+sudo pam-auth-update
+```
+
+This opens an interactive menu showing which PAM modules are active in the shared stacks. Check/uncheck to enable/disable.
+
+```bash
+# Non-interactive — enable specific profiles
+sudo pam-auth-update --enable mkhomedir
+sudo pam-auth-update --enable pwquality
+
+# Disable a profile
+sudo pam-auth-update --disable faillock
+```
+
+**Important:** `pam-auth-update` manages the `common-*` files. If you manually edit those files, running `pam-auth-update` again may overwrite your changes. Either use `pam-auth-update` exclusively, or add your custom modules to service-specific files (`/etc/pam.d/sshd`, `/etc/pam.d/sudo`) instead of the shared ones.
+
+---
+
+## 14. Debugging PAM
+
+PAM failures can be opaque. These tools help.
+
+### Enable PAM debug logging
+
+Add `debug` to any module temporarily:
+
+```bash
+auth required pam_unix.so debug
+```
+
+This writes detailed module output to `/var/log/auth.log` or journald.
+
+### pamtester — Test PAM stacks without logging in
+
+```bash
+sudo apt install pamtester
+```
+
+```bash
+# Test the sshd PAM stack for a specific user
+sudo pamtester -v sshd alice authenticate
+
+# Test the sudo PAM stack
+sudo pamtester -v sudo alice authenticate acct_mgmt
+
+# Test session setup
+sudo pamtester -v sshd alice open_session
+```
+
+`pamtester` runs the PAM stack for a service and user without actually establishing a session. It shows which modules ran, their results, and the final outcome — invaluable for testing changes before they affect real logins.
+
+### Read PAM logs
+
+```bash
+# Real-time PAM events
+sudo journalctl -f | grep -i pam
+
+# All auth events for a specific user
+sudo journalctl | grep "alice" | grep -i "pam\|auth\|session"
+
+# Failed PAM events only
+sudo journalctl | grep "pam_unix.*failure\|pam_google.*Invalid\|pam_faillock.*Consecutive"
+```
+
+### Check module availability
+
+```bash
+# List all installed PAM modules
+ls /lib/*/security/pam_*.so /lib/security/pam_*.so 2>/dev/null
+
+# Check if a specific module is installed
+find /lib -name "pam_google_authenticator.so" 2>/dev/null
+```
+
+---
+
+## 15. Safe Editing Workflow
+
+PAM misconfigurations are dangerous. Follow this workflow every time:
+
+```bash
+# 1. Open a root session that will not be affected by SSH PAM changes
+sudo -i
+# Keep this terminal open for the entire process
+
+# 2. Back up the file you are editing
+sudo cp /etc/pam.d/common-auth /etc/pam.d/common-auth.bak
+
+# 3. Make your changes
+sudo nano /etc/pam.d/common-auth
+
+# 4. Test with pamtester before trying a real login
+sudo pamtester -v sshd testuser authenticate
+
+# 5. Open a new SSH session to test — do not close the root session yet
+ssh alice@localhost
+
+# 6. Only close the root session after confirming the new session works
+```
+
+Restore from backup if something breaks:
+
+```bash
+sudo cp /etc/pam.d/common-auth.bak /etc/pam.d/common-auth
+```
+
+---
+
+## Troubleshooting
+
+| Problem | Cause | Fix |
+|---------|-------|-----|
+| Everyone locked out after PAM change | Wrong skip count in `[success=N]` | Restore from backup via console, recount modules |
+| Auth succeeds but session fails | Broken `session` module | Check `common-session`, test with `pamtester open_session` |
+| `pam_unix.so` ignoring password | `try_first_pass` picking up wrong token | Check module order, ensure password is gathered before `pam_unix` |
+| PAM changes not taking effect | `pam-auth-update` overwrote edits | Add customizations to service-specific files, not `common-*` |
+| Module not found error | `.so` not installed | `find /lib -name "pam_<name>.so"`, install missing package |
+| Limits not applying | `pam_limits` not in `common-session` | Add `session required pam_limits.so` |
+| `pamtester` auth fails but real login works | `pamtester` runs as different user | Run `pamtester` with `sudo` to match real auth context |
+
+Always check the raw logs first:
+
+```bash
+sudo journalctl -u ssh --since "5 minutes ago" | grep -i pam
+```
+
+---
+
+## Related Topics
+
+- [Multi-Factor Authentication](/linux/debian/security/authentication/multi-factor-authentication/) — Using PAM for TOTP and MFA
+- [Brute-Force Protection](/linux/debian/security/authentication/brute-force-protection/) — pam_faillock integration
+- [Password Policies](/linux/debian/security/authentication/password-policies/) — pam_pwquality and pam_pwhistory
+- [SSH Hardening](/linux/debian/security/authentication/ssh-hardening/) — How SSH interacts with PAM
+
+---
+
+*PAM is the one system where a misplaced line can lock out every user on the machine. Understand the stack before you edit it, test with `pamtester` before you rely on it, and always keep a console session open until you are certain it works.*

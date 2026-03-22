@@ -1,0 +1,672 @@
+---
+sidebar_position: 6
+title: "Password Policies | Authentication"
+sidebar_label: "Password Policies"
+description: "Deep-dive password policies on Debian - pam_pwquality, pam_pwhistory, password aging with chage, shadow file internals, auditing weak credentials, and enforcing policies without locking users out."
+keywords:
+  - "debian password policy"
+  - "pam_pwquality debian"
+  - "debian password complexity"
+  - "chage debian"
+  - "password aging debian"
+  - "pam_pwhistory debian"
+  - "debian shadow file"
+  - "debian enforce password policy"
+tags:
+  - debian
+  - passwords
+  - pam
+  - security
+  - authentication
+slug: /linux/debian/security/authentication/password-policies
+hide_table_of_contents: true
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+# Password Policies
+
+Most servers should use SSH keys and disable passwords entirely. But not every system, service account, or user can live without passwords — and when passwords exist, they need to be managed. This guide covers how Debian stores passwords, how to enforce complexity and history rules, how aging works at the shadow file level, and how to audit existing credentials without disrupting users who are doing the right thing.
+
+:::info Prerequisites
+- Debian 11 (Bullseye) or Debian 12 (Bookworm)
+- Understanding of PAM basics — see [PAM Configuration](/linux/debian/security/authentication/pam-configuration/)
+- Root or `sudo` access
+:::
+
+:::tip Before enforcing password policies
+If SSH key authentication is enabled and working, consider disabling password authentication entirely instead of hardening it. A strong password policy is second-best to no password authentication at all. See [SSH Hardening](/linux/debian/security/authentication/ssh-hardening/).
+:::
+
+---
+
+## 1. How Debian Stores Passwords
+
+Before enforcing policies, understand what you are actually protecting.
+
+Passwords are not stored in plaintext anywhere on a modern Debian system. The storage chain:
+
+```
+/etc/passwd  ←── world-readable, contains usernames, UIDs, shells
+                  password field is 'x' — actual hash is elsewhere
+
+/etc/shadow  ←── root-readable only, contains the actual password hashes
+                  and aging parameters
+```
+
+### Reading /etc/shadow
+
+```bash
+sudo cat /etc/shadow | grep alice
+```
+
+```
+alice:$y$j9T$abc123...:19900:0:99999:7:::
+```
+
+Nine colon-separated fields:
+
+| Field | Value | Meaning |
+|-------|-------|---------|
+| 1 | `alice` | Username |
+| 2 | `$y$j9T$abc123...` | Password hash |
+| 3 | `19900` | Days since epoch of last password change |
+| 4 | `0` | Minimum days before password can be changed |
+| 5 | `99999` | Maximum days before password must be changed |
+| 6 | `7` | Days before expiry to warn user |
+| 7 | *(empty)* | Days after expiry until account disabled |
+| 8 | *(empty)* | Days since epoch when account expires absolutely |
+| 9 | *(empty)* | Reserved |
+
+### Password hash format
+
+The hash field `$y$j9T$abc123...` is structured:
+
+```
+$y$        ←── algorithm identifier
+j9T        ←── parameters (cost factor for yescrypt)
+abc123...  ←── salt + hash
+```
+
+| Identifier | Algorithm | Status |
+|-----------|-----------|--------|
+| `$1$` | MD5 | Broken — never use |
+| `$5$` | SHA-256 | Acceptable |
+| `$6$` | SHA-512 | Good |
+| `$y$` | yescrypt | Best — Debian 12 default |
+| `$2b$` | bcrypt | Good — not default on Debian |
+| `!` or `*` | No password | Account locked / service account |
+| `!!` | Never set | Password was never configured |
+
+### Check which algorithm is in use
+
+```bash
+# Check the configured default
+sudo grep "^ENCRYPT_METHOD\|^YESCRYPT_COST_FACTOR" /etc/login.defs
+
+# Check what algorithm an existing hash uses
+sudo getent shadow alice | cut -d: -f2 | grep -oP '^\$[^$]+'
+```
+
+### Set the default hashing algorithm
+
+```bash
+sudo nano /etc/login.defs
+```
+
+```bash
+# Use yescrypt (Debian 12 default — memory-hard, GPU-resistant)
+ENCRYPT_METHOD YESCRYPT
+
+# Cost factor — higher = slower to crack
+# J = 10 is approximately equivalent to bcrypt cost 10
+YESCRYPT_COST_FACTOR 5
+```
+
+yescrypt is memory-hard — cracking it requires large amounts of RAM per attempt, which limits GPU-based cracking attacks far more effectively than SHA-512.
+
+---
+
+## 2. pam_pwquality — Password Complexity
+
+`pam_pwquality` enforces password complexity rules when a user changes their password. It replaces the older `pam_cracklib`.
+
+```bash
+sudo apt install libpam-pwquality
+```
+
+### Configure pwquality
+
+```bash
+sudo nano /etc/security/pwquality.conf
+```
+
+```bash
+# Minimum password length
+minlen = 14
+
+# Minimum number of character classes required
+# Classes: uppercase, lowercase, digits, other (symbols)
+minclass = 3
+
+# Require at least N uppercase characters
+ucredit = -1
+
+# Require at least N lowercase characters
+lcredit = -1
+
+# Require at least N digits
+dcredit = -1
+
+# Require at least N other (symbol) characters
+ocredit = -1
+
+# Maximum number of repeated characters (e.g. 'aaa')
+maxrepeat = 3
+
+# Maximum number of same characters in a sequence (e.g. 'abc', '123')
+maxsequence = 3
+
+# Maximum number of characters from the previous password that can appear
+maxclassdiff = 0
+
+# Reject passwords containing the username
+usercheck = 1
+
+# Reject passwords found in a dictionary
+# (requires cracklib-runtime)
+dictcheck = 1
+
+# Number of attempts before giving up
+retry = 3
+
+# Reject if the password is a rotated version of the old one
+gecoscheck = 1
+
+# Enforce even for root
+enforce_for_root
+```
+
+### Understanding the credit system
+
+The `ucredit`, `lcredit`, `dcredit`, `ocredit` values are confusing because they work differently based on sign:
+
+- **Negative value** (`-1`): require at least this many characters of this class
+- **Positive value** (`+1`): allow up to this many characters of this class to contribute to `minlen` as bonus credit
+
+So `-1` means "require at least 1" and `+1` means "1 character of this class counts as extra length." Negative values are the strict enforcement mode. Positive values are the older lenient mode that most guides copy without explaining.
+
+```bash
+# Strict: require at least 2 uppercase, 2 lowercase, 1 digit, 1 symbol
+ucredit = -2
+lcredit = -2
+dcredit = -1
+ocredit = -1
+```
+
+### Wire pam_pwquality into PAM
+
+Add to `/etc/pam.d/common-password`, before `pam_unix.so`:
+
+```bash
+sudo nano /etc/pam.d/common-password
+```
+
+```
+# Enforce complexity before accepting the new password
+password        requisite       pam_pwquality.so retry=3
+
+# Store the new password
+password        [success=1 default=ignore]      pam_unix.so obscure use_authtok try_first_pass yescrypt
+
+password        requisite                       pam_deny.so
+password        required                        pam_permit.so
+```
+
+`use_authtok` tells `pam_unix.so` to use the password that `pam_pwquality.so` already gathered, instead of asking again.
+
+### Test pwquality without changing anything
+
+```bash
+# Test a password against the policy without actually setting it
+echo "testpassword" | pwscore
+
+# Check a specific password's quality score (0-100)
+pwscore <<< "MyStr0ng!Pass#2024"
+```
+
+`pwscore` returns a score from 0 to 100. Scores below 25 are weak, 50–74 are good, 75+ are very strong. The score is informational — the actual acceptance depends on your `pwquality.conf` settings.
+
+---
+
+## 3. pam_pwhistory — Prevent Password Reuse
+
+`pam_pwhistory` remembers previous passwords and rejects reuse. Without this, users required to change their password quarterly will just cycle through the same two passwords.
+
+```bash
+sudo nano /etc/pam.d/common-password
+```
+
+Add `pam_pwhistory.so` before `pam_unix.so`:
+
+```
+password        requisite       pam_pwquality.so retry=3
+password        required        pam_pwhistory.so remember=12 use_authtok
+password        [success=1 default=ignore]      pam_unix.so obscure use_authtok try_first_pass yescrypt
+password        requisite       pam_deny.so
+password        required        pam_permit.so
+```
+
+`remember=12` keeps the last 12 passwords. Attempting to reuse any of them fails with:
+
+```
+Password has been already used. Choose another.
+```
+
+### Where password history is stored
+
+```bash
+# Password history is stored here (root-readable only)
+sudo cat /etc/security/opasswd
+```
+
+```
+alice:1000:5:$6$salt$hash1,$6$salt$hash2,$6$salt$hash3
+```
+
+Each user has one line containing their last N password hashes. The file must exist and be writable:
+
+```bash
+sudo touch /etc/security/opasswd
+sudo chmod 600 /etc/security/opasswd
+sudo chown root:root /etc/security/opasswd
+```
+
+### Clear password history for a user
+
+If a user needs to reset to a known password during recovery:
+
+```bash
+# Remove the user's history entries
+sudo sed -i '/^alice:/d' /etc/security/opasswd
+```
+
+---
+
+## 4. Password Aging with chage
+
+`chage` (change age) reads and writes the aging fields in `/etc/shadow`. It is the right tool for setting expiry policies — editing `/etc/shadow` directly is error-prone and bypasses validation.
+
+### View aging settings for a user
+
+```bash
+sudo chage -l alice
+```
+
+```
+Last password change                                    : Jan 15, 2024
+Password expires                                        : Apr 15, 2024
+Password inactive                                       : never
+Account expires                                         : never
+Minimum number of days between password change          : 7
+Maximum number of days between password change          : 90
+Number of days of warning before password expires       : 14
+```
+
+### Set aging policies
+
+```bash
+# Maximum password age: 90 days
+sudo chage -M 90 alice
+
+# Minimum password age: 7 days (prevents immediate reuse cycling)
+sudo chage -m 7 alice
+
+# Warn user 14 days before expiry
+sudo chage -W 14 alice
+
+# Disable account 30 days after password expires (inactive period)
+sudo chage -I 30 alice
+
+# Force password change on next login
+sudo chage -d 0 alice
+
+# Set absolute account expiry date
+sudo chage -E 2024-12-31 alice
+
+# Remove account expiry
+sudo chage -E -1 alice
+```
+
+### Set aging defaults for new users
+
+New user aging defaults live in `/etc/login.defs`:
+
+```bash
+sudo nano /etc/login.defs
+```
+
+```bash
+# Maximum password age (days)
+PASS_MAX_DAYS   90
+
+# Minimum password age (days) — prevents immediate re-change to cycle past history
+PASS_MIN_DAYS   7
+
+# Warning period before expiry (days)
+PASS_WARN_AGE   14
+```
+
+These apply to users created with `adduser` or `useradd` after the change. Existing users are not affected — use `chage` to update them.
+
+### Apply aging settings to all existing users
+
+```bash
+# Apply 90-day max age, 7-day min age, 14-day warning to all human users
+for user in $(awk -F: '$3 >= 1000 && $1 != "nobody" {print $1}' /etc/passwd); do
+  sudo chage -M 90 -m 7 -W 14 "$user"
+  echo "Updated: $user"
+done
+```
+
+### Understanding minimum password age
+
+`PASS_MIN_DAYS` (the minimum age before a password can be changed again) seems counterintuitive — why prevent users from changing their password? Without it, a user forced to change their password could immediately change it 12 more times to exhaust the history, then set it back to the original. A minimum age of 7 days prevents this cycling.
+
+---
+
+## 5. Locking and Unlocking Accounts
+
+### Lock an account immediately
+
+```bash
+# Lock — prepends ! to the password hash in /etc/shadow
+sudo usermod -L alice
+
+# Verify — the hash now starts with !
+sudo getent shadow alice | cut -d: -f2 | head -c1
+```
+
+A locked account cannot authenticate with a password. SSH key authentication is **not** affected by `usermod -L` — the user can still log in with a key. To fully block access:
+
+```bash
+# Lock password AND expire the account
+sudo usermod -L -e 1 alice
+```
+
+Setting expiry to day `1` (January 2, 1970) immediately expires the account, blocking both password and key-based SSH login.
+
+### Unlock an account
+
+```bash
+sudo usermod -U alice
+
+# Also reset expiry if it was set
+sudo chage -E -1 alice
+```
+
+### Expire a password without locking
+
+Force a password change on next login without locking the account:
+
+```bash
+sudo chage -d 0 alice
+```
+
+The next login succeeds with the current password, but PAM immediately prompts for a new one before allowing shell access.
+
+### Disable login without locking (service accounts)
+
+For service accounts that should never have interactive logins:
+
+```bash
+# Set shell to nologin
+sudo usermod -s /usr/sbin/nologin serviceaccount
+
+# Or set shell to false
+sudo usermod -s /bin/false serviceaccount
+```
+
+`/usr/sbin/nologin` prints a message ("This account is currently not available") and exits. `/bin/false` exits silently with failure. Either prevents interactive logins while still allowing the account to own files and run processes.
+
+---
+
+## 6. Auditing Existing Passwords
+
+Enforcing policies going forward is only half the work. Existing accounts may already have weak, expired, or never-set passwords.
+
+### Find accounts with no password
+
+```bash
+# Accounts with empty password field (can log in with no password)
+sudo awk -F: '($2 == "" || $2 == " ") {print $1}' /etc/shadow
+```
+
+### Find accounts with never-set passwords
+
+```bash
+# Accounts that were created but never had a password set (!!)
+sudo awk -F: '$2 ~ /^!!/ {print $1}' /etc/shadow
+```
+
+These are typically newly created accounts or service accounts. Verify each one is intentional.
+
+### Find accounts with no password expiry
+
+```bash
+# Accounts where max password age is 99999 (effectively never expires)
+sudo awk -F: '$5 == 99999 || $5 == "" {print $1}' /etc/shadow
+```
+
+### Find accounts with expired passwords
+
+```bash
+# Accounts where the password has already expired
+sudo chage -l $(cut -d: -f1 /etc/shadow | head -1) 2>/dev/null
+# For all users:
+for user in $(awk -F: '$3 >= 1000 {print $1}' /etc/passwd); do
+  expiry=$(sudo chage -l "$user" 2>/dev/null | grep "Password expires" | cut -d: -f2)
+  echo "$user: $expiry"
+done
+```
+
+### Find accounts with locked passwords but active keys
+
+```bash
+# Users with locked passwords (!) who still have authorized_keys
+for user in $(awk -F: '$3 >= 1000 {print $1}' /etc/passwd); do
+  shadow=$(sudo getent shadow "$user" | cut -d: -f2)
+  keyfile="/home/$user/.ssh/authorized_keys"
+  if [[ "$shadow" == !* ]] && [[ -f "$keyfile" ]] && [[ -s "$keyfile" ]]; then
+    echo "Locked password but active SSH keys: $user"
+  fi
+done
+```
+
+This is important — locking a password does not revoke SSH key access. A "locked" account with valid keys is still accessible.
+
+### Check password hash algorithms in use
+
+```bash
+# Find accounts still using MD5 or SHA-256 (should be yescrypt or SHA-512)
+sudo awk -F: '
+  $2 ~ /^\$1\$/ { print $1, "MD5 — CRITICAL" }
+  $2 ~ /^\$5\$/ { print $1, "SHA-256 — upgrade" }
+  $2 ~ /^\$6\$/ { print $1, "SHA-512 — acceptable" }
+  $2 ~ /^\$y\$/ { print $1, "yescrypt — good" }
+' /etc/shadow
+```
+
+Users with old hash algorithms need to change their password — the hash upgrades automatically on next change.
+
+### Full password audit report
+
+```bash
+#!/bin/bash
+# /usr/local/bin/password-audit.sh
+
+echo "=== Password Audit Report: $(date) ==="
+echo ""
+
+echo "--- Accounts with no password ---"
+sudo awk -F: '($2 == "" || $2 == " ") {print "  " $1}' /etc/shadow
+
+echo ""
+echo "--- Accounts with never-set password (!!)"
+sudo awk -F: '$2 ~ /^!!/ {print "  " $1}' /etc/shadow
+
+echo ""
+echo "--- Accounts with no expiry (99999 days) ---"
+sudo awk -F: '$5 == 99999 || $5 == "" {print "  " $1}' /etc/shadow
+
+echo ""
+echo "--- Password hash algorithms in use ---"
+sudo awk -F: '
+  $2 ~ /^\$1\$/ { print "  MD5 (CRITICAL):    " $1 }
+  $2 ~ /^\$5\$/ { print "  SHA-256 (upgrade): " $1 }
+  $2 ~ /^\$6\$/ { print "  SHA-512 (ok):      " $1 }
+  $2 ~ /^\$y\$/ { print "  yescrypt (best):   " $1 }
+  $2 ~ /^!!/    { print "  Never set:         " $1 }
+  $2 ~ /^!/     { print "  Locked:            " $1 }
+' /etc/shadow
+
+echo ""
+echo "--- Aging settings for human users ---"
+for user in $(awk -F: '$3 >= 1000 && $3 < 65534 {print $1}' /etc/passwd); do
+  sudo chage -l "$user" 2>/dev/null | grep -E "expires|minimum|maximum" | \
+    sed "s/^/  [$user] /"
+done
+```
+
+```bash
+sudo chmod 750 /usr/local/bin/password-audit.sh
+sudo /usr/local/bin/password-audit.sh
+```
+
+---
+
+## 7. System-Wide Defaults in login.defs
+
+`/etc/login.defs` is the central configuration file for shadow password utilities. Settings here affect `useradd`, `adduser`, `chage`, `passwd`, and related tools.
+
+```bash
+sudo nano /etc/login.defs
+```
+
+```bash
+# ─── Password Aging ───────────────────────────────────────────────────────────
+PASS_MAX_DAYS   90          # Maximum password age
+PASS_MIN_DAYS   7           # Minimum age before change allowed
+PASS_WARN_AGE   14          # Days to warn before expiry
+
+# ─── Password Hashing ─────────────────────────────────────────────────────────
+ENCRYPT_METHOD  YESCRYPT    # Hashing algorithm
+YESCRYPT_COST_FACTOR 5      # Cost factor (higher = slower to crack)
+
+# ─── UID/GID Ranges ───────────────────────────────────────────────────────────
+UID_MIN         1000        # First UID for human users
+UID_MAX         60000
+GID_MIN         1000
+GID_MAX         60000
+SYS_UID_MIN     100         # System account range
+SYS_UID_MAX     999
+
+# ─── Home Directories ─────────────────────────────────────────────────────────
+CREATE_HOME     yes         # Create home directory by default
+UMASK           077         # Restrictive default permissions (owner only)
+
+# ─── Login Behavior ───────────────────────────────────────────────────────────
+LOGIN_RETRIES   3           # Attempts before connection closes
+LOGIN_TIMEOUT   60          # Seconds to complete login
+
+# ─── su Behavior ──────────────────────────────────────────────────────────────
+SULOG_FILE      /var/log/sulog   # Log all su attempts
+SU_NAME         su
+```
+
+### UMASK 077 vs 022
+
+The `UMASK` in `login.defs` sets the default file creation mask for new user home directories.
+
+- `022` — new files are `644` (world-readable), directories are `755` (world-accessible) — Debian default
+- `077` — new files are `600` (owner only), directories are `700` (owner only) — recommended for security
+
+With `077`, a user's files are private by default. With `022`, anyone on the system can read any user's files. On multi-user servers, `077` is the correct choice.
+
+Note: `UMASK` in `login.defs` only affects new home directory creation. For session umask, use `pam_umask.so` or set it in `/etc/profile`.
+
+---
+
+## 8. Forcing Password Changes for Existing Users
+
+After changing policies, you need to bring existing accounts into compliance without a hard lockout.
+
+### Gradual rollout — warn first, expire later
+
+```bash
+# Phase 1: Warn all users their password expires in 14 days
+for user in $(awk -F: '$3 >= 1000 && $3 < 65534 {print $1}' /etc/passwd); do
+  sudo chage -W 14 "$user"
+  # Set expiry 30 days from now (gives time to comply)
+  sudo chage -M 30 "$user"
+  echo "Configured: $user"
+done
+```
+
+```bash
+# Phase 2 (after 30 days): verify compliance
+for user in $(awk -F: '$3 >= 1000 && $3 < 65534 {print $1}' /etc/passwd); do
+  last_change=$(sudo chage -l "$user" | grep "Last password change" | cut -d: -f2 | xargs)
+  echo "$user: $last_change"
+done
+```
+
+### Force immediate change on next login for specific users
+
+```bash
+sudo chage -d 0 alice
+sudo chage -d 0 bob
+```
+
+The user can still log in — but PAM intercepts the session before giving shell access and requires an immediate password change. They cannot skip it.
+
+---
+
+## Troubleshooting
+
+| Problem | Cause | Fix |
+|---------|-------|-----|
+| Password rejected despite meeting requirements | `pam_pwhistory` blocking reuse | Check `/etc/security/opasswd`, clear history if needed |
+| `pwquality.conf` changes not taking effect | PAM not loading `pam_pwquality` | Verify it is in `common-password` with `pamtester` |
+| Positive credit values not enforcing minimums | `ucredit = +1` is lenient mode | Use negative values: `ucredit = -1` |
+| User forced to change password on every login | `chage -d 0` set without max age | Set `chage -d $(date +%s -d today)/86400 alice` to reset last-change to today |
+| `opasswd` errors when setting password | File missing or wrong permissions | `sudo touch /etc/security/opasswd && sudo chmod 600 /etc/security/opasswd` |
+| Hash algorithm not upgrading | User has not changed password | Hashes only upgrade when the password is actually changed |
+| Account locked but user still logging in via SSH | `usermod -L` only locks password — keys still work | Remove `authorized_keys` or use `usermod -e 1` to expire account |
+
+Test the full password change flow as a user:
+
+```bash
+# Test what happens when alice tries to change her password
+sudo pamtester -v passwd alice chauthtok
+```
+
+Check PAM is enforcing complexity:
+
+```bash
+sudo grep -r "pwquality\|pwhistory" /etc/pam.d/
+```
+
+---
+
+## Related Topics
+
+- [PAM Configuration](/linux/debian/security/authentication/pam-configuration/) — Full PAM stack reference and module internals
+- [SSH Key Management](/linux/debian/security/authentication/ssh-key-management/) — Replace passwords with keys entirely
+- [Brute-Force Protection](/linux/debian/security/authentication/brute-force-protection/) — Fail2ban and pam_faillock
+- [SSH Hardening](/linux/debian/security/authentication/ssh-hardening/) — Disable password authentication over SSH
+
+---
+
+*The best password policy is one that makes passwords unnecessary. Use SSH keys for remote access, enforce strong policies only where passwords are unavoidable, and audit regularly — because policies only matter if someone checks compliance.*

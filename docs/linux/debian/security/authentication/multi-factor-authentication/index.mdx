@@ -1,0 +1,710 @@
+---
+sidebar_position: 3
+title: "Multi-Factor Authentication | Authentication"
+sidebar_label: "Multi-Factor Authentication"
+description: "Deep-dive MFA on Debian - TOTP with libpam-google-authenticator, FIDO2/YubiKey, PAM stack internals, per-user policies, bypass rules for trusted networks, and lockout recovery."
+keywords:
+  - "debian mfa"
+  - "debian two factor authentication"
+  - "ssh mfa debian"
+  - "libpam-google-authenticator debian"
+  - "yubikey debian ssh"
+  - "fido2 ssh debian"
+  - "pam totp debian"
+  - "debian 2fa ssh"
+tags:
+  - debian
+  - mfa
+  - two-factor
+  - pam
+  - authentication
+  - ssh
+  - yubikey
+slug: /linux/debian/security/authentication/multi-factor-authentication
+hide_table_of_contents: true
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+# Multi-Factor Authentication
+
+A stolen SSH key is game over — unless there is a second factor. MFA adds something the attacker cannot get from your key file: a time-based code from your phone, or a physical hardware key you have to touch. This guide covers two serious MFA approaches — TOTP (time-based one-time passwords) and FIDO2/YubiKey — plus the PAM internals that make it all work, and the configuration mistakes that silently break it.
+
+:::info Prerequisites
+- Debian 11 (Bullseye) or Debian 12 (Bookworm)
+- SSH key authentication already working and tested — MFA is a second layer, not a replacement
+- See [SSH Key Management](/linux/debian/security/authentication/ssh-key-management/) and [SSH Hardening](/linux/debian/security/authentication/ssh-hardening/) first
+- **Keep a root console session open** during the entire setup
+:::
+
+:::danger Keep a console session open
+PAM misconfigurations can lock out every user including root over SSH. Always have an active console/VNC session that does not depend on SSH during setup.
+:::
+
+---
+
+## 1. Understanding the MFA Stack
+
+Before touching any config, understand what you are actually configuring.
+
+SSH authentication on Debian goes through two layers:
+
+```
+Client connects
+    ↓
+OpenSSH — handles publickey, checks authorized_keys
+    ↓
+PAM (Pluggable Authentication Modules) — handles everything else
+    ↓
+Session opened
+```
+
+When you add MFA, you are inserting a PAM module into the second layer. The PAM stack for SSH lives in `/etc/pam.d/sshd`. Each line in this file is a module that runs in sequence, and the result of each module (success/failure) is evaluated according to its control flag.
+
+### PAM control flags
+
+| Flag | Meaning |
+|------|---------|
+| `required` | Must succeed — but PAM continues evaluating other modules before returning failure |
+| `requisite` | Must succeed — PAM stops immediately on failure |
+| `sufficient` | If it succeeds and nothing before it failed, stop and return success |
+| `optional` | Result is ignored unless it is the only module for the service |
+| `[success=N]` | If this module succeeds, skip the next N modules |
+
+Understanding `[success=N]` is critical for building MFA bypass rules — it is how you say "if the user is connecting from a trusted IP, skip the TOTP check."
+
+---
+
+## 2. TOTP with libpam-google-authenticator
+
+TOTP (Time-based One-Time Password) generates a 6-digit code that changes every 30 seconds. The server and your authenticator app share a secret — both compute the same code independently. No network connection needed on either side.
+
+### Install
+
+```bash
+sudo apt install libpam-google-authenticator
+```
+
+### Per-user setup
+
+Each user runs this themselves — the secret is stored in their home directory, not system-wide:
+
+```bash
+google-authenticator
+```
+
+You will be asked a series of questions. Here is what each one means and what to answer:
+
+```
+Do you want authentication tokens to be time-based? (y/n)
+```
+→ `y` — TOTP (time-based) is what every authenticator app uses. The alternative HOTP (counter-based) is rarely needed.
+
+```
+Do you want me to update your "~/.google_authenticator" file? (y/n)
+```
+→ `y` — this writes the secret and config to disk.
+
+```
+Do you want to disallow multiple uses of the same authentication token?
+```
+→ `y` — prevents replay attacks. A TOTP code is valid for 30 seconds; without this, the same code could be used multiple times within that window.
+
+```
+By default, tokens are good for 30 seconds. In order to compensate for
+possible time-skew between the client and the server, we allow an extra
+token before and after the current time. Do you want to do so?
+```
+→ `y` — allows a ±30 second window for clock skew. Necessary for real-world use where client clocks are not perfectly synchronized.
+
+```
+Do you want to enable rate-limiting? (y/n)
+```
+→ `y` — limits to 3 login attempts every 30 seconds. Prevents brute-force of the 6-digit code (which has only 1,000,000 possible values).
+
+### What gets created
+
+```bash
+cat ~/.google_authenticator
+```
+
+```
+JBSWY3DPEHPK3PXP          ← Base32-encoded TOTP secret
+" TOTP_AUTH               ← Options line
+35779740                   ← Scratch/backup code
+38916984                   ← Scratch/backup code
+85563678                   ← Scratch/backup code
+48512048                   ← Scratch/backup code
+17399590                   ← Scratch/backup code
+```
+
+The first line is the shared secret. The lines after the options are **scratch codes** — single-use backup codes for when you do not have your phone. Store these somewhere safe and offline.
+
+### Scan the QR code
+
+During setup, `google-authenticator` displays a QR code in the terminal and a manual entry key. Scan it with any TOTP app:
+
+- **Aegis** (Android, open source — recommended)
+- **Raivo OTP** (iOS, open source — recommended)
+- **Google Authenticator** (Android/iOS)
+- **Authy** (Android/iOS — stores encrypted cloud backup)
+
+If you missed the QR code, regenerate it from the stored secret:
+
+```bash
+# Display QR code from existing secret
+SECRET=$(head -1 ~/.google_authenticator)
+qrencode -t UTF8 "otpauth://totp/$(whoami)@$(hostname)?secret=${SECRET}&issuer=MyServer"
+```
+
+Install `qrencode` if needed: `sudo apt install qrencode`
+
+### Secure the secret file
+
+```bash
+chmod 600 ~/.google_authenticator
+```
+
+The secret file must only be readable by the user. If it is world-readable, an attacker who gains any access to the filesystem can extract the TOTP secret and generate codes indefinitely.
+
+---
+
+## 3. Configuring PAM for TOTP
+
+Now wire the TOTP module into the PAM stack.
+
+Edit `/etc/pam.d/sshd`:
+
+```bash
+sudo nano /etc/pam.d/sshd
+```
+
+Add this line **at the top**, before anything else:
+
+```
+auth required pam_google_authenticator.so nullok
+```
+
+The `nullok` option allows users who have **not** set up `google-authenticator` to still log in without a TOTP code. This is essential during rollout — remove it once every user has enrolled.
+
+Once all users are enrolled:
+
+```bash
+auth required pam_google_authenticator.so
+```
+
+Without `nullok`, any user without `~/.google_authenticator` will be denied entirely.
+
+---
+
+## 4. Configuring sshd for MFA
+
+PAM alone is not enough — you need to tell SSH to actually use the PAM keyboard-interactive module and require both factors.
+
+Edit `/etc/ssh/sshd_config`:
+
+```bash
+# Enable PAM
+UsePAM yes
+
+# Enable keyboard-interactive (needed for TOTP prompt)
+KbdInteractiveAuthentication yes
+
+# Require BOTH publickey AND keyboard-interactive
+AuthenticationMethods publickey,keyboard-interactive
+```
+
+The comma in `AuthenticationMethods publickey,keyboard-interactive` means **both are required in sequence** — not either-or. The user must:
+1. Authenticate with their SSH key
+2. Then enter their TOTP code
+
+Without the comma (using a space instead), it would mean either method is sufficient — which defeats the purpose.
+
+Restart SSH:
+
+```bash
+sudo sshd -t && sudo systemctl restart ssh
+```
+
+---
+
+## 5. Testing the MFA Flow
+
+In a **new terminal** (keep your current session open):
+
+```bash
+ssh -p 2222 alice@your-server-ip
+```
+
+The expected flow:
+
+```
+Enter passphrase for key '/home/alice/.ssh/id_ed25519': ←  key passphrase (local)
+Authenticated with partial success.                      ←  SSH key accepted
+Verification code:                                       ←  TOTP prompt
+```
+
+If you see `Verification code:` — MFA is working. Enter the 6-digit code from your authenticator app.
+
+### What "partial success" means
+
+`Authenticated with partial success` is SSH telling you the first factor (publickey) passed, but more factors are still required. This is the expected message with `AuthenticationMethods publickey,keyboard-interactive`. If you only see the key passphrase prompt and are immediately logged in, `AuthenticationMethods` is not being applied correctly.
+
+---
+
+## 6. PAM Stack Deep Dive
+
+The default `/etc/pam.d/sshd` on Debian includes several modules. Understanding the full stack helps you build precise MFA bypass rules.
+
+```bash
+cat /etc/pam.d/sshd
+```
+
+A typical Debian `pam.d/sshd`:
+
+```
+# Standard Un*x authentication
+@include common-auth
+
+# Disallow non-root logins when /etc/nologin exists
+account    required     pam_nologin.so
+
+# Standard Un*x authorization
+@include common-account
+
+# SELinux needs to be the first session rule
+session [success=ok ignore=ignore module_unknown=ignore default=bad] pam_selinux.so close
+
+# Set the loginuid process attribute
+session    required     pam_loginuid.so
+
+# Create a new session keyring
+session    optional     pam_keyinit.so force revoke
+
+# Standard Un*x session setup and teardown
+@include common-session
+
+# Print the message of the day upon successful login
+session    optional     pam_motd.so motd=/run/motd.dynamic
+session    optional     pam_motd.so noupdate
+
+# Print the status of the user's mailbox upon successful login
+session    optional     pam_mail.so standard noenv
+
+# Set up user limits from /etc/security/limits.conf
+session    required     pam_limits.so
+
+# Read environment variables from /etc/environment and
+# /etc/security/pam_env.conf
+session    required     pam_env.so
+session    required     pam_env.so envfile=/etc/default/locale
+
+# SELinux needs to intervene at login time to ensure that the process starts
+# in the proper default security context
+session [success=ok ignore=ignore module_unknown=ignore default=bad] pam_selinux.so open
+```
+
+`@include common-auth` pulls in `/etc/pam.d/common-auth`, which handles the primary auth check. Your TOTP line goes **before** this include so it runs first, or specifically placed depending on your bypass requirements.
+
+---
+
+## 7. MFA Bypass for Trusted Networks
+
+In many environments, you want MFA for connections from the internet, but not for connections from your internal network or VPN. PAM handles this with `pam_access.so` or with the `[success=N]` jump mechanism.
+
+### Method 1 — pam_access.so with network check
+
+```bash
+sudo nano /etc/pam.d/sshd
+```
+
+```
+# Skip TOTP if connecting from trusted network
+auth [success=1 default=ignore] pam_access.so accessfile=/etc/security/mfa_bypass.conf
+
+# TOTP check (only reached if pam_access above did not succeed=1 skip)
+auth required pam_google_authenticator.so
+
+# Standard auth
+@include common-auth
+```
+
+Create the bypass file:
+
+```bash
+sudo nano /etc/security/mfa_bypass.conf
+```
+
+```
+# Allow (skip MFA) from internal network and VPN
++ : ALL : 10.0.0.0/8
++ : ALL : 192.168.1.0/24
++ : ALL : 172.16.0.0/12
+
+# Deny (require MFA) from everywhere else
+- : ALL : ALL
+```
+
+How `[success=1 default=ignore]` works:
+- If `pam_access.so` **succeeds** (user is from trusted network): skip the next **1** module (the TOTP check) and continue
+- If `pam_access.so` **fails** (user is from untrusted network): `ignore` — do nothing, continue to the next module (the TOTP check runs)
+
+### Method 2 — environment variable via AuthorizedKeysCommand
+
+A cleaner approach for SSH specifically: use `Match Address` in `sshd_config` to apply different `AuthenticationMethods` per source network:
+
+```bash
+# /etc/ssh/sshd_config
+
+# Default: require both factors
+AuthenticationMethods publickey,keyboard-interactive
+
+# Internal network: key only
+Match Address 10.0.0.0/8,192.168.1.0/24
+    AuthenticationMethods publickey
+```
+
+This is simpler and more explicit than PAM tricks — the bypass is visible in the SSH config, not buried in PAM stack logic.
+
+:::tip
+The `Match Address` approach is preferred for SSH-specific MFA bypass. Use the `pam_access.so` approach when you also want MFA bypass for `sudo` or console login.
+:::
+
+---
+
+## 8. Per-User MFA Enrollment
+
+In a team environment, you cannot enroll everyone at once. Use `nullok` during rollout and track who has enrolled.
+
+### Check enrollment status
+
+```bash
+# List users who have set up google-authenticator
+sudo find /home -name ".google_authenticator" -printf "%h\n" | xargs -I{} basename {}
+
+# List users who have NOT set up google-authenticator
+for user in $(getent passwd | awk -F: '$3 >= 1000 && $7 != "/usr/sbin/nologin" {print $1}'); do
+  if [[ ! -f "/home/$user/.google_authenticator" ]]; then
+    echo "NOT enrolled: $user"
+  fi
+done
+```
+
+### Enforce MFA for specific groups only
+
+Require MFA only for users in a specific group (e.g. `mfarequired`), while others use key-only auth:
+
+```bash
+# /etc/ssh/sshd_config
+
+# Default: key only
+AuthenticationMethods publickey
+
+# This group requires both factors
+Match Group mfarequired
+    AuthenticationMethods publickey,keyboard-interactive
+```
+
+```bash
+sudo groupadd mfarequired
+sudo usermod -aG mfarequired alice
+```
+
+PAM side — only run TOTP check for the group:
+
+```bash
+# /etc/pam.d/sshd
+auth [success=1 default=ignore] pam_succeed_if.so user notingroup mfarequired
+auth required pam_google_authenticator.so
+```
+
+How this reads: if the user is **not** in `mfarequired` (success) → skip the next 1 module (TOTP). If they **are** in `mfarequired` (ignore) → fall through to the TOTP check.
+
+---
+
+## 9. FIDO2 and Hardware Security Keys
+
+TOTP is a solid second factor, but it has one weakness: if an attacker phishes your TOTP code (you enter it on a fake login page), they can use it within the 30-second window. FIDO2 hardware keys are **phishing-proof** — the key cryptographically binds the challenge to the origin, so it cannot be replayed on a different server.
+
+OpenSSH has supported FIDO2 keys natively since version 8.2 (included in Debian 11+).
+
+### What you need
+
+- A FIDO2-capable hardware key: **YubiKey 5 series**, **Nitrokey FIDO2**, **SoloKey v2**
+- The `libfido2` library
+
+```bash
+sudo apt install libfido2-1 fido2-tools
+```
+
+### Generate a FIDO2-backed SSH key
+
+```bash
+# Ed25519-SK (SK = Security Key)
+ssh-keygen -t ed25519-sk -C "alice@yubikey"
+
+# ECDSA-SK (broader compatibility)
+ssh-keygen -t ecdsa-sk -C "alice@yubikey"
+```
+
+During generation, you will be prompted to **touch your hardware key**. The key generates the credential and returns the public/private key pair. The "private key" file is actually just a credential handle — the real private key never leaves the hardware.
+
+```
+Generating public/private ed25519-sk key pair.
+You may need to touch your authenticator to authorize key generation.
+```
+
+This produces:
+- `~/.ssh/id_ed25519_sk` — credential handle (not the real private key)
+- `~/.ssh/id_ed25519_sk.pub` — public key
+
+### Resident vs non-resident keys
+
+By default, FIDO2 keys are **non-resident**: the credential handle is stored in `~/.ssh/`. If you lose the file, you lose access.
+
+**Resident keys** store the credential on the hardware key itself:
+
+```bash
+ssh-keygen -t ed25519-sk -O resident -C "alice@yubikey"
+```
+
+With resident keys, you can recover the credential handle on any machine:
+
+```bash
+ssh-keygen -K
+```
+
+This downloads all resident credentials from the attached hardware key to the current directory as `id_ed25519_sk` and `id_ed25519_sk.pub`.
+
+### Require physical touch on every use
+
+By default, resident keys require touch only at generation. Force touch on every authentication:
+
+```bash
+ssh-keygen -t ed25519-sk -O resident -O verify-required -C "alice@yubikey"
+```
+
+`verify-required` means the user must touch the key for every SSH connection — not just once per power cycle.
+
+### Deploy and use
+
+Deploy the public key to the server the same way as any other key:
+
+```bash
+ssh-copy-id -i ~/.ssh/id_ed25519_sk.pub user@server
+```
+
+Connect — you will be prompted to touch the key:
+
+```bash
+ssh user@server
+# Confirm user presence for key...  ← touch your hardware key here
+```
+
+### No extra PAM or sshd config needed
+
+FIDO2 authentication with `-sk` key types works purely at the OpenSSH layer — no PAM changes needed. The hardware presence proof is baked into the key type itself. This is simpler and more robust than TOTP + PAM.
+
+### PIN-protected FIDO2 keys
+
+For even stronger security, configure your hardware key to require a PIN before it will respond:
+
+```bash
+# Set a PIN on the hardware key
+fido2-token -S /dev/hidraw0
+
+# Generate a key that requires PIN verification
+ssh-keygen -t ed25519-sk -O verify-required -C "alice@yubikey-pin"
+```
+
+Now authentication requires: **PIN** + **physical touch** + **private key** — three factors effectively.
+
+---
+
+## 10. MFA for sudo
+
+Extending MFA beyond SSH to `sudo` means even if an attacker gets a shell, they cannot escalate to root without the second factor.
+
+Edit the sudo PAM config:
+
+```bash
+sudo nano /etc/pam.d/sudo
+```
+
+Add at the top:
+
+```
+auth required pam_google_authenticator.so
+```
+
+Now every `sudo` command requires a TOTP code:
+
+```bash
+sudo apt update
+# Verification code: ← TOTP required
+```
+
+### Avoid TOTP fatigue for sudo
+
+Requiring TOTP on every single `sudo` quickly becomes unbearable. Use `pam_google_authenticator.so` with a grace period:
+
+There is no built-in grace period in `pam_google_authenticator`, but you can use `pam_timestamp.so` to cache a successful auth for a period:
+
+```bash
+# /etc/pam.d/sudo
+auth sufficient pam_timestamp.so
+auth required   pam_google_authenticator.so
+auth required   pam_unix.so
+session required pam_timestamp.so
+```
+
+`pam_timestamp.so` caches a successful authentication for 5 minutes (default) in `/var/run/sudo/`. Within 5 minutes of a successful TOTP, subsequent `sudo` calls skip the TOTP check. After 5 minutes, it is required again.
+
+---
+
+## 11. Backup Codes and Lockout Recovery
+
+This is the section most guides skip, and it is the one that matters most when something goes wrong at 2am.
+
+### Scratch codes
+
+During `google-authenticator` setup, five scratch codes are generated. Each can be used **once** in place of a TOTP code. After use, they are deleted from `~/.google_authenticator`.
+
+Store them:
+- In your password manager
+- On paper in a physically secure location
+- **Not** on the same device as your authenticator app
+
+View remaining scratch codes:
+
+```bash
+grep -E '^[0-9]{8}$' ~/.google_authenticator
+```
+
+### Regenerate scratch codes
+
+```bash
+google-authenticator
+```
+
+Running `google-authenticator` again lets you update the config. When asked to update the file, say yes and new scratch codes will be generated. Note: this also regenerates the TOTP secret, so you will need to re-scan the QR code in your authenticator app.
+
+### Emergency recovery when locked out
+
+**Scenario: Lost phone, no scratch codes, locked out of SSH.**
+
+You need console access (VNC, KVM, cloud provider serial console). From console:
+
+```bash
+# Option 1: Temporarily disable MFA in PAM
+sudo nano /etc/pam.d/sshd
+# Comment out the google_authenticator line
+# auth required pam_google_authenticator.so
+
+sudo systemctl restart ssh
+# Log in via SSH, re-enroll, re-enable PAM line
+```
+
+```bash
+# Option 2: Remove the google_authenticator file for the user
+# (allows login with nullok, or bypasses TOTP entirely if nullok is set)
+sudo mv /home/alice/.google_authenticator /home/alice/.google_authenticator.bak
+```
+
+```bash
+# Option 3: Add a scratch code manually
+# Each scratch code is an 8-digit number, one per line after the options line
+echo "12345678" | sudo tee -a /home/alice/.google_authenticator
+```
+
+### Designate a break-glass account
+
+For production servers, maintain one dedicated emergency account:
+- Only accessible from the console (no SSH `AllowUsers` entry)
+- Key stored offline or in a vault
+- MFA not required (it is console-only)
+- Alert on any use
+
+---
+
+## 12. Verifying the Full Setup
+
+After all changes, verify everything works as expected:
+
+```bash
+# Confirm PAM is using google-authenticator
+grep -n "google_authenticator" /etc/pam.d/sshd
+
+# Confirm sshd has the right AuthenticationMethods
+sudo sshd -T | grep authenticationmethods
+
+# Confirm KbdInteractiveAuthentication is on
+sudo sshd -T | grep kbdinteractiveauthentication
+
+# Confirm UsePAM is on
+sudo sshd -T | grep usepam
+
+# Check the google_authenticator file for a user
+sudo ls -la /home/alice/.google_authenticator
+```
+
+Monitor authentication attempts in real time:
+
+```bash
+sudo journalctl -u ssh -f
+```
+
+A successful MFA login looks like:
+
+```
+Accepted publickey for alice from 203.0.113.10 port 54321 ssh2: ED25519 SHA256:abc...
+pam_google_authenticator: Accepted TOTP token for alice
+```
+
+A failed TOTP attempt:
+
+```
+pam_google_authenticator: Invalid verification code for alice
+error: PAM: Authentication failure for alice from 203.0.113.10
+```
+
+---
+
+## Troubleshooting
+
+| Problem | Cause | Fix |
+|---------|-------|-----|
+| No TOTP prompt after key auth | `KbdInteractiveAuthentication no` | Set to `yes` in `sshd_config` |
+| No TOTP prompt — direct login | `AuthenticationMethods` not set or wrong | Set `AuthenticationMethods publickey,keyboard-interactive` |
+| `Permission denied` without TOTP prompt | `UsePAM no` | Set `UsePAM yes` |
+| TOTP code rejected despite being correct | Clock skew between client and server | Sync server time: `sudo timedatectl set-ntp true` |
+| Users without `~/.google_authenticator` locked out | `nullok` missing | Add `nullok` to the PAM line during rollout |
+| `google-authenticator` not found | Package not installed | `sudo apt install libpam-google-authenticator` |
+| FIDO2 key not detected | `libfido2` missing or udev rules needed | `sudo apt install libfido2-1` and check `fido2-token -L` |
+| `ssh-keygen -t ed25519-sk` fails | OpenSSH < 8.2 | Check version: `ssh -V` — upgrade if needed |
+
+Always debug with:
+
+```bash
+ssh -vvv user@server 2>&1 | grep -E "auth|pam|factor|partial|keyboard"
+```
+
+And check PAM logs:
+
+```bash
+sudo journalctl | grep "pam_google\|PAM" | tail -30
+```
+
+---
+
+## Related Topics
+
+- [SSH Key Management](/linux/debian/security/authentication/ssh-key-management/) — Generate and deploy SSH keys
+- [SSH Hardening](/linux/debian/security/authentication/ssh-hardening/) — Lock down `sshd_config`
+- [Brute-Force Protection](/linux/debian/security/authentication/brute-force-protection/) — Block attackers with Fail2ban
+- [PAM Configuration](/linux/debian/security/authentication/pam-configuration/) — Full PAM stack reference
+
+---
+
+*MFA is not complete until you have tested lockout recovery. Set it up, lock yourself out intentionally using the console, and verify you can get back in — before it happens at 2am for real.*
